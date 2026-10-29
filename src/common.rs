@@ -362,7 +362,7 @@ pub(crate) fn v3(s: &[f32]) -> [f32; 3] {
     [s[0], s[1], s[2]]
 }
 
-#[cfg(feature = "crowd")]
+#[cfg(any(feature = "crowd", feature = "tilecache"))]
 #[inline]
 pub(crate) fn sinf(x: f32) -> f32 {
     #[cfg(all(feature = "std", not(feature = "libm")))]

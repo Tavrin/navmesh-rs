@@ -766,36 +766,28 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
         }
         if self.queue_pos < self.queue.len() {
             let t = self.queue[self.queue_pos];
-            let mut count = 0;
-            let mut a = self.tiles[t].head;
-            while a != NONE {
-                work(&mut self.ws, 1)?;
-                count += 1;
-                a = self.associations[a].next;
-            }
-            let mut completed = self.ws.vec_with_capacity::<usize>(count)?;
-            // Reserve accounting for completion and free-list updates before changing the mesh.
-            work(
-                &mut self.ws,
-                count * (20 + usize::try_from(count.max(1).ilog2()).unwrap()),
-            )?;
+            // Upstream scans every slot, including newly added obstacles whose
+            // requests are deferred by the existing queue (pending == 0).
+            // Reserve slot, pending-list and completion/unlink work before mutation.
+            work(&mut self.ws, self.obstacles.len() * 26)?;
             self.rebuild(t, nav)?;
-            let mut a = self.tiles[t].head;
-            while a != NONE {
-                let e = self.associations[a];
-                if e.pending {
-                    self.associations[a].pending = false;
-                    let o = self.obstacles[e.obstacle].as_mut().unwrap();
-                    o.pending -= 1;
+            for i in 0..self.obstacles.len() {
+                let Some(o) = self.obstacles[i].as_mut() else {
+                    continue;
+                };
+                if matches!(o.state, ObstacleState::Processing | ObstacleState::Removing) {
+                    for j in 0..o.count {
+                        let a = i * 8 + j;
+                        if self.associations[a].pending && o.touched[j] == t {
+                            self.associations[a].pending = false;
+                            o.pending -= 1;
+                            break;
+                        }
+                    }
                     if o.pending == 0 {
-                        completed.push(e.obstacle);
+                        self.finish(i);
                     }
                 }
-                a = e.next;
-            }
-            completed.sort_unstable();
-            for i in completed {
-                self.finish(i);
             }
             self.queued[t] = false;
             self.queue_pos += 1;

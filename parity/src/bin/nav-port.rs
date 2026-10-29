@@ -256,6 +256,7 @@ fn parse_case(path: &Path) -> Result<Case, String> {
                     "obox" => 3,
                     "remove" => 4,
                     "update" => 5,
+                    "update_once" => 6,
                     _ => return Err("invalid obstacle op".into()),
                 };
                 let args = floats(args);

@@ -1,0 +1,13 @@
+# Add while an earlier obstacle still has queued cross-tile/layer rebuilds.
+mesh = gen_multilevel.obj
+mode = tilecache
+tile_size = 32
+queries = 24
+tc_obstacle = cylinder 9.6 -1 9.6 1 20
+tc_obstacle = update_once
+tc_obstacle = box 15 -1 15 18 20 18
+tc_obstacle = update_once
+tc_obstacle = update
+tc_obstacle = remove 0
+tc_obstacle = remove 1
+tc_obstacle = update

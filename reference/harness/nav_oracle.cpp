@@ -177,7 +177,7 @@ struct AreaVolume {
 
 // One tile-cache obstacle script step (`tc_obstacle` lines).
 struct ObstacleOp {
-    int op = 0; // 1 cylinder, 2 box, 3 oriented box, 4 remove, 5 update
+    int op = 0; // 1 cylinder, 2 box, 3 oriented box, 4 remove, 5 update, 6 update_once
     std::vector<float> args;
 };
 
@@ -297,7 +297,7 @@ bool parseCase(const char* path, Case& c) {
             for (int i = 3; i + 1 < n; i += 2) { v.verts.push_back(x[i]); v.verts.push_back(0.0f); v.verts.push_back(x[i + 1]); }
             c.areaVolumes.push_back(v);
         } else if (k == "tc_obstacle") {
-            // cylinder x y z radius height | box x0 y0 z0 x1 y1 z1 | obox cx cy cz hx hy hz yaw | remove N | update
+            // cylinder x y z radius height | box x0 y0 z0 x1 y1 z1 | obox cx cy cz hx hy hz yaw | remove N | update | update_once
             char op[32] = {0};
             int used = 0;
             sscanf(val, "%31s %n", op, &used);
@@ -310,6 +310,7 @@ bool parseCase(const char* path, Case& c) {
             else if (ops == "obox") { o.op = 3; want = 7; }
             else if (ops == "remove") { o.op = 4; want = 1; }
             else if (ops == "update") { o.op = 5; want = 0; }
+            else if (ops == "update_once") { o.op = 6; want = 0; }
             if (want < 0 || n != want) {
                 fprintf(stderr, "%s:%d: bad tc_obstacle '%s'\n", path, lineNo, val);
                 fclose(f);
@@ -1529,15 +1530,15 @@ void recordObstacles(const Case& c, Baked& b) {
             dtStatus st = tc->removeObstacle(ref);
             r.s.u32(ref); r.s.u32(st); r.s.u32(n);
         } else {
-            // update until the cache reports up to date (bounded), then the
-            // obstacle slots and the resident navmesh tiles of every touched tile.
+            // Update until up to date (bounded), or exactly once for update_once;
+            // record obstacle slots and resident bytes even at intermediate steps.
             bool upToDate = false;
             dtStatus st = DT_SUCCESS;
             uint32_t iters = 0;
             while (!upToDate && iters < 4096) {
                 st = tc->update(1.0f / 30.0f, b.nav, &upToDate);
                 ++iters;
-                if (dtStatusFailed(st)) break;
+                if (dtStatusFailed(st) || op.op == 6) break;
             }
             ++updates;
             r.s.u32(iters); r.s.u32(st); r.s.u8(upToDate ? 1 : 0);

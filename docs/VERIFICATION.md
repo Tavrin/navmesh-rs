@@ -46,7 +46,7 @@ records.
 
 ## Corpus
 
-20 case files in [`reference/cases/`](../reference/cases/) over 13 meshes. No mesh is committed:
+21 case files in [`reference/cases/`](../reference/cases/) over 13 meshes. No mesh is committed:
 [`reference/corpus/fetch.sh`](../reference/corpus/fetch.sh) downloads the third-party meshes at
 pinned commits, generates the others, and checks every SHA-256 against
 [`MANIFEST.toml`](../reference/corpus/MANIFEST.toml).
@@ -196,7 +196,10 @@ compile-fail doctests enforce non-exhaustive parameter structs and state enums.
 ## Tile-cache verification
 
 `reference/run-tilecache-parity.sh` compares all records on `dungeon_tilecache`,
-`seams_tilecache` and `multilevel_tilecache`, with both polygon-reference widths.
+`seams_tilecache`, `multilevel_tilecache` and `queued_tilecache`, with both
+polygon-reference widths. The queued case adds an obstacle after one cross-tile
+rebuild, then records another single rebuild before draining: the newly added
+obstacle becomes processed while its add request is still queued, as in the pin.
 The Rust driver builds every layer and tile itself. The oracle and port both
 record all 21 query families under two filters after every obstacle-script update
 as `obstacle_update_N.q_*` and `obstacle_update_N.filtered.q_*`.
@@ -207,41 +210,55 @@ Initial layer grids, regions, contours, polygon meshes, raw bytes, initial navme
 tile bytes, and rebuilt resident bytes (including links) are compared exactly.
 Independent release repeats and debug builds use the same comparator with no
 tolerance. On x86-64 Linux (GCC 13.3.0, glibc 2.39, the pinned oracle flags), all
-**6,744 record comparisons pass with zero mismatches** across both ref widths and
+**9,200 record comparisons pass with zero mismatches** across both ref widths and
 Rust debug/release. Independent release record files are byte-identical.
 
 | Case | Layers | Script ops | Updates | Resident tile snapshots | Records per width/build |
 |---|---:|---:|---:|---:|---:|
 | `dungeon_tilecache` | 30 | 11 | 3 | 4 | 658 |
 | `multilevel_tilecache` | 45 | 13 | 5 | 38 | 656 |
+| `queued_tilecache` | 45 | 8 | 4 | 17 | 614 |
 | `seams_tilecache` | 16 | 9 | 3 | 21 | 372 |
-| Total | 91 | 33 | 11 | 63 | 1,686 |
+| Total | 136 | 41 | 15 | 80 | 2,300 |
 
-Each width/build compares 455 layer-stage records, 588 query records (including
-462 after obstacle updates), three obstacle scripts and three initial tile sets,
+Each width/build compares 680 layer-stage records, 798 query records (including
+630 after obstacle updates), four obstacle scripts and four initial tile sets,
 plus the remaining Recast, malformed-tile and crowd records. All resident bytes
 include live first-link fields, the entire link pool, and snapped vertices.
 `MeshTile.data` retains the original input; the record driver serializes the live
 runtime sections for this comparison.
 
-The 16-obstacle/tile scaling fixture uses 3,525,800 work units; 128 use 28,206,400:
-**8.0000×** for 8× input, below the 11× regression ceiling. These are charged work
+The 16-obstacle/tile scaling fixture uses 3,577,496 work units; 128 use 29,365,440:
+**8.2084×** for 8× input, below the 11× regression ceiling. These are charged work
 units including scratch-grid initialization, not wall-clock timings or an
 all-input worst-case complexity claim. Colliding hash chains are separately
-budget-tested. All 14 tile-cache regression tests pass in both ref widths.
-Workspace tests (62 tests plus 10 doctests), both-width Clippy and debug/release
+budget-tested. All 18 tile-cache integration tests and the merge-pass unit
+regression pass in both ref widths. Three new compile-fail doctests enforce non-exhaustive contour
+and mesh types; constructors/defaults allow public-field customization.
+Workspace tests (67 tests plus 13 doctests), both-width Clippy and debug/release
 builds, Rust 1.88, native no-std/libm, wasm32 build, documentation, fuzz-source
 compilation, formatting and public-text checks pass. The fuzz target was not run.
-Initial lint failures and a recorder error (original bytes instead of live link
-state) were corrected; the entire final verification run then passed.
 
 Unit regressions cover truncated/oversized layers, invalid headers, area ids and
 connections, invalid codec output lengths, all shapes and marking, full carving
 and restoration, stale handles, obstacle/tile slot reuse, zero-touch lifecycle,
 request/obstacle/touched-tile capacities, incomplete region-stage rejection,
 budget failure and retry, and charged
-hash collisions. The work-scaling fixture grows independent obstacles and tiles
+hash collisions. Added regressions reject a 1,020-vertex contour before allocation
+with a small work limit, precharge every greedy merge pass, reject 100,000 empty
+contours before traversal, count all three contour-list passes, and complete a
+queued add during an existing rebuild. The feature matrix also tests
+`--no-default-features --features std,tilecache` and builds
+`--no-default-features --features libm,tilecache`, without crowd.
+The work-scaling fixture grows independent obstacles and tiles
 from 16 to 128 and includes insertion, request handling and every rebuild.
+
+The review-fix rerun also compares the complete 21-case corpus in release:
+38,009 records per reference width, 76,018 comparisons altogether, with zero
+mismatches, including all Recast/Detour records and 21 initial tile sets per width.
+Both crowd campaigns above were rerun in debug/release and both reference widths:
+158,400 simulation-tick and 2,469,992 active-agent comparisons, zero mismatches.
+Independent release repeats are identical on every crowd and tile-cache case.
 
 ### Tile-cache safety and resource differences
 
@@ -257,12 +274,24 @@ from 16 to 128 and includes insertion, request handling and every rebuild.
   requests or rebuilds are pending; a tile with obstacle associations cannot be
   removed. These rules keep tile membership stable for queued requests.
 - Zero-touch processing and removal complete even with no queued tile. C++ can
-  leave these slots stuck in processing/removing. Every reused slot and reverse
+  leave these slots stuck in processing/removing when no rebuild runs. During an
+  existing rebuild queue, Rust follows the pinned whole-pool state scan: every
+  rebuild completes processing/removing obstacles with zero pending tiles, even
+  if their add requests are still deferred. Every reused slot and reverse
   association is reset; stale handles cannot refer to a replacement occupant.
 - Bounds lookups charge cells and every hash-chain visit, including collisions.
-  Reverse tile-to-obstacle indices avoid a whole-pool scan on each rebuild.
-  Layer algorithms retain upstream order; their bounded region merges, ear
-  clipping and greedy polygon merges charge their work before execution.
+  Reverse tile-to-obstacle indices select obstacles for carving. Lifecycle
+  completion scans the whole obstacle pool after every rebuild in upstream order;
+  its bounded per-slot work is charged before the rebuild.
+  Layer algorithms retain upstream order. Ear clipping and greedy polygon merging
+  have O(n³) worst-case work for n contour vertices; their algorithms are preserved
+  for bit-exact output. Default limits are unlimited, so callers handling untrusted
+  or large contours must choose a finite `Limits::max_work` to bound work. Cubic
+  triangulation work is charged during contour validation, before mesh/scratch
+  allocation. Every greedy merge pass charges all pair/edge comparisons before
+  running, including its final pass; portal-hole triangulation is also precharged.
+  Every contour-list traversal charges one unit per entry before traversing,
+  including empty contours, and validation charges vertex bytes separately.
   Vertex and portal coordinate indices replace unrelated vertex/edge scans.
   Allocations are fallible and byte-charged before allocation; tile creation has
   a conservative scratch/output charge. Navmesh mutation also uses the navmesh's

@@ -25,6 +25,10 @@ jobs:
         run: cargo test --locked -p navmesh-rs --no-default-features --features std,recast,detour,crowd --tests
       - name: no_std build
         run: cargo build --locked -p navmesh-rs --lib --no-default-features --features libm,recast,detour,crowd,polyref64
+      - name: tilecache without crowd, std tests
+        run: cargo test --locked -p navmesh-rs --no-default-features --features std,tilecache
+      - name: tilecache without crowd, no_std build
+        run: cargo build --locked -p navmesh-rs --lib --no-default-features --features libm,tilecache
       - run: cargo doc --locked -p navmesh-rs --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

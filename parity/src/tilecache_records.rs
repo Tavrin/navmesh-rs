@@ -192,17 +192,18 @@ pub(super) fn record_obstacles(
                 .u32(u32::try_from(ts.len()).unwrap());
         } else {
             let mut iters = 0;
-            loop {
+            let up_to_date = loop {
                 iters += 1;
-                if cache.update(1.0 / 30.0, nav)? {
-                    break;
+                let done = cache.update(1.0 / 30.0, nav)?;
+                if done || *op == 6 {
+                    break done;
                 }
                 if iters >= 4096 {
                     return Err(Error::Failed);
                 }
-            }
+            };
             updates += 1;
-            p.u32(iters).u32(0x40000000).u8(1);
+            p.u32(iters).u32(0x40000000).u8(u8::from(up_to_date));
             let used = (0..cache.params().max_obstacles)
                 .filter(|&i| cache.obstacle_at(i).is_some())
                 .count();

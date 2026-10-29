@@ -215,6 +215,12 @@ pub(crate) fn regions(ws: &mut Workspace, l: &mut Layer, climb: i32) -> Result<(
     Ok(())
 }
 /// A contour vertex carries x, height, z, and portal/removal flags.
+///
+/// ```compile_fail
+/// use navmesh_rs::tilecache::LayerContour;
+/// let LayerContour { reg, area, verts } = LayerContour::new();
+/// ```
+#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct LayerContour {
     /// Region id.
@@ -224,11 +230,29 @@ pub struct LayerContour {
     /// Four bytes per vertex.
     pub verts: Vec<u8>,
 }
+impl LayerContour {
+    /// Creates an empty contour; customize its public fields before building.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 /// Outlines, ordered by region id.
+///
+/// ```compile_fail
+/// use navmesh_rs::tilecache::LayerContourSet;
+/// let LayerContourSet { contours } = LayerContourSet::new();
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct LayerContourSet {
     /// One contour slot per region.
     pub contours: Vec<LayerContour>,
+}
+impl LayerContourSet {
+    /// Creates an empty set; append contours through its public field.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 fn neighbour(l: &Layer, x: usize, y: usize, dir: usize) -> u8 {
     let w = usize::from(l.header.width);
@@ -480,6 +504,12 @@ pub(crate) fn contours(
     Ok(out)
 }
 /// Layer polygon mesh, with six vertices and six neighbour indices per polygon.
+///
+/// ```compile_fail
+/// use navmesh_rs::tilecache::LayerPolyMesh;
+/// let LayerPolyMesh { verts, polys, flags, areas } = LayerPolyMesh::new();
+/// ```
+#[non_exhaustive]
 #[derive(Debug, Default)]
 pub struct LayerPolyMesh {
     /// Vertices (three quantized coordinates each).
@@ -490,6 +520,12 @@ pub struct LayerPolyMesh {
     pub flags: Vec<u16>,
     /// Area ids per polygon.
     pub areas: Vec<u8>,
+}
+impl LayerPolyMesh {
+    /// Creates an empty mesh; customize its public fields as needed.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 const FLAG: i32 = 0x1000_0000;
@@ -769,9 +805,17 @@ fn merge_polys(
 ) -> Result<(), Error> {
     loop {
         let n = u64::try_from(*npolys).map_err(|_| Error::SizeOverflow)?;
-        ws.work(
-            n * n.saturating_sub(1) / 2 * u64::try_from(nvp).map_err(|_| Error::SizeOverflow)?,
-        )?;
+        let width = u64::try_from(nvp).map_err(|_| Error::SizeOverflow)?;
+        // Each pair compares up to nvp² edges; include the pass and row copies.
+        let pairs = n
+            .checked_mul(n.saturating_sub(1))
+            .ok_or(Error::SizeOverflow)?
+            / 2;
+        let cost = pairs
+            .checked_mul(width * width)
+            .and_then(|v| v.checked_add(width * 4 + 1))
+            .ok_or(Error::SizeOverflow)?;
+        ws.work(cost)?;
         let mut best = 0i32;
         let (mut bpa, mut bpb, mut bea, mut beb) = (0, 0, 0, 0);
         for j in 0..npolys.saturating_sub(1) {
@@ -812,6 +856,13 @@ fn merge_polys(
 }
 
 /// Triangulates, greedily merges, removes portal vertices and builds adjacency.
+///
+/// The pinned ear-clipping and greedy merge algorithms retain their original
+/// order for bit-exact output and have O(n³) worst-case work for n contour
+/// vertices. [`Limits::default`](crate::Limits::default) is unlimited: callers
+/// handling untrusted or large contours should set [`Limits::max_work`](crate::Limits::max_work).
+/// A conservative cubic triangulation charge is reserved before mesh allocation,
+/// and each greedy merge pass is charged before comparing polygon pairs.
 pub fn build_poly_mesh(ws: &mut Workspace, cset: &LayerContourSet) -> Result<LayerPolyMesh, Error> {
     ws.begin();
     poly_mesh(ws, cset)
@@ -822,6 +873,7 @@ pub(crate) fn poly_mesh(
 ) -> Result<LayerPolyMesh, Error> {
     let mut maxv = 0usize;
     let mut maxt = 0usize;
+    charge(ws, cset.contours.len())?;
     for c in &cset.contours {
         charge(ws, c.verts.len())?;
         if c.verts.len() % 4 != 0
@@ -838,6 +890,13 @@ pub(crate) fn poly_mesh(
         if n >= 3 {
             maxv = maxv.checked_add(n).ok_or(Error::SizeOverflow)?;
             maxt = maxt.checked_add(n - 2).ok_or(Error::SizeOverflow)?;
+            // Reject expensive contours before any mesh/scratch allocation.
+            charge(
+                ws,
+                n.checked_mul(n)
+                    .and_then(|v| v.checked_mul(n))
+                    .ok_or(Error::SizeOverflow)?,
+            )?;
         }
     }
     if maxv >= 0xfffe {
@@ -854,6 +913,7 @@ pub(crate) fn poly_mesh(
     charge(ws, 256 * 256)?;
     let mut heads = ws.vec(256 * 256, usize::MAX)?;
     let mut nextv = ws.vec(maxv, usize::MAX)?;
+    charge(ws, cset.contours.len())?;
     for c in &cset.contours {
         let n = c.verts.len() / 4;
         if n < 3 {
@@ -868,13 +928,7 @@ pub(crate) fn poly_mesh(
             *a = i32::try_from(i).map_err(|_| Error::SizeOverflow)?;
         }
         let mut tris = ws.vec(n * 3, 0i32)?;
-        // Diagonal tests traverse edges at each ear removal.
-        charge(
-            ws,
-            n.checked_mul(n)
-                .and_then(|v| v.checked_mul(n))
-                .ok_or(Error::SizeOverflow)?,
-        )?;
+        // Diagonal tests were charged conservatively during validation.
         let nt = usize::try_from(triangulate(n, &v, &mut idx, &mut tris).unsigned_abs())
             .map_err(|_| Error::SizeOverflow)?;
         let mut indices = ws.vec(n, 0u16)?;
@@ -1066,6 +1120,7 @@ fn remove(
         }
     }
     let n = hole.len();
+    charge(ws, n * n * n)?;
     let mut verts = ws.vec(n * 4, 0i32)?;
     let mut idx = ws.vec(n, 0i32)?;
     let mut tris = ws.vec(n * 3, 0i32)?;
@@ -1075,7 +1130,6 @@ fn remove(
         }
         idx[j] = i32::try_from(j).unwrap();
     }
-    charge(ws, n * n * n)?;
     let nt = usize::try_from(triangulate(n, &verts, &mut idx, &mut tris).unsigned_abs())
         .map_err(|_| Error::SizeOverflow)?;
     let mut polys = ws.vec((nt + 1) * 6, NULL)?;
@@ -1130,11 +1184,13 @@ fn adjacency(
     charge(ws, 2 * 256 * 256)?;
     let mut portals = ws.vec(2 * 256 * 256, None::<(usize, u8)>)?;
     let mut order = 0;
+    charge(ws, cset.contours.len())?;
     for c in &cset.contours {
         let n = c.verts.len() / 4;
         if n < 3 {
             continue;
         }
+        charge(ws, n)?;
         for j in 0..n {
             let a = &c.verts[j * 4..];
             let b = &c.verts[((j + 1) % n) * 4..];
@@ -1195,4 +1251,38 @@ fn adjacency(
         i = end;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Limits;
+
+    #[test]
+    fn every_greedy_merge_pass_is_charged_before_it_runs() {
+        let verts = [0, 0, 0, 0, 0, 8, 8, 0, 8, 8, 0, 0];
+        let original = [0, 1, 2, NULL, NULL, NULL, 0, 2, 3, NULL, NULL, NULL];
+        for (limit, expected_count, expected_work) in [(60, 2, 61), (85, 1, 86), (86, 1, 86)] {
+            let mut ws = Workspace::with_limits(Limits {
+                max_work: limit,
+                ..Limits::default()
+            });
+            let mut polys = original;
+            let mut count = 2;
+            let result = merge_polys(&mut ws, &mut polys, &mut count, 6, &verts, None);
+            assert_eq!(
+                result,
+                if limit < 86 {
+                    Err(Error::LimitExceeded)
+                } else {
+                    Ok(())
+                }
+            );
+            assert_eq!(count, expected_count);
+            assert_eq!(ws.usage().work, expected_work);
+            if limit == 60 {
+                assert_eq!(polys, original);
+            }
+        }
+    }
 }

@@ -290,6 +290,115 @@ fn budget_precedes_allocations_and_rebuild_and_can_retry() {
     drain(&mut c, &mut n);
 }
 #[test]
+fn large_contour_is_rejected_before_triangulation_or_allocation() {
+    let mut contour = LayerContour::new();
+    contour.area = 63;
+    // A simple 1,020-vertex square with collinear boundary vertices. Its
+    // conservative cubic charge exceeds one billion work units.
+    for i in 0..255u8 {
+        contour.verts.extend_from_slice(&[0, 1, i, 15]);
+    }
+    for i in 0..255u8 {
+        contour.verts.extend_from_slice(&[i, 1, 255, 15]);
+    }
+    for i in (1..=255u8).rev() {
+        contour.verts.extend_from_slice(&[255, 1, i, 15]);
+    }
+    for i in (1..=255u8).rev() {
+        contour.verts.extend_from_slice(&[i, 1, 0, 15]);
+    }
+    let mut set = LayerContourSet::new();
+    set.contours.push(contour);
+    let mut ws = Workspace::with_limits(Limits {
+        max_work: 1_000_000,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        build_poly_mesh(&mut ws, &set),
+        Err(Error::LimitExceeded)
+    ));
+    assert_eq!(ws.usage().work, 1 + 1020 * 4 + 1020u64.pow(3));
+    assert_eq!(ws.usage().bytes, 0);
+}
+#[test]
+fn empty_contour_entries_are_charged_before_each_list_traversal() {
+    let mut set = LayerContourSet::new();
+    set.contours.resize(100_000, LayerContour::new());
+    let mut ws = Workspace::with_limits(Limits {
+        max_work: 1,
+        ..Limits::default()
+    });
+    assert!(matches!(
+        build_poly_mesh(&mut ws, &set),
+        Err(Error::LimitExceeded)
+    ));
+    assert_eq!(ws.usage().work, 100_000);
+    assert_eq!(ws.usage().bytes, 0);
+
+    ws.set_limits(Limits::default());
+    set.contours.truncate(1);
+    build_poly_mesh(&mut ws, &set).unwrap();
+    let one = ws.usage().work;
+    set.contours.push(LayerContour::new());
+    build_poly_mesh(&mut ws, &set).unwrap();
+    assert_eq!(ws.usage().work - one, 3); // validation, construction, portals
+}
+#[test]
+fn non_exhaustive_intermediates_support_construction_and_customization() {
+    let mut contour = LayerContour::new();
+    contour.reg = 1;
+    contour.area = 63;
+    contour.verts = vec![0, 1, 0, 15, 0, 1, 8, 15, 8, 1, 8, 15, 8, 1, 0, 15];
+    let mut set = LayerContourSet::new();
+    set.contours.push(contour);
+    let mut mesh = build_poly_mesh(&mut Workspace::new(), &set).unwrap();
+    assert_eq!(mesh.areas, [63]);
+    mesh.flags[0] = 7;
+    let mut empty = LayerPolyMesh::new();
+    empty.verts = mesh.verts;
+    assert_eq!(empty.verts.len(), 12);
+    assert!(LayerContour::default().verts.is_empty());
+    assert!(LayerContourSet::default().contours.is_empty());
+    assert!(LayerPolyMesh::default().polys.is_empty());
+}
+#[test]
+fn queued_add_is_processed_by_an_existing_rebuild_before_its_request() {
+    let mut c = TileCache::new(
+        params(2),
+        RawCompressor,
+        DefaultMeshProcess,
+        Limits::default(),
+    )
+    .unwrap();
+    c.add_tile(data(0)).unwrap();
+    c.add_tile(data(1)).unwrap();
+    let mut n = nav(2);
+    let first = c.add_obstacle(cylinder(8.0)).unwrap();
+    assert!(!c.update(0.1, &mut n).unwrap());
+    assert_eq!(
+        c.obstacle(first).unwrap().state(),
+        ObstacleState::Processing
+    );
+    let second = c.add_obstacle(cylinder(4.0)).unwrap();
+    assert_eq!(
+        c.obstacle(second).unwrap().state(),
+        ObstacleState::Processing
+    );
+    assert!(!c.update(0.1, &mut n).unwrap());
+    assert_eq!(c.obstacle(first).unwrap().state(), ObstacleState::Processed);
+    assert_eq!(
+        c.obstacle(second).unwrap().state(),
+        ObstacleState::Processed
+    );
+    // Its add request still runs next; subsequent removal must also finish.
+    drain(&mut c, &mut n);
+    c.remove_obstacle(second).unwrap();
+    c.remove_obstacle(first).unwrap();
+    drain(&mut c, &mut n);
+    assert!(c.obstacle(first).is_none());
+    assert!(c.obstacle(second).is_none());
+}
+#[test]
 fn hash_chain_visits_are_charged_even_without_hits() {
     let mut c = TileCache::new(
         params(64),
