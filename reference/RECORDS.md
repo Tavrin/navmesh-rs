@@ -144,7 +144,7 @@ or points for the first two) and hold one entry per pair; `status` is the raw `d
 | `q_closest_point_on_poly`, `q_closest_point_on_poly_boundary` | the pair's end point projected on the start polygon |
 | `q_poly_height` | `getPolyHeight` on the start polygon at the start and the end point |
 | `q_random_point_around_circle` | radius 3 around the start point |
-| `crowd_trajectories` | tick count; per tick (dt = 1/30): tick, active count, per active agent: slot, state, target state, `npos`, `vel`, `nvel`, first corridor poly, corner count. Avoidance type 3 with `dtCrowd`'s default parameters |
+| `crowd_trajectories` | tick count; per tick (dt = 1/30): tick, active count, per active agent: slot, state, target state, `npos`, `vel`, `nvel`, first corridor poly, corner count, corridor count and every corridor poly. Avoidance type 3 with `dtCrowd`'s default parameters |
 | `crowd_quality_0` .. `crowd_quality_3` | the same with the demo's low, medium, good and high avoidance presets |
 | `crowd_move_velocity` | odd agents switch to `requestMoveVelocity` toward their target at half speed; at T/2 every third agent gets `resetMoveTarget` |
 | `crowd_remove_readd` | agents 1, 5, 9, ... removed at T/3; as many new agents added at 2T/3 |
@@ -174,6 +174,11 @@ belong to the port's fuzz targets, where the verdict is a typed error.
 | Tile cache after obstacle scripts | byte-exact navmesh tiles | integer layer algorithms; `cosf`/`sinf` only for oriented boxes, computed once per obstacle (same libm rule as the crowd) |
 | Timing, memory | not compared | measured separately (`nav_oracle bench`, `nav-port bench`) |
 
+Crowd exactness applies to valid inputs in the domain documented under
+"Deliberate differences from C++" in `docs/VERIFICATION.md`. In particular, adaptive
+sampling with even division counts reads uninitialized storage upstream and has
+no C++ parity claim; all recorded presets use odd divisions.
+
 A tolerance is never introduced to make a failing record pass. If a bit-exact record differs,
 the port is wrong until a decoded dump shows the cause is one of the listed libm sites.
 
@@ -186,7 +191,8 @@ example `tiles[3].data.polys[17].neis[2]: 5 vs 6`). Every payload is decoded eve
 agree (`--no-validate` skips that), so a payload that does not match its kind's layout fails.
 `--crowd-tolerance` applies the crowd rule above to `crowd_*` records. `--recast` compares only
 the Recast record kinds (`geometry` through `detail_mesh`, and `heightfield_layers`), so a port
-file holding those stages can be compared with a full oracle file. `--detour` adds
+file holding those stages can be compared with a full oracle file. `--crowd` selects only the eight crowd trajectory kinds, including their full corridors.
+`--detour` adds
 `navmesh_tiles`, `malformed_tiles` and every `q_*` kind (the Recast and Detour phases, without
 crowd, tile-cache layer and obstacle records). Two files that both state
 `polyref_bits` may state different widths: each file is decoded at its own width (absent: 32) and
@@ -208,3 +214,16 @@ and malformed-tile kinds on them. Built with `--no-default-features` (in `parity
 32-bit poly refs, for comparison with `nav_oracle`. `nav_oracle bench` with
 `NAV_BENCH_NO_CROWD=1` times the query set without the crowd run (`nav-port bench-queries` is
 the port's counterpart).
+
+
+## Crowd regression run
+
+`run-crowd-parity.sh <output-directory>` runs every case with `crowd_agents` enabled
+for 300 ticks (using temporary case copies in the output directory),
+compares the eight variants bit for bit in both reference widths, and checks that
+repeated Rust runs produce identical files. Set `NAV_ORACLE32`, `NAV_ORACLE64`,
+`NAV_PORT32`, `NAV_PORT64`, `NAV_PARITY` and `NAV_CORPUS_DIR` to the separately built
+executables and pinned corpus. Build `nav-port` with default features for 64-bit
+refs, and with `--no-default-features` for 32-bit refs. The crowd payload includes
+the entire corridor after every tick; old payloads containing only `first_poly`
+need to be regenerated with the current harness.

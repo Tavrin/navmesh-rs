@@ -21,3 +21,6 @@ cargo +nightly fuzz run recast_input corpus/recast_input -- -max_len=1048576
 
 Release rule: each target starts from the corpus seeds and runs until its coverage has been
 flat for 10 minutes, for at least 10 and at most 120 CPU-minutes, with no crash.
+
+`crowd_update` creates a bounded crowd on a small mesh and applies arbitrary
+agent positions, targets, velocities, removals, resets and update intervals.

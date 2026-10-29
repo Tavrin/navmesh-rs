@@ -7,8 +7,8 @@
 //! nav-port bench <case-file> [--repeat N]
 //! ```
 //!
-//! Only the Recast stages are produced (geometry through the detail mesh, and
-//! the heightfield layers in tile-cache mode). Mesh paths that are not absolute
+//! Produces Recast, Detour and crowd records. Tile-cache builds need oracle
+//! tiles supplied with `--tiles`. Mesh paths that are not absolute
 //! resolve against `$NAV_CORPUS_DIR`.
 
 use std::path::Path;
@@ -68,6 +68,8 @@ struct Case {
     filter_walkable_low_height: bool,
     area_volumes: Vec<AreaVolume>,
     queries: i32,
+    crowd_agents: usize,
+    crowd_ticks: usize,
     seed: u32,
     /// x0 y0 z0 x1 y1 z1 radius bidir, repeated.
     off_mesh: Vec<f32>,
@@ -168,6 +170,8 @@ fn parse_case(path: &Path) -> Result<Case, String> {
         filter_ledge: true,
         filter_walkable_low_height: true,
         queries: 64,
+        crowd_agents: 0,
+        crowd_ticks: 0,
         seed: 0x9e37_79b9,
         off_mesh: Vec::new(),
         area_volumes: Vec::new(),
@@ -235,7 +239,9 @@ fn parse_case(path: &Path) -> Result<Case, String> {
                 c.off_mesh.extend_from_slice(&x[..8]);
             }
             // Crowd and tile-cache keys: not used by the port yet.
-            "crowd_agents" | "crowd_ticks" | "tc_obstacle" => {}
+            "crowd_agents" => c.crowd_agents = atoi(val) as usize,
+            "crowd_ticks" => c.crowd_ticks = atoi(val) as usize,
+            "tc_obstacle" => {}
             "area_volume" => {
                 let x = floats(val);
                 if x.len() < 9 || !(x.len() - 3).is_multiple_of(2) || x[0] < 1.0 || x[0] > 62.0 {
@@ -1319,6 +1325,7 @@ fn run() -> Result<(), String> {
                     .and_then(|()| record_queries(&case, &nav, &costs, "filtered.", &mut sink))
                     .map_err(|e| format!("queries: {e}"))?;
                 record_malformed(&b, &nav, &mut sink);
+                record_crowds(&case, &b, &mut sink).map_err(|e| format!("crowd: {e}"))?;
                 Ok(())
             });
             let bytes = sink.writer.take().map(|w| w.finish()).unwrap_or_default();
@@ -1380,4 +1387,122 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn record_crowds(c: &Case, b: &Baked, sink: &mut Sink) -> Result<(), Error> {
+    use navmesh_rs::crowd::{AgentId, AgentParams, Crowd, ObstacleAvoidanceParams};
+    if c.crowd_agents == 0 || c.crowd_ticks == 0 {
+        return Ok(());
+    }
+    let names = [
+        "crowd_trajectories",
+        "crowd_quality_0",
+        "crowd_quality_1",
+        "crowd_quality_2",
+        "crowd_quality_3",
+        "crowd_move_velocity",
+        "crowd_remove_readd",
+        "crowd_tile_swap",
+    ];
+    for (variant, name) in names.iter().enumerate() {
+        let mut nav = assemble(b)?;
+        let mut ws = Workspace::new();
+        let mut crowd = Crowd::new(&mut ws, &nav, c.crowd_agents, c.agent_radius)?;
+        if (1..=4).contains(&variant) {
+            for k in 0..4 {
+                crowd.set_obstacle_avoidance_params(k, ObstacleAvoidanceParams::quality(k)?)?;
+            }
+        }
+        let seed = c.seed ^ 0x5bd1e995;
+        let mut rng = Rng(if seed != 0 { seed } else { 1 });
+        let mut ap = AgentParams::default();
+        ap.radius = c.agent_radius;
+        ap.height = c.agent_height;
+        ap.collision_query_range = c.agent_radius * 12.;
+        ap.path_optimization_range = c.agent_radius * 30.;
+        ap.obstacle_avoidance_type = if (1..=4).contains(&variant) {
+            variant - 1
+        } else {
+            3
+        };
+        let add = |nav: &NavMesh,
+                   crowd: &mut Crowd,
+                   ws: &mut Workspace,
+                   rng: &mut Rng|
+         -> Result<(), Error> {
+            let q = NavMeshQuery::new(nav, 2048)?;
+            let f = DefaultFilter::default();
+            let (_, p0) = q.find_random_point(&f, &mut || rng.frand())?;
+            let (r1, p1) = q.find_random_point(&f, &mut || rng.frand())?;
+            let id = crowd.add_agent(ws, nav, p0, ap)?;
+            crowd.request_move_target(nav, id, r1, p1)
+        };
+        for _ in 0..c.crowd_agents {
+            add(&nav, &mut crowd, &mut ws, &mut rng)?;
+        }
+        if variant == 5 {
+            for i in (1..c.crowd_agents).step_by(2) {
+                let a = crowd.agent(AgentId(i)).ok_or(Error::Failed)?;
+                let d = [a.target_pos[0] - a.npos[0], 0., a.target_pos[2] - a.npos[2]];
+                let len = (d[0] * d[0] + d[2] * d[2]).sqrt();
+                let mut v = [0.; 3];
+                if len > 0.0001 {
+                    let scale = 0.5 * ap.max_speed / len;
+                    v = d.map(|x| x * scale);
+                }
+                crowd.request_move_velocity(AgentId(i), v)?;
+            }
+        }
+        let mut p = Payload::new();
+        p.u32(c.crowd_ticks as u32);
+        for t in 0..c.crowd_ticks {
+            if variant == 5 && t == c.crowd_ticks / 2 {
+                for i in (0..c.crowd_agents).step_by(3) {
+                    crowd.reset_move_target(AgentId(i))?;
+                }
+            }
+            if variant == 6 && t == c.crowd_ticks / 3 {
+                for i in (1..c.crowd_agents).step_by(4) {
+                    crowd.remove_agent(AgentId(i))?;
+                }
+            }
+            if variant == 6 && t == 2 * c.crowd_ticks / 3 {
+                for _ in (1..c.crowd_agents).step_by(4) {
+                    add(&nav, &mut crowd, &mut ws, &mut rng)?;
+                }
+            }
+            if variant == 7
+                && t == c.crowd_ticks / 2
+                && let Some(a) = crowd.agent(AgentId(0))
+                && let Ok((tile, _)) = nav.tile_and_poly_by_ref(a.corridor.first_poly())
+            {
+                let h = &tile.header;
+                let loc = (h.x, h.y, h.layer);
+                if let Some((x, y, l, data)) =
+                    b.tiles.iter().find(|(x, y, l, _)| (*x, *y, *l) == loc)
+                {
+                    let i = nav.tile_index_at(*x, *y, *l).ok_or(Error::Failed)?;
+                    nav.remove_tile(nav.tile_ref(i))?;
+                    nav.add_tile(data.clone())?;
+                }
+            }
+            crowd.update(&mut ws, &nav, 1. / 30.)?;
+            p.u32(t as u32)
+                .u32(crowd.agents().iter().filter(|a| a.active).count() as u32);
+            for (i, a) in crowd.agents().iter().enumerate().filter(|(_, a)| a.active) {
+                p.u32(i as u32).u8(a.state as u8).u8(a.target_state as u8);
+                p.v3(a.npos).v3(a.vel).v3(a.nvel);
+                put_ref(&mut p, a.corridor.first_poly());
+                p.i32(a.corners.len() as i32);
+                p.u32(a.corridor.path().len() as u32);
+                for &r in a.corridor.path() {
+                    put_ref(&mut p, r);
+                }
+            }
+        }
+        if let Some(w) = &mut sink.writer {
+            w.record(name, p.as_bytes());
+        }
+    }
+    Ok(())
 }

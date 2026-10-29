@@ -73,7 +73,7 @@ fn crowd(ticks: u32, bump: Option<(u32, f32)>) -> Vec<u8> {
             }
             p.u32(i).u8(1).u8(3);
             p.v3([x, 0.5, 2.0]).v3([3.0, 0.0, 0.0]).v3([3.0, 0.0, 0.0]);
-            p.u32(0x1000 + i).i32(2);
+            p.u32(0x1000 + i).i32(2).u32(1).u32(0x1000 + i);
         }
     }
     p.into_bytes()
@@ -385,4 +385,18 @@ fn crowd_tolerance_rejects_a_cell_size_that_is_not_finite_and_positive() {
             "cs {cs}: {outcome:?}"
         );
     }
+}
+
+#[test]
+fn crowd_full_corridor_difference_names_the_polygon() {
+    let mut b = base();
+    // Tick header, first agent's original 50-byte state, corridor count,
+    // then the first corridor ref. This changes neither its first_poly nor pose.
+    b[2].1[4 + 8 + 50 + 4] ^= 1;
+    let (passed, outcome) = outcome_of(&base(), &b, Options::default(), "crowd_trajectories");
+    assert!(!passed);
+    assert!(
+        matches!(&outcome, Outcome::Different(m) if m.starts_with("ticks[0].agents[0].corridor[0].poly")),
+        "{outcome:?}"
+    );
 }

@@ -6,7 +6,19 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Clear crowd animation, movement targets and cached state when reusing agent slots.
+- Charge proximity-grid collision chains to the update work budget; reject stale
+  targets, exhausted helper pools and zero agent speeds with typed errors.
+- Make crowd state enums and parameter structs non-exhaustive; retain default and
+  quality-preset construction. Document the adaptive sampler's C++ parity domain.
+
 ### Added
+
+- DetourCrowd: crowd manager, corridor maintenance, local walls, proximity grid,
+  sliced path queue, steering, separation, grid and adaptive avoidance, and off-mesh
+  animation; full per-tick trajectory and corridor comparison with the reference.
 
 - Recast port: every generation stage from walkable-triangle marking to the detail mesh,
   the three partitions (watershed, monotone, layers), area volumes and heightfield layers.

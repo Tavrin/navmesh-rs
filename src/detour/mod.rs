@@ -31,10 +31,10 @@
 )]
 
 mod builder;
-mod math;
+pub(crate) mod math;
 mod navmesh;
 mod node;
-mod query;
+pub(crate) mod query;
 mod query_local;
 mod tile;
 

@@ -4,6 +4,10 @@ navmesh-rs is an altered, translated version of recastnavigation
 Our changes and additions are licensed under MIT OR Apache-2.0 (LICENSE-MIT,
 LICENSE-APACHE). The recastnavigation licence is reproduced below unaltered.
 
+Translated crowd sources: DetourCrowd.cpp, DetourPathCorridor.cpp,
+DetourLocalBoundary.cpp, DetourObstacleAvoidance.cpp, DetourProximityGrid.cpp,
+DetourPathQueue.cpp and their public headers (DetourCrowd/Source and Include).
+
 --------------------------------------------------------------------------------
 
 Copyright (c) 2009 Mikko Mononen memon@inside.org

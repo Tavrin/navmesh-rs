@@ -706,7 +706,9 @@ fn crowd(c: &mut Cursor) -> DecodeResult<()> {
             c.v3("vel")?;
             c.v3("nvel")?;
             c.poly_ref("first_poly")?;
-            c.i32("corners").map(drop)
+            c.i32("corners")?;
+            let n = c.count_u32("corridor_count", 4)?;
+            c.array("corridor", n, |c, _| c.poly_ref("poly").map(drop))
         })
     })
 }

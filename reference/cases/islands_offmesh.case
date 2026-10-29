@@ -6,3 +6,5 @@ queries = 32
 # x0 y0 z0  x1 y1 z1  radius bidirectional
 off_mesh = 7.5 0.5 4.0  14.5 1.0 4.0  0.6 1
 off_mesh = 4.0 0.5 7.5  4.0 2.0 14.5  0.6 0
+crowd_agents = 8
+crowd_ticks = 300
