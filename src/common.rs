@@ -184,7 +184,7 @@ impl Workspace {
         }
     }
 
-    fn charge_bytes<T>(&mut self, n: usize) -> Result<(), Error> {
+    pub(crate) fn charge_bytes<T>(&mut self, n: usize) -> Result<(), Error> {
         let bytes = n
             .checked_mul(core::mem::size_of::<T>())
             .ok_or(Error::SizeOverflow)?;
@@ -360,4 +360,17 @@ pub(crate) fn vmax(mx: &mut [f32; 3], v: &[f32]) {
 #[inline(always)]
 pub(crate) fn v3(s: &[f32]) -> [f32; 3] {
     [s[0], s[1], s[2]]
+}
+
+#[cfg(feature = "crowd")]
+#[inline]
+pub(crate) fn sinf(x: f32) -> f32 {
+    #[cfg(all(feature = "std", not(feature = "libm")))]
+    {
+        x.sin()
+    }
+    #[cfg(feature = "libm")]
+    {
+        libm::sinf(x)
+    }
 }

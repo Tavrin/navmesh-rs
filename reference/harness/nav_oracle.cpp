@@ -1402,6 +1402,8 @@ void recordCrowd(const Case& c, dtNavMesh* nav, const Baked& b, CrowdVariant var
             r.s.u32((uint32_t)i); r.s.u8(ag->state); r.s.u8(ag->targetState);
             r.s.v3(ag->npos); r.s.v3(ag->vel); r.s.v3(ag->nvel);
             r.s.ref(ag->corridor.getFirstPoly()); r.s.i32(ag->ncorners);
+            r.s.u32((uint32_t)ag->corridor.getPathCount());
+            for (int k = 0; k < ag->corridor.getPathCount(); ++k) r.s.ref(ag->corridor.getPath()[k]);
         }
     }
     dtFreeCrowd(crowd);

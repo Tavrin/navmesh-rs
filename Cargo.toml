@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-description = "Pure-Rust port of recastnavigation's Recast (navmesh generation) and Detour (navmesh queries), bit-exact with upstream"
+description = "Pure-Rust port of recastnavigation's Recast, Detour and DetourCrowd, bit-exact with upstream"
 repository = "https://github.com/Tavrin/navmesh-rs"
 readme = "README.md"
 keywords = ["navmesh", "recast", "detour", "pathfinding", "gamedev"]
@@ -15,7 +15,7 @@ include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APAC
 name = "navmesh_rs"
 
 [features]
-default = ["std", "recast", "detour", "polyref64"]
+default = ["std", "recast", "detour", "crowd", "polyref64"]
 # Use the platform libm through std for sqrt/floor/ceil/cos (bit-identical to the
 # C++ oracle on x86-64 glibc).
 std = []
@@ -26,6 +26,8 @@ libm = ["dep:libm"]
 recast = []
 # Navmesh runtime, tile data and queries (Detour).
 detour = []
+# Agent simulation and local avoidance (DetourCrowd).
+crowd = ["detour"]
 # 64-bit poly refs (upstream's DT_POLYREF64); without it refs are 32-bit. The width
 # is part of the tile byte format (links hold refs).
 polyref64 = []

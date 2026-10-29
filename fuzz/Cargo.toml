@@ -37,3 +37,10 @@ bench = false
 
 # Not part of the main workspace (nightly-only, libFuzzer).
 [workspace]
+
+[[bin]]
+name = "crowd_update"
+path = "fuzz_targets/crowd_update.rs"
+test = false
+doc = false
+bench = false

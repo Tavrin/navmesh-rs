@@ -36,8 +36,9 @@ The record kinds and their exact contents are listed in
   searches around a circle and a shape, local neighbourhood, wall segments, closest points,
   heights and random points), and `malformed_tiles`: upstream's verdicts on a set of corrupted and
   conflicting tiles.
-- **Not yet compared:** crowd records and tile-cache records (layer data, obstacle scripts), which
-  the driver already writes.
+- **Crowd:** eight trajectory variants with position, actual and chosen velocity, agent and
+  target states, corner count and every corridor polygon after each tick.
+- **Not yet compared:** tile-cache records (layer data and obstacle scripts).
 
 Generation, tile bytes and queries must be bit-exact. Timing and memory are not part of the
 records.
@@ -72,6 +73,7 @@ cases. Both widths give the same table.
 | 21 Detour query families, each under two filters | equal on all 19 cases (38 / 38 records per family) |
 | `malformed_tiles` | 19 / 19 |
 | `navmesh_tiles` | 17 / 19 (the two tile-cache cases, see below) |
+| Crowd trajectories, eight variants with full corridors | 72 / 72 in both debug and release, per ref width |
 
 On the two tile-cache cases (`dungeon_tilecache`, `seams_tilecache`) upstream builds the tiles
 with DetourTileCache, which is not ported, so the port writes no `navmesh_tiles` record there.
@@ -81,6 +83,62 @@ every query family and `malformed_tiles` is equal on them too.
 The driver's own records are reproducible: two runs of the whole corpus give byte-identical
 record files. Under `wasm32-wasip1` (Wasmtime), the port's record files are byte-identical to
 the native ones on the two cases checked (`godot_level_solo`, `dungeon_tiled`).
+
+## Crowd results
+
+The nine crowd cases below are compared bit for bit, without the tolerance option,
+in debug and release with both 32-bit and 64-bit polygon references. Each case runs
+all eight variants: default avoidance, the four demo quality levels, velocity
+requests with target resets, agent removal and re-addition, and a tile swap.
+
+| Case | Agents | Configured ticks per variant |
+|---|---:|---:|
+| `dungeon_tiled` | 16 | 300 |
+| `godot_level_solo` | 8 | 200 |
+| `islands_offmesh` | 8 | 300 |
+| `multilevel_solo` | 8 | 200 |
+| `nav_test_areas` | 8 | 200 |
+| `nav_test_solo` | 16 | 300 |
+| `seams_tilecache` | 8 | 150 |
+| `terrain_small_tiled` | 32 | 300 |
+| `undulating_crowd` | 32 | 300 |
+
+The configured runs compare 18,000 simulation ticks and 294,498 active-agent ticks
+per build and reference width: 72,000 simulation ticks and 1,177,992 active-agent
+comparisons altogether, with zero mismatches. Entire Rust record files from two
+independent runs are identical on all nine crowd cases, in both ref widths. The
+longest recorded corridor has 54 polygons. The island case exercises off-mesh
+animation in all eight variants (512 active-agent ticks per build and width).
+
+The design gate also runs all nine cases for 300 ticks per variant, using case
+copies so the configured inputs stay unchanged. All 72 records are bit-exact per
+build and width: 21,600 simulation ticks and 323,000 active-agent ticks per build
+and width, or 86,400 simulation-tick comparisons and 1,292,000 active-agent
+comparisons across all four combinations. Mismatches: **0**. Independent repeat
+files are identical. `reference/run-crowd-parity.sh` reproduces the 300-tick release
+comparison and repeat check from separately built drivers.
+
+Final gates pass: workspace tests (40 tests and 3 doctests), 32-bit tests, clippy in both ref widths,
+debug/release builds in both widths, Rust 1.88, native `no_std`, wasm32 build, documentation,
+formatting, public text, and compilation of the crowd fuzz target. An initial lint
+failure in the record driver was fixed and the complete lint gate passed again.
+
+The two tile-cache cases still use oracle tile bytes; the crowd comparison on
+`seams_tilecache` runs those bytes through the port's validating reader and navmesh.
+No tile-cache implementation is implied.
+
+Unit tests cover invalid vectors, parameters and handles, exhausted memory/work
+limits, independent per-call helper budgets, capacity, slot reuse, deterministic
+trajectories, tile replacement, both
+avoidance samplers, grid coordinate limits, corridor movement and queue expiry.
+The `crowd_update` fuzz target is compiled but has not been run. Native `no_std` +
+`alloc` with `libm`, and `wasm32-unknown-unknown`, build successfully. Crowd runtime
+trajectories on wasm and the cross-platform `libm` tolerance are not verified here.
+
+Upstream's adaptive pattern reads uninitialized storage for even angular division
+counts; the Rust sampler uses zero-initialized storage there. The recorded presets
+use five or seven divisions. Grid coordinates beyond the upstream signed 16-bit
+cell range return a typed error.
 
 ## Beyond the records
 
@@ -94,8 +152,8 @@ the native ones on the two cases checked (`godot_level_solo`, `dungeon_tiled`).
 
 ## Not covered yet
 
-- DetourCrowd and DetourTileCache are not ported, so crowd records, tile-cache records and the
-  `navmesh_tiles` of the two tile-cache cases are not compared.
+- DetourTileCache is not ported, so tile-cache records and the `navmesh_tiles` of the
+  two tile-cache cases are not compared.
 - Only x86-64 Linux with glibc has been compared with upstream. Other platforms can differ in the
   last bit where upstream calls `cos`/`sin`; the `libm` feature has not been compared with the
   driver.

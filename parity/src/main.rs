@@ -21,7 +21,7 @@ use navmesh_parity::schema::{kind_of, type_of};
 use navmesh_parity::{Error, RecordFile};
 
 const USAGE: &str = "usage:
-  nav-parity diff  <a> <b> [--crowd-tolerance] [--no-validate] [--recast | --detour]
+  nav-parity diff  <a> <b> [--crowd-tolerance] [--no-validate] [--recast | --detour | --crowd]
   nav-parity check <file-or-dir>...
   nav-parity list  <file>";
 
@@ -225,6 +225,7 @@ fn main() -> ExitCode {
                     "--no-validate" => opts.validate = false,
                     "--recast" => opts.only = Some(navmesh_parity::schema::is_recast),
                     "--detour" => opts.only = Some(navmesh_parity::schema::is_detour_phase),
+                    "--crowd" => opts.only = Some(navmesh_parity::schema::is_crowd),
                     _ if a.starts_with("--") => {
                         eprintln!("unknown option {a}\n{USAGE}");
                         return ExitCode::from(2);

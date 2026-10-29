@@ -1,7 +1,8 @@
 # navmesh-rs
 
 A pure-Rust port of [recastnavigation](https://github.com/recastnavigation/recastnavigation)'s
-Recast (navmesh generation) and Detour (navmesh runtime and queries).
+Recast (navmesh generation), Detour (navmesh runtime and queries), and DetourCrowd
+(agent simulation and local avoidance).
 
 The port follows upstream function by function and is checked against it record by record: on
 x86-64 Linux with default features, every Recast stage, the navmesh tile bytes and every Detour
@@ -85,6 +86,41 @@ fn build_and_query(verts: &[f32], tris: &[i32]) -> Result<(), Error> {
 Tiled navmeshes use `NavMesh::new` with `NavMeshParams` and `add_tile` per tile. The crate
 documentation lists every stage and query.
 
+## Crowd
+
+Enable the default `crowd` feature to manage agents over an existing navmesh.
+Targets use polygon references from `NavMeshQuery::find_nearest_poly`.
+
+```rust
+use navmesh_rs::{Error, Workspace};
+use navmesh_rs::crowd::{AgentParams, Crowd};
+use navmesh_rs::detour::{DefaultFilter, NavMesh, NavMeshQuery};
+
+fn simulate(nav: &NavMesh, start: [f32; 3], goal: [f32; 3]) -> Result<(), Error> {
+    let mut ws = Workspace::new();
+    let mut crowd = Crowd::new(&mut ws, nav, 64, 0.6)?;
+    let agent = crowd.add_agent(&mut ws, nav, start, AgentParams::default())?;
+    let query = NavMeshQuery::new(nav, 512)?;
+    let (poly, target, _) = query.find_nearest_poly(&goal, &[2.0, 4.0, 2.0], &DefaultFilter::default())?;
+    crowd.request_move_target(agent, poly, target)?;
+    for _ in 0..300 {
+        crowd.update(&mut ws, nav, 1.0 / 30.0)?;
+        let position = crowd.agent(agent).ok_or(Error::InvalidRef)?.npos;
+        // Use position to drive the caller's presentation.
+        let _ = position;
+    }
+    crowd.remove_agent(agent)?;
+    Ok(())
+}
+```
+
+`Crowd` provides target and velocity requests, target resets, sixteen query filters,
+eight avoidance parameter slots, and read-only agent state. `PathCorridor`,
+`LocalBoundary`, `ObstacleAvoidanceQuery`, `ProximityGrid`, and `PathQueue` can also
+be used independently. Agent handles name reusable slots. The mesh is borrowed only
+during calls, allowing tile changes between ticks. An update error may leave earlier
+phases applied; do not consume that tick as a successful simulation result.
+
 ## What it adds over the C++ library
 
 - No C++ toolchain or bindings; builds for `wasm32` and for `no_std` targets (with `alloc`).
@@ -103,21 +139,22 @@ documentation lists every stage and query.
 |---|---|---|
 | `recast` | yes | navmesh generation |
 | `detour` | yes | tile data, navmesh, queries |
+| `crowd` | yes | Agent simulation, corridors, avoidance and path queue; implies `detour`. |
 | `std` | yes | floating-point functions from the platform libm |
 | `libm` | no | floating-point functions from the `libm` crate; required without `std` |
 | `polyref64` | yes | 64-bit poly refs; off gives upstream's 32-bit refs |
 
-`no_std`: `default-features = false, features = ["libm", "recast", "detour", "polyref64"]`.
+`no_std`: `default-features = false, features = ["libm", "recast", "detour", "crowd", "polyref64"]`.
 
 ## Status and limits
 
-- Ported and checked: Recast and Detour.
-- Not ported yet: DetourCrowd (crowds and local avoidance) and DetourTileCache (layers,
+- Ported: Recast, Detour and DetourCrowd.
+- Not ported yet: DetourTileCache (layers,
   obstacles, incremental rebuild), merging and copying polygon meshes, and big-endian tile data.
 - The API follows upstream's stage functions; there is no single-call bake helper yet.
 - Bit-exactness with the C++ library is checked on x86-64 Linux with glibc. On other
   platforms the results can differ in the last bit where upstream calls `cos`/`sin`
-  (the walkable-slope threshold).
+  (the walkable-slope threshold and avoidance sampling).
 - Speed: the query set and the Recast stages take about 1.1 to 1.35 times the instructions of
   the C++ library on the test corpus; no optimisation work has been done yet.
 

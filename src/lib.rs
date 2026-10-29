@@ -35,15 +35,18 @@
 //!   distance to wall, move along surface, polygon searches, wall segments,
 //!   random points and height queries, with [`detour::DefaultFilter`] or a custom
 //!   [`detour::QueryFilter`].
+//! - Crowd (feature `crowd`): [`crowd::Crowd`], corridors, local walls, proximity
+//!   grid, sliced path queue, steering, separation and sampled avoidance.
 //! - `no_std` + `alloc`, `wasm32`, no `unsafe` code.
 //!
-//! Not yet ported: DetourCrowd, DetourTileCache, merging and copying polygon
+//! Not yet ported: DetourTileCache, merging and copying polygon
 //! meshes, and big-endian tile data.
 //!
 //! # Features
 //!
 //! - `recast` (default): navmesh generation.
 //! - `detour` (default): tile data, navmesh and queries.
+//! - `crowd` (default): agent simulation and local avoidance; implies `detour`.
 //! - `std` (default): floating-point functions from the platform libm.
 //! - `libm`: floating-point functions from the `libm` crate; required without `std`.
 //! - `polyref64` (default): 64-bit poly refs (upstream's `DT_POLYREF64`); without it
@@ -144,6 +147,9 @@ pub mod recast;
 pub mod detour;
 
 // Compiles the README's code blocks as doctests.
-#[cfg(all(doctest, feature = "recast", feature = "detour"))]
+#[cfg(all(doctest, feature = "recast", feature = "detour", feature = "crowd"))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+#[cfg(feature = "crowd")]
+pub mod crowd;

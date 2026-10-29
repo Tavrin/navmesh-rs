@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- DetourCrowd: crowd manager, corridor maintenance, local walls, proximity grid,
+  sliced path queue, steering, separation, grid and adaptive avoidance, and off-mesh
+  animation; full per-tick trajectory and corridor comparison with the reference.
+
 - Recast port: every generation stage from walkable-triangle marking to the detail mesh,
   the three partitions (watershed, monotone, layers), area volumes and heightfield layers.
 - Detour port: tile data creation in upstream's `DNAV` v7 layout (32- and 64-bit poly refs),

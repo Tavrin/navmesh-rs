@@ -32,6 +32,8 @@ pub struct Agent {
     pub first_poly: u64,
     /// Number of steering corners.
     pub corners: i32,
+    /// Every polygon of the path corridor.
+    pub corridor: Vec<u64>,
 }
 
 /// All active agents after one tick.
@@ -62,6 +64,15 @@ pub fn parse(payload: &[u8], ref_bits: u32) -> DecodeResult<Vec<Tick>> {
                 nvel: c.v3("nvel")?,
                 first_poly: c.poly_ref("first_poly")?,
                 corners: c.i32("corners")?,
+                corridor: {
+                    let n = c.count_u32("corridor_count", 4)?;
+                    let mut path = Vec::with_capacity(n);
+                    c.array("corridor", n, |c, _| {
+                        path.push(c.poly_ref("poly")?);
+                        Ok(())
+                    })?;
+                    path
+                },
             });
             Ok(())
         })?;
@@ -85,6 +96,7 @@ fn bit_equal(a: &Agent, b: &Agent) -> bool {
         && bits(a.nvel) == bits(b.nvel)
         && a.first_poly == b.first_poly
         && a.corners == b.corners
+        && a.corridor == b.corridor
 }
 
 /// Outcome of a tolerance comparison: the largest position error seen, or the
