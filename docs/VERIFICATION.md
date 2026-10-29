@@ -134,7 +134,8 @@ Unit tests cover invalid vectors, parameters and handles, exhausted memory/work
 limits, independent per-call helper budgets, capacity, slot reuse, deterministic
 trajectories, tile replacement, both
 avoidance samplers, grid coordinate limits, corridor movement and queue expiry.
-The `crowd_update` fuzz target is compiled but has not been run. Native `no_std` +
+The `crowd_update` fuzz target has run under the release rule with no crash
+([`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md)). Native `no_std` +
 `alloc` with `libm`, and `wasm32-unknown-unknown`, build successfully. Crowd runtime
 trajectories on wasm and the cross-platform `libm` tolerance are not verified here.
 
