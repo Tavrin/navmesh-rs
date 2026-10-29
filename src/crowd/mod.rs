@@ -43,8 +43,20 @@ pub const OPTIMIZE_TOPO: u8 = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentId(pub usize);
 /// Locomotion state, with upstream numeric values.
+///
+/// ```compile_fail,E0004
+/// use navmesh_rs::crowd::AgentState;
+/// fn code(state: AgentState) -> u8 {
+///     match state {
+///         AgentState::Invalid => 0,
+///         AgentState::Walking => 1,
+///         AgentState::Offmesh => 2,
+///     }
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum AgentState {
     /// No valid position.
     Invalid = 0,
@@ -54,8 +66,24 @@ pub enum AgentState {
     Offmesh = 2,
 }
 /// Move request state, with upstream numeric values.
+///
+/// ```compile_fail,E0004
+/// use navmesh_rs::crowd::TargetState;
+/// fn code(state: TargetState) -> u8 {
+///     match state {
+///         TargetState::None => 0,
+///         TargetState::Failed => 1,
+///         TargetState::Valid => 2,
+///         TargetState::Requesting => 3,
+///         TargetState::WaitingForQueue => 4,
+///         TargetState::WaitingForPath => 5,
+///         TargetState::Velocity => 6,
+///     }
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum TargetState {
     /// No request.
     None = 0,
@@ -65,7 +93,7 @@ pub enum TargetState {
     Valid = 2,
     /// Quick search pending.
     Requesting = 3,
-    /// Waiting for queue capacity.
+    /// Waiting for queue capacity; updates retry the request in upstream order.
     WaitingForQueue = 4,
     /// Sliced search pending.
     WaitingForPath = 5,
@@ -73,7 +101,14 @@ pub enum TargetState {
     Velocity = 6,
 }
 /// Physical dimensions and steering settings for an agent.
+/// Construct with [`Self::default`] and assign the desired fields.
+///
+/// ```compile_fail,E0639
+/// use navmesh_rs::crowd::AgentParams;
+/// let params = AgentParams { radius: 0.5, ..AgentParams::default() };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct AgentParams {
     /// Positive radius, no larger than the crowd's maximum.
     pub radius: f32,
@@ -81,7 +116,7 @@ pub struct AgentParams {
     pub height: f32,
     /// Maximum acceleration per second.
     pub max_acceleration: f32,
-    /// Maximum desired speed.
+    /// Positive maximum desired speed (zero is rejected).
     pub max_speed: f32,
     /// Neighbour and wall search range.
     pub collision_query_range: f32,
@@ -117,16 +152,13 @@ impl AgentParams {
         for v in [
             self.radius,
             self.height,
+            self.max_speed,
             self.collision_query_range,
             self.path_optimization_range,
         ] {
             positive(v)?;
         }
-        for v in [
-            self.max_acceleration,
-            self.max_speed,
-            self.separation_weight,
-        ] {
+        for v in [self.max_acceleration, self.separation_weight] {
             nonnegative(v)?;
         }
         if self.radius > max_radius
@@ -189,6 +221,36 @@ pub struct CrowdAgent {
     nneis: usize,
     disp: V3,
     anim: Animation,
+}
+impl CrowdAgent {
+    // Preserve allocated storage, but no state belonging to a previous occupant.
+    fn reset_slot(&mut self) {
+        self.active = false;
+        self.state = AgentState::Invalid;
+        self.target_state = TargetState::None;
+        self.npos = [0.; 3];
+        self.vel = [0.; 3];
+        self.nvel = [0.; 3];
+        self.dvel = [0.; 3];
+        self.desired_speed = 0.;
+        self.corridor.path.clear();
+        self.corridor.pos = [0.; 3];
+        self.corridor.target = [0.; 3];
+        self.boundary.reset();
+        self.corners.clear();
+        self.params = AgentParams::default();
+        self.target_ref = 0;
+        self.target_pos = [0.; 3];
+        self.partial = false;
+        self.topology_time = 0.;
+        self.replan_time = 0.;
+        self.replan = false;
+        self.pathq = 0;
+        self.neis.fill((0, 0.));
+        self.nneis = 0;
+        self.disp = [0.; 3];
+        self.anim = Animation::default();
+    }
 }
 /// Fixed-capacity single-threaded crowd manager.
 pub struct Crowd {
@@ -338,18 +400,10 @@ impl Crowd {
             .unwrap_or((0, pos, false));
         let nearest = if r == 0 { pos } else { nearest };
         let a = &mut self.agents[idx];
+        a.reset_slot();
         a.params = p;
         a.corridor.reset(r, nearest)?;
-        a.boundary.reset();
-        a.partial = false;
-        a.topology_time = 0.;
-        a.replan_time = 0.;
-        a.nneis = 0;
-        a.dvel = [0.; 3];
-        a.nvel = [0.; 3];
-        a.vel = [0.; 3];
         a.npos = nearest;
-        a.desired_speed = 0.;
         a.state = if r != 0 {
             AgentState::Walking
         } else {
@@ -359,9 +413,9 @@ impl Crowd {
         a.active = true;
         Ok(AgentId(idx))
     }
-    /// Releases a slot for reuse.
+    /// Releases a slot for reuse, clearing its animation, target and cached state.
     pub fn remove_agent(&mut self, id: AgentId) -> Result<(), Error> {
-        self.agent_mut(id)?.active = false;
+        self.agent_mut(id)?.reset_slot();
         Ok(())
     }
     /// Updates physical and steering settings for an active slot.
@@ -371,9 +425,16 @@ impl Crowd {
         Ok(())
     }
     /// Requests a new target polygon and position; processed on the next update.
-    pub fn request_move_target(&mut self, id: AgentId, r: PolyRef, pos: V3) -> Result<(), Error> {
+    /// Returns [`Error::InvalidRef`] for zero, stale or nonexistent refs in `nav`.
+    pub fn request_move_target(
+        &mut self,
+        nav: &NavMesh,
+        id: AgentId,
+        r: PolyRef,
+        pos: V3,
+    ) -> Result<(), Error> {
         finite(pos)?;
-        if r == 0 {
+        if !nav.is_valid_poly_ref(r) {
             return Err(Error::InvalidRef);
         }
         let a = self.agent_mut(id)?;

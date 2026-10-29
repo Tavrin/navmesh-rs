@@ -118,10 +118,13 @@ comparisons across all four combinations. Mismatches: **0**. Independent repeat
 files are identical. `reference/run-crowd-parity.sh` reproduces the 300-tick release
 comparison and repeat check from separately built drivers.
 
-Final gates pass: workspace tests (40 tests and 3 doctests), 32-bit tests, clippy in both ref widths,
+Final gates pass: workspace tests (48 tests and 7 doctests), 32-bit tests (33 tests), clippy in both ref widths,
 debug/release builds in both widths, Rust 1.88, native `no_std`, wasm32 build, documentation,
 formatting, public text, and compilation of the crowd fuzz target. An initial lint
 failure in the record driver was fixed and the complete lint gate passed again.
+After the crowd review fixes, both complete campaigns above were rerun against
+fresh reference records: zero mismatches, identical repeat files, and all count
+assertions passed. All 16 crowd regression tests pass in both ref widths.
 
 The two tile-cache cases still use oracle tile bytes; the crowd comparison on
 `seams_tilecache` runs those bytes through the port's validating reader and navmesh.
@@ -135,10 +138,59 @@ The `crowd_update` fuzz target is compiled but has not been run. Native `no_std`
 `alloc` with `libm`, and `wasm32-unknown-unknown`, build successfully. Crowd runtime
 trajectories on wasm and the cross-platform `libm` tolerance are not verified here.
 
-Upstream's adaptive pattern reads uninitialized storage for even angular division
-counts; the Rust sampler uses zero-initialized storage there. The recorded presets
-use five or seven divisions. Grid coordinates beyond the upstream signed 16-bit
-cell range return a typed error.
+### Deliberate differences from C++
+
+The pin above is the source of truth for defined, valid-use behavior. These safety
+and resource differences do not alter any recorded crowd trajectory:
+
+- **Slot lifetime:** `dtCrowd::removeAgent` only clears `active`, and `addAgent`
+  leaves animation, target, corner and queue metadata behind. Rust resets the entire
+  slot on removal and addition, preserving allocated buffers. A replacement cannot
+  inherit an off-mesh animation or a request. Already submitted queue searches
+  finish or expire independently; their handles are no longer retained by the slot.
+- **Work limits:** C++ walks proximity-grid hash chains without a budget. Rust
+  charges every queried cell and every visited chain entry, even nonmatching hash
+  collisions, before processing it. Exhaustion returns `Error::LimitExceeded`.
+- **References and capacity:** C++ accepts any nonzero crowd target ref. Rust's
+  `request_move_target` borrows the current mesh and rejects zero, fabricated and
+  stale refs with `Error::InvalidRef`, without changing the request. `PathQueue`
+  also validates both refs when enqueuing. C++ silently drops excess grid/avoidance
+  entries and returns an invalid handle for a full queue. Rust returns
+  `Error::BufferTooSmall` for full agent, grid, avoidance-circle/segment and path
+  queue pools. Grid insertions check all required cells before changing the grid.
+  Inside `Crowd`, queue saturation leaves the agent in the publicly readable
+  `TargetState::WaitingForQueue`; subsequent updates retry in upstream order.
+  Grid query output retains upstream's bounded, deduplicated result order and
+  returns the filled count when the caller's id slice is full.
+- **Speed:** C++ accepts `maxSpeed == 0`, then divides off-mesh duration by it,
+  potentially keeping the animation active forever. Rust requires finite,
+  strictly positive `AgentParams::max_speed` on both addition and parameter
+  updates. Zero returns `Error::InvalidParameter` before changing the slot.
+- **Adaptive sampling:** `sampleVelocityAdaptive` declares an uninitialized
+  `pat` float array. For each even angular division count, its final branch writes
+  sample `npat + 1` (float indices `npat*2 + 2` and `npat*2 + 3`), then increments
+  `npat`, leaving the preceding sample unwritten and subsequently reading it.
+  With 32 divisions and four rings, that last write also exceeds C++'s 129-sample
+  array. Rust retains zero-initialized storage, room for the extra write, and the
+  pinned indexing; even counts have defined, repeatable output, with **no C++ parity
+  claim**. Within the accepted parameter ranges, the adaptive pattern is fully
+  initialized upstream exactly for odd `adaptive_divs` in `1, 3, ..., 31`, with
+  `adaptive_rings` in `1..=4` and `adaptive_depth` in `1..=32`. Those combinations
+  retain C++ arithmetic and sampling order on the oracle platform, provided all
+  other inputs are valid, capacities and budgets suffice, and no other deliberate
+  difference above is triggered. The recorded presets exercise divisions 5/7,
+  rings 2/3 and depths 1/2/3/5; the corpus does not exhaust the whole odd-division
+  parameter space. Grid sampling does not read the adaptive pattern, so its
+  parity domain does not depend on division parity.
+- **Cell domain:** Rust rejects cells outside the upstream signed-16-bit range
+  with `Error::FormatLimit`, instead of truncating coordinates.
+
+Regression tests cover removal during an actual off-mesh crossing and reuse at a
+new location, colliding grid chains with insufficient and exact budgets, invalid
+nonzero refs, atomic grid insertion and full helper pools, zero speed at a link
+entrance, default/preset parameter customization, and finite repeatable adaptive
+sampling for every even division count and ring count at depths 1/3/32. Four
+compile-fail doctests enforce non-exhaustive parameter structs and state enums.
 
 ## Beyond the records
 

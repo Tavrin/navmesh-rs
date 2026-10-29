@@ -174,6 +174,11 @@ belong to the port's fuzz targets, where the verdict is a typed error.
 | Tile cache after obstacle scripts | byte-exact navmesh tiles | integer layer algorithms; `cosf`/`sinf` only for oriented boxes, computed once per obstacle (same libm rule as the crowd) |
 | Timing, memory | not compared | measured separately (`nav_oracle bench`, `nav-port bench`) |
 
+Crowd exactness applies to valid inputs in the domain documented under
+"Deliberate differences from C++" in `docs/VERIFICATION.md`. In particular, adaptive
+sampling with even division counts reads uninitialized storage upstream and has
+no C++ parity claim; all recorded presets use odd divisions.
+
 A tolerance is never introduced to make a failing record pass. If a bit-exact record differs,
 the port is wrong until a decoded dump shows the cause is one of the listed libm sites.
 

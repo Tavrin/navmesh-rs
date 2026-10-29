@@ -73,9 +73,15 @@ impl ProximityGrid {
         let [x0, y0, x1, y1] = self.cells(b)?;
         Ok((i64::from(x1) - i64::from(x0) + 1) as u64 * (i64::from(y1) - i64::from(y0) + 1) as u64)
     }
-    /// Adds an item to every touched cell; excess entries are dropped as upstream.
+    /// Adds an item to every touched cell.
+    /// Returns [`Error::BufferTooSmall`] without changing the grid if the pool
+    /// cannot hold every touched cell.
     pub fn add_item(&mut self, id: u16, b: [f32; 4]) -> Result<(), Error> {
         let [x0, y0, x1, y1] = self.cells(b)?;
+        let count = self.cell_work(b)?;
+        if count > (self.pool.len() - self.head) as u64 {
+            return Err(Error::BufferTooSmall);
+        }
         self.bounds = [
             self.bounds[0].min(x0),
             self.bounds[1].min(y0),
@@ -84,9 +90,6 @@ impl ProximityGrid {
         ];
         for y in y0..=y1 {
             for x in x0..=x1 {
-                if self.head == self.pool.len() {
-                    return Ok(());
-                }
                 let h = self.hash(x, y);
                 let i = self.head;
                 self.head += 1;
@@ -102,13 +105,31 @@ impl ProximityGrid {
         Ok(())
     }
     /// Queries unique ids in upstream cell and hash-chain order.
-    pub fn query_items(&self, b: [f32; 4], ids: &mut [u16]) -> Result<usize, Error> {
+    /// Charges every cell and visited hash entry to `ws`, including collisions.
+    /// Stops at the first extra unique id if `ids` is full, returning `ids.len()`.
+    pub fn query_items(
+        &self,
+        ws: &mut Workspace,
+        b: [f32; 4],
+        ids: &mut [u16],
+    ) -> Result<usize, Error> {
+        ws.begin();
+        self.query_items_in(ws, b, ids)
+    }
+    pub(crate) fn query_items_in(
+        &self,
+        ws: &mut Workspace,
+        b: [f32; 4],
+        ids: &mut [u16],
+    ) -> Result<usize, Error> {
         let [x0, y0, x1, y1] = self.cells(b)?;
+        ws.work(self.cell_work(b)?)?;
         let mut n = 0;
         for y in y0..=y1 {
             for x in x0..=x1 {
                 let mut i = self.buckets[self.hash(x, y)];
                 while i != usize::MAX {
+                    ws.work(1)?;
                     let item = self.pool[i];
                     if item.x == x && item.y == y && !ids[..n].contains(&item.id) {
                         if n == ids.len() {

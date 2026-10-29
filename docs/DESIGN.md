@@ -276,8 +276,9 @@ its notice if ported. Corpus files are not committed; their licences are in the 
   but any other choice is platform-specific.
 - Tile triangle selection by bordered xz-overlap in input order, not the demo's chunky mesh.
   Reversal: cheap (both sides of the harness).
-- Default behaviour matches upstream including its defined-but-questionable results; fixes are
-  opt-in. Reversal: per fix.
+- Valid-use behavior matches the pinned upstream. Crowd state leaks, uninitialized
+  reads and invalid inputs are corrected by default; the deliberate differences
+  and exact parity domain are listed in `VERIFICATION.md`.
 
 - 64-bit poly refs by default (`polyref64` on): large worlds need more than 22 tile+poly bits.
   Upstream defaults to 32-bit; turning the feature off gives its format. Reversal: breaking

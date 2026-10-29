@@ -51,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
             }
             2 => {
                 let r = crowd.agent(id).map_or(0, |a| a.corridor.first_poly());
-                let _ = crowd.request_move_target(id, r, v);
+                let _ = crowd.request_move_target(&nav, id, r, v);
             }
             3 => {
                 let _ = crowd.remove_agent(id);

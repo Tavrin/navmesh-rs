@@ -89,7 +89,10 @@ documentation lists every stage and query.
 ## Crowd
 
 Enable the default `crowd` feature to manage agents over an existing navmesh.
-Targets use polygon references from `NavMeshQuery::find_nearest_poly`.
+Targets use polygon references from `NavMeshQuery::find_nearest_poly`; requests
+borrow the mesh to validate refs. Agent speed must be strictly positive. Construct
+non-exhaustive parameter structs with `Default::default()` (or an avoidance quality
+preset), then assign individual fields.
 
 ```rust
 use navmesh_rs::{Error, Workspace};
@@ -102,7 +105,7 @@ fn simulate(nav: &NavMesh, start: [f32; 3], goal: [f32; 3]) -> Result<(), Error>
     let agent = crowd.add_agent(&mut ws, nav, start, AgentParams::default())?;
     let query = NavMeshQuery::new(nav, 512)?;
     let (poly, target, _) = query.find_nearest_poly(&goal, &[2.0, 4.0, 2.0], &DefaultFilter::default())?;
-    crowd.request_move_target(agent, poly, target)?;
+    crowd.request_move_target(nav, agent, poly, target)?;
     for _ in 0..300 {
         crowd.update(&mut ws, nav, 1.0 / 30.0)?;
         let position = crowd.agent(agent).ok_or(Error::InvalidRef)?.npos;

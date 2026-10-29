@@ -71,22 +71,26 @@ impl PathQueue {
         })
     }
     /// Enqueues a search using an index into the filter array passed to `update`.
-    /// A full queue returns `Ok(None)`.
+    /// Refs are checked against `nav`. A full queue returns [`Error::BufferTooSmall`].
     pub fn request(
         &mut self,
+        nav: &NavMesh,
         start: PolyRef,
         end: PolyRef,
         start_pos: V3,
         end_pos: V3,
         filter: usize,
-    ) -> Result<Option<u32>, Error> {
+    ) -> Result<u32, Error> {
         finite(start_pos)?;
         finite(end_pos)?;
-        if start == 0 || end == 0 || filter >= 16 {
-            return Err(Error::InvalidParameter("queue refs or filter"));
+        if !nav.is_valid_poly_ref(start) || !nav.is_valid_poly_ref(end) {
+            return Err(Error::InvalidRef);
+        }
+        if filter >= 16 {
+            return Err(Error::InvalidParameter("queue filter"));
         }
         let Some(q) = self.requests.iter_mut().find(|r| r.handle == 0) else {
-            return Ok(None);
+            return Err(Error::BufferTooSmall);
         };
         let h = self.next;
         self.next = self.next.wrapping_add(1);
@@ -102,7 +106,7 @@ impl PathQueue {
         q.status = 0;
         q.keep = 0;
         q.path.clear();
-        Ok(Some(h))
+        Ok(h)
     }
     /// Upstream status bits of a request; an unknown handle reports failure.
     pub fn status(&self, handle: u32) -> u32 {

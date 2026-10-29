@@ -1415,17 +1415,15 @@ fn record_crowds(c: &Case, b: &Baked, sink: &mut Sink) -> Result<(), Error> {
         }
         let seed = c.seed ^ 0x5bd1e995;
         let mut rng = Rng(if seed != 0 { seed } else { 1 });
-        let ap = AgentParams {
-            radius: c.agent_radius,
-            height: c.agent_height,
-            collision_query_range: c.agent_radius * 12.,
-            path_optimization_range: c.agent_radius * 30.,
-            obstacle_avoidance_type: if (1..=4).contains(&variant) {
-                variant - 1
-            } else {
-                3
-            },
-            ..AgentParams::default()
+        let mut ap = AgentParams::default();
+        ap.radius = c.agent_radius;
+        ap.height = c.agent_height;
+        ap.collision_query_range = c.agent_radius * 12.;
+        ap.path_optimization_range = c.agent_radius * 30.;
+        ap.obstacle_avoidance_type = if (1..=4).contains(&variant) {
+            variant - 1
+        } else {
+            3
         };
         let add = |nav: &NavMesh,
                    crowd: &mut Crowd,
@@ -1437,7 +1435,7 @@ fn record_crowds(c: &Case, b: &Baked, sink: &mut Sink) -> Result<(), Error> {
             let (_, p0) = q.find_random_point(&f, &mut || rng.frand())?;
             let (r1, p1) = q.find_random_point(&f, &mut || rng.frand())?;
             let id = crowd.add_agent(ws, nav, p0, ap)?;
-            crowd.request_move_target(id, r1, p1)
+            crowd.request_move_target(nav, id, r1, p1)
         };
         for _ in 0..c.crowd_agents {
             add(&nav, &mut crowd, &mut ws, &mut rng)?;

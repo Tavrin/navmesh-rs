@@ -2,7 +2,14 @@
 use super::*;
 use crate::common::{cosf, sinf};
 /// Weights and sampling pattern for obstacle avoidance.
+/// Construct with [`Self::default`] or [`Self::quality`] and assign fields.
+///
+/// ```compile_fail,E0639
+/// use navmesh_rs::crowd::ObstacleAvoidanceParams;
+/// let params = ObstacleAvoidanceParams { grid_size: 17, ..Default::default() };
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct ObstacleAvoidanceParams {
     /// Bias toward desired velocity, in [0, 1].
     pub vel_bias: f32,
@@ -18,7 +25,9 @@ pub struct ObstacleAvoidanceParams {
     pub horiz_time: f32,
     /// Grid resolution (at least 2).
     pub grid_size: u8,
-    /// Adaptive angular divisions (1..=32).
+    /// Adaptive angular divisions (1..=32). Odd counts preserve the defined C++
+    /// pattern; even counts use initialized Rust storage where C++ reads an
+    /// unwritten sample, and carry no C++ parity claim.
     pub adaptive_divs: u8,
     /// Adaptive ring count (1..=4).
     pub adaptive_rings: u8,
@@ -121,31 +130,33 @@ impl ObstacleAvoidanceQuery {
         self.circles.clear();
         self.segments.clear();
     }
-    /// Adds a moving circle; excess circles are ignored as upstream.
+    /// Adds a moving circle, or returns [`Error::BufferTooSmall`] if full.
     pub fn add_circle(&mut self, p: V3, rad: f32, vel: V3, dvel: V3) -> Result<(), Error> {
         finite(p)?;
         finite(vel)?;
         finite(dvel)?;
         nonnegative(rad)?;
-        if self.circles.len() < self.max_circles {
-            self.circles.push(Circle {
-                p,
-                rad,
-                vel,
-                dvel,
-                dp: [0.; 3],
-                np: [0.; 3],
-            });
+        if self.circles.len() == self.max_circles {
+            return Err(Error::BufferTooSmall);
         }
+        self.circles.push(Circle {
+            p,
+            rad,
+            vel,
+            dvel,
+            dp: [0.; 3],
+            np: [0.; 3],
+        });
         Ok(())
     }
-    /// Adds a wall; excess segments are ignored as upstream.
+    /// Adds a wall, or returns [`Error::BufferTooSmall`] if full.
     pub fn add_segment(&mut self, p: V3, q: V3) -> Result<(), Error> {
         finite(p)?;
         finite(q)?;
-        if self.segments.len() < self.max_segments {
-            self.segments.push(Segment { p, q, touch: false });
+        if self.segments.len() == self.max_segments {
+            return Err(Error::BufferTooSmall);
         }
+        self.segments.push(Segment { p, q, touch: false });
         Ok(())
     }
     fn prepare(&mut self, pos: V3, dvel: V3) {
@@ -393,6 +404,8 @@ impl ObstacleAvoidanceQuery {
             dir,
             [dir[0] * c - dir[2] * s, dir[1], dir[0] * s + dir[2] * c],
         ];
+        // One extra sample also contains upstream's final even-division write
+        // when nd=32 and nr=4; C++ only allocates 129 samples.
         let mut pat = [[0.; 2]; 130];
         let mut n = 1;
         for j in 0..nr {

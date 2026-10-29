@@ -146,15 +146,21 @@ impl Crowd {
         }
         for &i in &queue[..nqueue] {
             let a = &mut self.agents[i];
-            if let Some(h) = self.pathq.request(
+            match self.pathq.request(
+                nav,
                 a.corridor.last_poly(),
                 a.target_ref,
                 a.corridor.target,
                 a.target_pos,
                 a.params.query_filter_type,
-            )? {
-                a.pathq = h;
-                a.target_state = T::WaitingForPath;
+            ) {
+                Ok(h) => {
+                    a.pathq = h;
+                    a.target_state = T::WaitingForPath;
+                }
+                // Capacity backpressure is observable in the agent's target state.
+                Err(Error::BufferTooSmall) => {}
+                Err(e) => return Err(e),
             }
         }
         self.pathq.update_in(ws, nav, 100, &self.filters)?;
@@ -294,13 +300,8 @@ impl Crowd {
             let pos = a.npos;
             let height = a.params.height;
             let mut ids = [0u16; 32];
-            ws.work(self.grid.cell_work([
-                pos[0] - range,
-                pos[2] - range,
-                pos[0] + range,
-                pos[2] + range,
-            ])?)?;
-            let n = self.grid.query_items(
+            let n = self.grid.query_items_in(
+                ws,
                 [
                     pos[0] - range,
                     pos[2] - range,
