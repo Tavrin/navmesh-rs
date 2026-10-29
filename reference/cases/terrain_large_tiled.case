@@ -1,0 +1,5 @@
+# Generated 1024 m value-noise terrain, 2M triangles, tiled; used for bake cost.
+mesh = gen_terrain_large.obj
+mode = tiled
+tile_size = 64
+queries = 256

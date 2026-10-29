@@ -1,0 +1,4 @@
+# Generated 1024 m terrain as one solo build (3414 x 3414 cells); bake-cost comparison only.
+mesh = gen_terrain_large.obj
+mode = solo
+queries = 64

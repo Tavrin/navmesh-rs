@@ -1,0 +1,7 @@
+# Generated 128 m value-noise terrain, tiled.
+mesh = gen_terrain_small.obj
+mode = tiled
+tile_size = 64
+queries = 64
+crowd_agents = 32
+crowd_ticks = 300

@@ -1,0 +1,6 @@
+# Upstream crowd mesh 5 km from the origin (float precision far from zero).
+mesh = undulating.obj
+mode = solo
+queries = 64
+crowd_agents = 32
+crowd_ticks = 300

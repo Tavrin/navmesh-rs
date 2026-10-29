@@ -1,0 +1,11 @@
+# Upstream demo mesh, solo build, three convex area volumes (areas 1, 2 and 4).
+# Area 4 polygons carry flag 0x10, which the filtered query set excludes.
+mesh = nav_test.obj
+mode = solo
+queries = 64
+crowd_agents = 8
+crowd_ticks = 200
+# area hmin hmax  x z points (convex, counter-clockwise seen from +y)
+area_volume = 1 -5 20  0 -20  0 -5  15 -5  15 -20
+area_volume = 4 -5 20  20 -10  20 10  35 10  35 -10
+area_volume = 2 -5 20  40 -40  40 -20  55 -20  55 -40

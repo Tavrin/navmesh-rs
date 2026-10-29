@@ -1,0 +1,124 @@
+# Corpus manifest. Every input mesh used by a differential test is listed here with its source,
+# licence, SHA-256 and feature tags. Files are materialised by fetch.sh into $NAV_CORPUS_DIR,
+# outside the repository; none are committed. `status` is one of: active (fetched and used by a case), candidate
+# (licence checked, not yet wired), rejected (kept to record why).
+
+[[mesh]]
+name = "nav_test.obj"
+source = "recastnavigation RecastDemo/Bin/Meshes/nav_test.obj @ 9f4ce64458dfae86e1239c525ddc219c4e9e06f1"
+licence = "Zlib (repository License.txt; no separate notice on the file)"
+sha256 = "ed27fc1a85ef73faa4d0621d640b67842e9081606e732267c662327c35fabc0f"
+size = "884 verts, 1612 tris"
+tags = ["real", "multi-level", "stairs", "slopes", "overhangs", "upstream-demo"]
+status = "active"
+
+[[mesh]]
+name = "dungeon.obj"
+source = "recastnavigation RecastDemo/Bin/Meshes/dungeon.obj @ 9f4ce64458dfae86e1239c525ddc219c4e9e06f1"
+licence = "Zlib (repository License.txt; no separate notice on the file)"
+sha256 = "6b157db01f8eaa4b0290d18bd8d6515e969f674213de6f3a3e014f82ae1facc4"
+size = "5101 verts, 10133 tris"
+tags = ["real", "interior", "corridors", "rooms", "upstream-demo"]
+status = "active"
+
+[[mesh]]
+name = "undulating.obj"
+source = "recastnavigation RecastDemo/Bin/Meshes/undulating.obj @ 9f4ce64458dfae86e1239c525ddc219c4e9e06f1"
+licence = "Zlib (repository License.txt; no separate notice on the file)"
+sha256 = "3207fee6720faa45f9a677e2a64e1be516318efee94cb0c7ef15a55c288fa2ff"
+size = "2800 verts, 5202 tris"
+tags = ["synthetic", "far-from-origin", "crowd", "upstream-demo"]
+status = "active"
+
+[[mesh]]
+name = "godot_nav_level.obj"
+source = "godotengine/godot-demo-projects 3d/navigation/models/level_mesh/level_mesh.obj @ b761b4cd5718a7118f2c95eb55f181d0a5f004f1"
+licence = "MIT (repository LICENSE.md: all demos MIT)"
+attribution = "Copyright (c) 2014-present Godot Engine contributors; 2007-2014 Juan Linietsky, Ariel Manzur"
+sha256 = "b79ff8b1a2c5880ec2094ee42cd4834db75af755f6f0d4dad7a6ed3318f9b174"
+size = "141 verts, 138 faces"
+tags = ["real", "game-level", "multi-height", "small"]
+status = "active"
+
+# Generated meshes: produced by `nav_oracle gen <kind>`; their hashes are in generated.sha256.
+# Licence: ours (MIT OR Apache-2.0). Coordinates are exact binary fractions or fixed literals,
+# so generation needs no libm and the text is identical on every platform.
+
+[[mesh]]
+name = "gen_stairs.obj"
+generator = "stairs"
+tags = ["synthetic", "stairs", "climb-threshold"]
+status = "active"
+
+[[mesh]]
+name = "gen_slopes.obj"
+generator = "slopes"
+tags = ["synthetic", "slopes", "slope-threshold"]
+status = "active"
+
+[[mesh]]
+name = "gen_multilevel.obj"
+generator = "multilevel"
+tags = ["synthetic", "multi-level", "bridge", "ramp", "overhangs"]
+status = "active"
+
+[[mesh]]
+name = "gen_corridors.obj"
+generator = "corridors"
+tags = ["synthetic", "narrow-corridors", "erosion"]
+status = "active"
+
+[[mesh]]
+name = "gen_islands.obj"
+generator = "islands"
+tags = ["synthetic", "islands", "off-mesh-links", "disconnected"]
+status = "active"
+
+[[mesh]]
+name = "gen_seams.obj"
+generator = "seams"
+tags = ["synthetic", "tile-seams", "tiled"]
+status = "active"
+
+[[mesh]]
+name = "gen_terrain_small.obj"
+generator = "terrain_small"
+size = "16641 verts, 32768 tris, 128 m"
+tags = ["synthetic", "terrain", "tiled", "crowd"]
+status = "active"
+
+[[mesh]]
+name = "gen_terrain_large.obj"
+generator = "terrain_large"
+size = "1050625 verts, 2097152 tris, 1024 m"
+tags = ["synthetic", "terrain", "large-open-world", "tiled", "benchmark"]
+status = "active"
+
+[[mesh]]
+name = "gen_degenerate.obj"
+generator = "degenerate"
+tags = ["synthetic", "degenerate", "zero-area", "duplicate-faces", "slivers", "sub-cell", "downward-facing"]
+status = "active"
+
+# Candidates and rejections.
+
+[[mesh]]
+name = "Amazon Lumberyard Bistro"
+source = "NVIDIA ORCA (Open Research Content Archive)"
+licence = "CC BY 4.0 (per the ASWF 'Links to Open Assets' listing; verify the file's own notice at fetch)"
+tags = ["real", "large", "exterior", "interior", "benchmark"]
+status = "candidate"
+note = "About 3M triangles in FBX; needs an offline FBX-to-OBJ step pinned by hash. Attribution text must ship with any record that names it."
+
+[[mesh]]
+name = "Crytek Sponza"
+source = "Khronos glTF-Sample-Assets Models/Sponza"
+licence = "LicenseRef-CRYENGINE-Agreement (Cryengine Limited License Agreement)"
+status = "rejected"
+note = "Not a permissive licence; do not redistribute or depend on it."
+
+[[mesh]]
+name = "GPL game maps (Quake-derived, OpenArena, Xonotic)"
+licence = "GPL"
+status = "rejected"
+note = "Incompatible with redistribution inside an MIT/Apache test corpus."

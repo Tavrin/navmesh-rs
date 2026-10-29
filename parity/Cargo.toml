@@ -1,0 +1,19 @@
+[package]
+name = "navmesh-parity"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Record encoder, decoders and comparator for differential tests against the recastnavigation reference driver"
+
+[[bin]]
+name = "nav-parity"
+path = "src/main.rs"
+
+[features]
+default = ["polyref64"]
+# Build the port with 64-bit poly refs (off: 32-bit, to compare with the 32-bit oracle).
+polyref64 = ["navmesh-rs/polyref64"]
+
+[dependencies]
+navmesh-rs = { path = "..", default-features = false, features = ["std", "recast", "detour"] }

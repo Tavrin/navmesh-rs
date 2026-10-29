@@ -1,0 +1,5 @@
+# Generated stairs (climbable and non-climbable risers), monotone partition.
+mesh = gen_stairs.obj
+mode = solo
+partition = monotone
+queries = 32

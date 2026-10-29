@@ -1,0 +1,11 @@
+# Godot 3D navigation demo level (MIT), small multi-height interior; finer cells.
+mesh = godot_nav_level.obj
+mode = solo
+cell_size = 0.1
+cell_height = 0.05
+agent_height = 1.0
+agent_radius = 0.3
+agent_max_climb = 0.3
+queries = 32
+crowd_agents = 8
+crowd_ticks = 200

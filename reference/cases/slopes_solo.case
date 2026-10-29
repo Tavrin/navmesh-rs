@@ -1,0 +1,4 @@
+# Generated ramps at 30, 44, 45, 46 and 60 degrees (limit 45).
+mesh = gen_slopes.obj
+mode = solo
+queries = 16

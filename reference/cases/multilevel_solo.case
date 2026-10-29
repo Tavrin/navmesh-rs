@@ -1,0 +1,6 @@
+# Generated two floors, a ramp and a bridge (overlapping walkable layers).
+mesh = gen_multilevel.obj
+mode = solo
+queries = 32
+crowd_agents = 8
+crowd_ticks = 200

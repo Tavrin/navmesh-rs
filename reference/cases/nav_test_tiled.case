@@ -1,0 +1,5 @@
+# Upstream demo mesh, tiled build, demo defaults.
+mesh = nav_test.obj
+mode = tiled
+tile_size = 32
+queries = 64

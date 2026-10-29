@@ -1,0 +1,39 @@
+[package]
+name = "navmesh-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "cargo-fuzz targets for navmesh-rs"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+navmesh-rs = { path = ".." }
+navmesh-parity = { path = "../parity" }
+
+[[bin]]
+name = "tile_add_query"
+path = "fuzz_targets/tile_add_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recast_input"
+path = "fuzz_targets/recast_input.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seeds"
+path = "src/bin/seeds.rs"
+test = false
+doc = false
+bench = false
+
+# Not part of the main workspace (nightly-only, libFuzzer).
+[workspace]

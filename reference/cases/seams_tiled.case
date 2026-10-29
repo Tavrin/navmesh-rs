@@ -1,0 +1,5 @@
+# Generated features on exact tile boundaries (32 cells x 0.3 m).
+mesh = gen_seams.obj
+mode = tiled
+tile_size = 32
+queries = 32

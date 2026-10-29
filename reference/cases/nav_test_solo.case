@@ -1,0 +1,7 @@
+# Upstream demo mesh, solo build, upstream demo default settings.
+mesh = nav_test.obj
+mode = solo
+partition = watershed
+queries = 64
+crowd_agents = 16
+crowd_ticks = 300

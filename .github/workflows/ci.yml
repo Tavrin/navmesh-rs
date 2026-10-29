@@ -1,0 +1,34 @@
+name: CI
+# Enable push and pull request triggers when the repository goes public.
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: tools/check_public_text.sh
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: clippy, 32-bit poly refs
+        run: cargo clippy --locked -p navmesh-rs --all-targets --no-default-features --features std,recast,detour -- -D warnings
+      - run: cargo test --locked
+      - name: test, 32-bit poly refs
+        run: cargo test --locked -p navmesh-rs --no-default-features --features std,recast,detour --tests
+      - name: no_std build
+        run: cargo build --locked -p navmesh-rs --lib --no-default-features --features libm,recast,detour,polyref64
+      - run: cargo doc --locked -p navmesh-rs --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: cargo build --locked -p navmesh-rs --lib --target wasm32-unknown-unknown
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - run: cargo check --locked -p navmesh-rs --lib

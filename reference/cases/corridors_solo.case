@@ -1,0 +1,4 @@
+# Generated corridors 0.75-2.5 m wide; radius 0.6 closes the narrow ones.
+mesh = gen_corridors.obj
+mode = solo
+queries = 32

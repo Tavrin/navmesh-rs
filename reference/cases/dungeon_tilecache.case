@@ -1,0 +1,19 @@
+# Upstream demo mesh through the tile cache (48-cell tiles, the demo default),
+# one area volume and an obstacle script with tall obstacles that cross every
+# layer at their location.
+mesh = dungeon.obj
+mode = tilecache
+tile_size = 48
+queries = 32
+area_volume = 1 -1 41  -10 -50  -10 -40  0 -40  0 -50
+tc_obstacle = cylinder 0 -1 -30 1.5 45
+tc_obstacle = box 10 -1 -60 14 44 -56
+tc_obstacle = obox 20 20 -20 3 22 0.75 0.7
+tc_obstacle = update
+tc_obstacle = remove 0
+tc_obstacle = cylinder 30 -1 -10 2 45
+tc_obstacle = update
+tc_obstacle = remove 1
+tc_obstacle = remove 2
+tc_obstacle = remove 3
+tc_obstacle = update

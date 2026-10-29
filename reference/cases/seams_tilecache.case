@@ -1,0 +1,18 @@
+# Generated seams mesh through the tile cache (32-cell tiles), with an obstacle
+# script that places each obstacle form across tile boundaries (9.6 m apart).
+mesh = gen_seams.obj
+mode = tilecache
+tile_size = 32
+queries = 32
+crowd_agents = 8
+crowd_ticks = 150
+# cylinder x y z radius height | box x0 y0 z0 x1 y1 z1 | obox cx cy cz hx hy hz yaw | remove N | update
+tc_obstacle = cylinder 9.6 -0.5 20.0 1.0 3.0
+tc_obstacle = box 18.9 -0.5 18.9 19.5 3.0 19.5
+tc_obstacle = obox 28.8 1.0 30.0 2.0 1.5 0.5 0.785398
+tc_obstacle = update
+tc_obstacle = remove 1
+tc_obstacle = update
+tc_obstacle = remove 0
+tc_obstacle = remove 2
+tc_obstacle = update

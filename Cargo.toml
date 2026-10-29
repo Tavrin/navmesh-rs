@@ -1,0 +1,40 @@
+[package]
+name = "navmesh-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Pure-Rust port of recastnavigation's Recast (navmesh generation) and Detour (navmesh queries), bit-exact with upstream"
+repository = "https://github.com/Tavrin/navmesh-rs"
+readme = "README.md"
+keywords = ["navmesh", "recast", "detour", "pathfinding", "gamedev"]
+categories = ["game-development", "algorithms", "no-std"]
+include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/NOTICE"]
+
+[lib]
+name = "navmesh_rs"
+
+[features]
+default = ["std", "recast", "detour", "polyref64"]
+# Use the platform libm through std for sqrt/floor/ceil/cos (bit-identical to the
+# C++ oracle on x86-64 glibc).
+std = []
+# Use the `libm` crate (a musl port) for transcendentals instead of the platform
+# libm; required without `std`.
+libm = ["dep:libm"]
+# Navmesh generation (Recast).
+recast = []
+# Navmesh runtime, tile data and queries (Detour).
+detour = []
+# 64-bit poly refs (upstream's DT_POLYREF64); without it refs are 32-bit. The width
+# is part of the tile byte format (links hold refs).
+polyref64 = []
+
+[dependencies]
+libm = { version = "0.2.16", optional = true }
+
+[workspace]
+members = ["parity"]
+default-members = [".", "parity"]
+# The cargo-fuzz crate is its own workspace (nightly, libFuzzer).
+exclude = ["fuzz"]

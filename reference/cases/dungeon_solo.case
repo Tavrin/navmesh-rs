@@ -1,0 +1,4 @@
+# Upstream demo mesh, solo build; bake-cost comparison with rerecast.
+mesh = dungeon.obj
+mode = solo
+queries = 64

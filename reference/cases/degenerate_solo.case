@@ -1,0 +1,5 @@
+# Generated floor carrying degenerate triangles (zero-area, duplicated, slivers,
+# sub-cell, downward-facing, zero-thickness wall).
+mesh = gen_degenerate.obj
+mode = solo
+queries = 16
