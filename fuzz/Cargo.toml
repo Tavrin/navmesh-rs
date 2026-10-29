@@ -44,3 +44,10 @@ path = "fuzz_targets/crowd_update.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "tilecache_update"
+path = "fuzz_targets/tilecache_update.rs"
+test = false
+doc = false
+bench = false

@@ -39,7 +39,10 @@
 //!   grid, sliced path queue, steering, separation and sampled avoidance.
 //! - `no_std` + `alloc`, `wasm32`, no `unsafe` code.
 //!
-//! Not yet ported: DetourTileCache, merging and copying polygon
+//! - Tile cache (feature `tilecache`): validated layers, pluggable compression,
+//!   three obstacle forms and incremental navmesh rebuilding.
+//!
+//! Not yet ported: merging and copying polygon
 //! meshes, and big-endian tile data.
 //!
 //! # Features
@@ -47,6 +50,7 @@
 //! - `recast` (default): navmesh generation.
 //! - `detour` (default): tile data, navmesh and queries.
 //! - `crowd` (default): agent simulation and local avoidance; implies `detour`.
+//! - `tilecache` (default): cached layers and dynamic obstacles; implies Recast and Detour.
 //! - `std` (default): floating-point functions from the platform libm.
 //! - `libm`: floating-point functions from the `libm` crate; required without `std`.
 //! - `polyref64` (default): 64-bit poly refs (upstream's `DT_POLYREF64`); without it
@@ -147,9 +151,18 @@ pub mod recast;
 pub mod detour;
 
 // Compiles the README's code blocks as doctests.
-#[cfg(all(doctest, feature = "recast", feature = "detour", feature = "crowd"))]
+#[cfg(all(
+    doctest,
+    feature = "recast",
+    feature = "detour",
+    feature = "crowd",
+    feature = "tilecache"
+))]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
 #[cfg(feature = "crowd")]
 pub mod crowd;
+
+#[cfg(feature = "tilecache")]
+pub mod tilecache;

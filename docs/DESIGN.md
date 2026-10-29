@@ -1,6 +1,6 @@
 # Design: a pure-Rust port of recastnavigation
 
-This is the design the port follows. Recast, Detour and DetourCrowd are ported; DetourTileCache,
+This is the design the port follows. Recast, Detour, DetourCrowd and DetourTileCache are ported;
 the bake API and the extensions below are not yet. Where this document describes something not
 built yet (bake API, `'MSET'` sets, big-endian tile reading, `parallel`, `serde`), it is the plan,
 not the current API; the README and the crate documentation describe what exists, and
@@ -226,7 +226,7 @@ skipped.
   RecastDemo and other ports, and no new container format of our own until an extension needs
   one (streaming may).
 - **Tile cache layers:** `'DTLR'` v1 with a `LayerCompressor` trait; provided implementations: none
-  (raw) and FastLZ level 1 (MIT, ported) for demo compatibility.
+  (raw). Other codecs can implement the trait; FastLZ is deferred.
 
 ## 8. Beyond upstream (opt-in, ranked by value for cost)
 
@@ -256,7 +256,7 @@ Each step ends with a proof gate before the next one starts.
 | Recast | all generation stages, three partitions, layers; stage API; `Workspace`/`Limits` | every Recast stage record bit-exact on every case; instructions within 1.25× of the oracle | done (bake API not yet) |
 | Detour | tile data builder and validating reader, navmesh, node pool, all queries, filters | `navmesh_tiles` byte-exact; all query records exact; malformed tile corpus rejected with typed errors; fuzzing without panics | done (`'MSET'` sets not yet) |
 | Crowd | crowd, corridor, boundary, avoidance, proximity grid, path queue | crowd records exact for 300 ticks on all crowd cases and all avoidance presets on the oracle platform | ported; see VERIFICATION.md |
-| TileCache | layers, compression trait plus FastLZ, obstacles, incremental rebuild | obstacle-script records produce byte-exact tiles after each update | not started |
+| TileCache | layers, compression trait plus raw storage, obstacles, incremental rebuild | obstacle-script records produce byte-exact tiles after each update | ported; see VERIFICATION.md |
 | Extensions | in the order of section 8 | each extension's own measurement, and every default-feature record unchanged | not started |
 
 ## 10. Licence and attribution

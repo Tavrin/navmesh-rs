@@ -7,8 +7,7 @@
 //! nav-port bench <case-file> [--repeat N]
 //! ```
 //!
-//! Produces Recast, Detour and crowd records. Tile-cache builds need oracle
-//! tiles supplied with `--tiles`. Mesh paths that are not absolute
+//! Produces Recast, Detour, crowd and tile-cache records. Mesh paths that are not absolute
 //! resolve against `$NAV_CORPUS_DIR`.
 
 use std::path::Path;
@@ -21,7 +20,13 @@ use navmesh_rs::detour::{
     Status,
 };
 use navmesh_rs::recast::{self, CompactHeightfield, Config, ContourSet, Heightfield, PolyMesh};
-use navmesh_rs::{Error, Workspace};
+use navmesh_rs::tilecache::{
+    self as tc, MeshProcess, ObstacleShape, RawCompressor, TileCache, TileCacheParams,
+};
+use navmesh_rs::{Error, Limits, Workspace};
+mod tilecache_records {
+    include!("../tilecache_records.rs");
+}
 
 /// The oracle's second filter: excludes flag 0x10 (area 4), areas 1..7 cost
 /// `1 + 1.5 * area`.
@@ -73,6 +78,7 @@ struct Case {
     seed: u32,
     /// x0 y0 z0 x1 y1 z1 radius bidir, repeated.
     off_mesh: Vec<f32>,
+    obstacle_ops: Vec<(u8, Vec<f32>)>,
 }
 
 /// The longest prefix of `s` that C's `strtof` would consume, parsed (0 when none).
@@ -175,6 +181,7 @@ fn parse_case(path: &Path) -> Result<Case, String> {
         seed: 0x9e37_79b9,
         off_mesh: Vec::new(),
         area_volumes: Vec::new(),
+        obstacle_ops: Vec::new(),
     };
     for (n, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("");
@@ -238,10 +245,32 @@ fn parse_case(path: &Path) -> Result<Case, String> {
                 }
                 c.off_mesh.extend_from_slice(&x[..8]);
             }
-            // Crowd and tile-cache keys: not used by the port yet.
+            // Simulation settings.
             "crowd_agents" => c.crowd_agents = atoi(val) as usize,
             "crowd_ticks" => c.crowd_ticks = atoi(val) as usize,
-            "tc_obstacle" => {}
+            "tc_obstacle" => {
+                let (op, args) = val.split_once(' ').unwrap_or((val, ""));
+                let code = match op {
+                    "cylinder" => 1,
+                    "box" => 2,
+                    "obox" => 3,
+                    "remove" => 4,
+                    "update" => 5,
+                    _ => return Err("invalid obstacle op".into()),
+                };
+                let args = floats(args);
+                let count = match code {
+                    1 => 5,
+                    2 => 6,
+                    3 => 7,
+                    4 => 1,
+                    _ => 0,
+                };
+                if args.len() != count {
+                    return Err("invalid obstacle arguments".into());
+                }
+                c.obstacle_ops.push((code, args));
+            }
             "area_volume" => {
                 let x = floats(val);
                 if x.len() < 9 || !(x.len() - 3).is_multiple_of(2) || x[0] < 1.0 || x[0] > 62.0 {
@@ -564,6 +593,7 @@ fn build_one(
     sink: &mut Sink,
     prefix: &str,
     tile: (i32, i32),
+    layer_data: &mut Vec<Vec<u8>>,
 ) -> Result<Option<Vec<u8>>, Error> {
     let tilecache = c.mode == "tilecache";
     sink.record(&format!("{prefix}config"), |p| stream_config(p, cfg));
@@ -632,6 +662,29 @@ fn build_one(
                 }
             }
         });
+        for (i, l) in lset.layers.iter().take(32).enumerate() {
+            let cv = |v: i32| u8::try_from(v).map_err(|_| Error::FormatLimit("layer dimension"));
+            let mut h = tc::LayerHeader::new(cv(l.width)?, cv(l.height)?);
+            h.tx = tile.0;
+            h.ty = tile.1;
+            h.tlayer = i32::try_from(i).map_err(|_| Error::SizeOverflow)?;
+            h.bmin = l.bmin;
+            h.bmax = l.bmax;
+            h.minx = cv(l.minx)?;
+            h.maxx = cv(l.maxx)?;
+            h.miny = cv(l.miny)?;
+            h.maxy = cv(l.maxy)?;
+            h.hmin = u16::try_from(l.hmin).map_err(|_| Error::FormatLimit("layer height"))?;
+            h.hmax = u16::try_from(l.hmax).map_err(|_| Error::FormatLimit("layer height"))?;
+            let data = tc::build_layer(ws, &RawCompressor, &h, &l.heights, &l.areas, &l.cons)?;
+            sink.record(
+                &format!("layer_{}_{}_{}.layer_data", h.tx, h.ty, h.tlayer),
+                |p| {
+                    p.u32(u32::try_from(data.len()).unwrap()).bytes(&data);
+                },
+            );
+            layer_data.push(data);
+        }
         return Ok(None);
     }
     match c.partition.as_str() {
@@ -760,21 +813,34 @@ fn build_one(
 struct Baked {
     tiles: Vec<(i32, i32, i32, Vec<u8>)>,
     params: Option<NavMeshParams>,
+    cache: Option<TileCache<RawCompressor, tilecache_records::Process>>,
 }
 
 fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
     let mut ws = Workspace::new();
     let base = make_config(c);
+    let mut layer_data = Vec::new();
     let mut out = Baked {
         tiles: Vec::new(),
         params: None,
+        cache: None,
     };
     if c.mode == "solo" {
         let mut cfg = base;
         cfg.bmin = g.bmin;
         cfg.bmax = g.bmax;
         (cfg.width, cfg.height) = recast::calc_grid_size(&cfg.bmin, &cfg.bmax, cfg.cs);
-        if let Some(t) = build_one(&mut ws, c, g, &cfg, &g.tris, sink, "", (0, 0))? {
+        if let Some(t) = build_one(
+            &mut ws,
+            c,
+            g,
+            &cfg,
+            &g.tris,
+            sink,
+            "",
+            (0, 0),
+            &mut layer_data,
+        )? {
             out.tiles.push((0, 0, 0, t));
         }
         return Ok(out);
@@ -827,6 +893,7 @@ fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
                 sink,
                 &format!("tile_{x}_{y}."),
                 (x, y),
+                &mut layer_data,
             )?;
             if let Some(t) = t {
                 out.tiles.push((x, y, 0, t));
@@ -834,8 +901,40 @@ fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
         }
     }
     if c.mode == "tilecache" {
-        // The tile-cache tile builder is a later phase; tiles come from --tiles.
-        out.tiles.clear();
+        let mut params = TileCacheParams::new(
+            u8::try_from(ts).map_err(|_| Error::FormatLimit("tile size"))?,
+            u8::try_from(ts).map_err(|_| Error::FormatLimit("tile size"))?,
+            c.cell_size,
+            c.cell_height,
+            usize::try_from(tw * th * 4).map_err(|_| Error::SizeOverflow)?,
+            128,
+        );
+        params.orig = g.bmin;
+        params.walkable_height = c.agent_height;
+        params.walkable_radius = c.agent_radius;
+        params.walkable_climb = c.agent_max_climb;
+        params.max_simplification_error = c.edge_max_error;
+        let mut cache = TileCache::new(
+            params,
+            RawCompressor,
+            tilecache_records::Process::new(c),
+            Limits::default(),
+        )?;
+        for data in layer_data {
+            cache.add_tile(data)?;
+        }
+        for y in 0..th {
+            for x in 0..tw {
+                for r in cache.tiles_at(x, y)? {
+                    tilecache_records::record_layer(&mut ws, &cache, r, c, sink)?;
+                    if let Some(data) = cache.build_tile_data(r)? {
+                        let h = cache.tile_header(r).unwrap();
+                        out.tiles.push((h.tx, h.ty, h.tlayer, data));
+                    }
+                }
+            }
+        }
+        out.cache = Some(cache);
     }
     Ok(out)
 }
@@ -1308,24 +1407,19 @@ fn run() -> Result<(), String> {
             };
             let res = bake(&case, &g, &mut sink).map_err(|e| format!("bake failed: {e}"));
             let res = res.and_then(|mut b| {
-                if case.mode == "tilecache" {
-                    match opt("--tiles") {
-                        Some(t) => tiles_from(t, &mut b)?,
-                        None => return Ok(()),
-                    }
-                } else {
-                    record_navmesh(&b, &mut sink);
-                }
+                record_navmesh(&b, &mut sink);
                 if b.tiles.is_empty() {
                     return Ok(());
                 }
-                let nav = assemble(&b).map_err(|e| format!("navmesh: {e}"))?;
+                let mut nav = assemble(&b).map_err(|e| format!("navmesh: {e}"))?;
                 let costs = cost_filter();
                 record_queries(&case, &nav, &DefaultFilter::default(), "", &mut sink)
                     .and_then(|()| record_queries(&case, &nav, &costs, "filtered.", &mut sink))
                     .map_err(|e| format!("queries: {e}"))?;
                 record_malformed(&b, &nav, &mut sink);
                 record_crowds(&case, &b, &mut sink).map_err(|e| format!("crowd: {e}"))?;
+                tilecache_records::record_obstacles(&case, &mut b, &mut nav, &mut sink)
+                    .map_err(|e| format!("obstacles: {e}"))?;
                 Ok(())
             });
             let bytes = sink.writer.take().map(|w| w.finish()).unwrap_or_default();

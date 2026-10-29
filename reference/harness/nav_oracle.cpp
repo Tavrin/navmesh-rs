@@ -1563,6 +1563,12 @@ void recordObstacles(const Case& c, Baked& b) {
                 }
             }
             touched.clear();
+            const std::string prefix = "obstacle_update_" + std::to_string(updates) + ".";
+            dtQueryFilter plain, costs;
+            costs.setExcludeFlags(0x10);
+            for (int a = 1; a < 8; ++a) costs.setAreaCost(a, 1.0f + 1.5f * a);
+            recordQueries(c, b.nav, plain, prefix);
+            recordQueries(c, b.nav, costs, prefix + "filtered.");
         }
     }
     r.counts["ops"] = (long long)c.obstacleOps.size();

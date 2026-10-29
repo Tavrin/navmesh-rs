@@ -16,6 +16,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- DetourTileCache: validated little-endian layers, raw compression and a pluggable
+  compressor trait, region/contour/polygon building, salted tile/obstacle handles,
+  all three obstacle forms and incremental navmesh handoff with mesh-process hooks.
+- Tile-cache layer/obstacle differential records and queries after script updates,
+  malformed-layer, lifecycle, resource-limit and scaling regressions, and a layer
+  decode/obstacle-update fuzz target source.
+
 - DetourCrowd: crowd manager, corridor maintenance, local walls, proximity grid,
   sliced path queue, steering, separation, grid and adaptive avoidance, and off-mesh
   animation; full per-tick trajectory and corridor comparison with the reference.

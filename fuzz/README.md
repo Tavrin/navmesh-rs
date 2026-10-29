@@ -24,3 +24,8 @@ flat for 10 minutes, for at least 10 and at most 120 CPU-minutes, with no crash.
 
 `crowd_update` creates a bounded crowd on a small mesh and applies arbitrary
 agent positions, targets, velocities, removals, resets and update intervals.
+
+`tilecache_update` decodes arbitrary raw layer bytes, exercises region/contour/poly
+building under limits, and runs cylinder, box, oriented-box, removal and update
+sequences over a valid seeded cache. The source is supplied for fuzzing; its
+addition does not imply a completed fuzz campaign.

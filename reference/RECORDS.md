@@ -152,6 +152,15 @@ or points for the first two) and hold one entry per pair; `status` is the raw `d
 | `malformed_tiles` | upstream verdicts on a fresh navmesh with the baked parameters: valid add, same location again, wrong magic, wrong version, more polygons than ref bits, remove of a null ref, remove twice, re-add into the freed slot with the stale ref |
 | `tilecache_obstacles` | per script step: the op and its arguments; for adds and removes the status, obstacle ref and number of tiles touched; for `update` the iteration count, status, up-to-date flag, every non-empty obstacle slot (index, ref, state, type, salt) and, for every tile touched since the previous update, the navmesh-resident tile bytes (links included) |
 
+After every tile-cache script `update`, the harness also records every query
+family under both filters, prefixed `obstacle_update_N.` (N starts at 1).
+The ordinary query layouts and exact comparison rules apply unchanged.
+
+`reference/run-tilecache-parity.sh` accepts separately built 32/64-bit oracle and
+Rust drivers, optional debug drivers, and compares complete records plus independent
+release repeats on every tile-cache case. It never supplies oracle tile bytes to
+the Rust tile-cache build.
+
 Random points come from `findRandomPoint` driven by a fixed xorshift32 (`seed` in the case
 file), so the query set is a function of the navmesh, the filter and the seed only; a navmesh
 mismatch is reported at `navmesh_tiles` before it can surface as query noise. The `filtered.`

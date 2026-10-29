@@ -48,3 +48,6 @@ step exists.
 Not covered: NaN/Inf vertices, huge coordinates and empty meshes. Upstream behaviour on them is
 undefined (float-to-int conversion of NaN grid sizes, allocation failures), so they belong to the
 port's fuzz corpus, where the expected verdict is a typed error, not to the oracle records.
+
+`multilevel_tilecache.case` reuses the generated multi-level mesh for stacked-layer
+obstacle rebuilding, salted obstacle slot reuse and batched add/remove requests.
