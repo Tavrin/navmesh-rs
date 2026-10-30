@@ -10,8 +10,8 @@ use super::{
     EXT_LINK, NAVMESH_MAGIC, NAVMESH_VERSION, OFFMESH_CON_BIDIR, POLYTYPE_GROUND,
     POLYTYPE_OFFMESH_CONNECTION, VERTS_PER_POLYGON,
 };
-use crate::Error;
 use crate::common::{ceilf, floorf};
+use crate::{Error, Limits, Workspace};
 
 const MESH_NULL_IDX: u16 = 0xffff;
 
@@ -104,6 +104,7 @@ fn longest_axis(x: u16, y: u16, z: u16) -> usize {
 
 fn subdivide(
     items: &mut [BvItem],
+    scratch: &mut [BvItem],
     imin: usize,
     imax: usize,
     cur: &mut usize,
@@ -135,10 +136,12 @@ fn subdivide(
     );
     // glibc qsort is a stable merge sort; a stable sort with the same comparator
     // reproduces it.
-    items[imin..imax].sort_by(|a, b| a.bmin[axis].cmp(&b.bmin[axis]));
+    crate::common::stable_sort(&mut items[imin..imax], scratch, |a, b| {
+        a.bmin[axis].cmp(&b.bmin[axis])
+    });
     let isplit = imin + inum / 2;
-    subdivide(items, imin, isplit, cur, nodes);
-    subdivide(items, isplit, imax, cur, nodes);
+    subdivide(items, scratch, imin, isplit, cur, nodes);
+    subdivide(items, scratch, isplit, imax, cur, nodes);
     let iescape = (*cur - icur) as i32;
     nodes[icur] = BvItem {
         bmin,
@@ -153,60 +156,64 @@ fn quant(v: f32, base: f32, f: f32) -> u16 {
     (((v - base) * f) as i32).clamp(0, 0xffff) as u16
 }
 
-fn create_bv_tree(p: &NavMeshCreateParams, nodes: &mut [BvItem]) -> usize {
+fn create_bv_tree(
+    ws: &mut Workspace,
+    p: &NavMeshCreateParams,
+    nodes: &mut [BvItem],
+) -> Result<usize, Error> {
     let qf = 1.0 / p.cs;
     let nvp = p.nvp as usize;
-    let mut items: Vec<BvItem> = (0..p.poly_count as usize)
-        .map(|i| {
-            if !p.detail_meshes.is_empty() {
-                let vb = p.detail_meshes[i * 4] as usize;
-                let ndv = p.detail_meshes[i * 4 + 1] as usize;
-                let dv = &p.detail_verts[vb * 3..];
-                let mut bmin = [dv[0], dv[1], dv[2]];
-                let mut bmax = bmin;
-                for j in 1..ndv {
-                    vmin(&mut bmin, &dv[j * 3..]);
-                    vmax(&mut bmax, &dv[j * 3..]);
-                }
-                BvItem {
-                    bmin: [0, 1, 2].map(|k| quant(bmin[k], p.bmin[k], qf)),
-                    bmax: [0, 1, 2].map(|k| quant(bmax[k], p.bmin[k], qf)),
-                    i: i as i32,
-                }
-            } else {
-                let pv = &p.polys[i * nvp * 2..];
-                let v0 = pv[0] as usize * 3;
-                let mut it = BvItem {
-                    bmin: [p.verts[v0], p.verts[v0 + 1], p.verts[v0 + 2]],
-                    bmax: [p.verts[v0], p.verts[v0 + 1], p.verts[v0 + 2]],
-                    i: i as i32,
-                };
-                for &vj in pv.iter().take(nvp).skip(1) {
-                    if vj == MESH_NULL_IDX {
-                        break;
-                    }
-                    let v = &p.verts[vj as usize * 3..];
-                    for k in 0..3 {
-                        if v[k] < it.bmin[k] {
-                            it.bmin[k] = v[k];
-                        }
-                        if v[k] > it.bmax[k] {
-                            it.bmax[k] = v[k];
-                        }
-                    }
-                }
-                it.bmin[1] = floorf(it.bmin[1] as f32 * p.ch / p.cs) as u16;
-                it.bmax[1] = ceilf(it.bmax[1] as f32 * p.ch / p.cs) as u16;
-                it
+    let mut items = ws.vec_with_capacity(p.poly_count as usize)?;
+    for i in 0..p.poly_count as usize {
+        items.push(if !p.detail_meshes.is_empty() {
+            let vb = p.detail_meshes[i * 4] as usize;
+            let ndv = p.detail_meshes[i * 4 + 1] as usize;
+            let dv = &p.detail_verts[vb * 3..];
+            let mut bmin = [dv[0], dv[1], dv[2]];
+            let mut bmax = bmin;
+            for j in 1..ndv {
+                vmin(&mut bmin, &dv[j * 3..]);
+                vmax(&mut bmax, &dv[j * 3..]);
             }
-        })
-        .collect();
+            BvItem {
+                bmin: [0, 1, 2].map(|k| quant(bmin[k], p.bmin[k], qf)),
+                bmax: [0, 1, 2].map(|k| quant(bmax[k], p.bmin[k], qf)),
+                i: i as i32,
+            }
+        } else {
+            let pv = &p.polys[i * nvp * 2..];
+            let v0 = pv[0] as usize * 3;
+            let mut it = BvItem {
+                bmin: [p.verts[v0], p.verts[v0 + 1], p.verts[v0 + 2]],
+                bmax: [p.verts[v0], p.verts[v0 + 1], p.verts[v0 + 2]],
+                i: i as i32,
+            };
+            for &vj in pv.iter().take(nvp).skip(1) {
+                if vj == MESH_NULL_IDX {
+                    break;
+                }
+                let v = &p.verts[vj as usize * 3..];
+                for k in 0..3 {
+                    if v[k] < it.bmin[k] {
+                        it.bmin[k] = v[k];
+                    }
+                    if v[k] > it.bmax[k] {
+                        it.bmax[k] = v[k];
+                    }
+                }
+            }
+            it.bmin[1] = floorf(it.bmin[1] as f32 * p.ch / p.cs) as u16;
+            it.bmax[1] = ceilf(it.bmax[1] as f32 * p.ch / p.cs) as u16;
+            it
+        });
+    }
     let mut cur = 0;
     let n = items.len();
     if n > 0 {
-        subdivide(&mut items, 0, n, &mut cur, nodes);
+        let mut scratch = ws.vec(n, items[0])?;
+        subdivide(&mut items, &mut scratch, 0, n, &mut cur, nodes);
     }
-    cur
+    Ok(cur)
 }
 
 fn classify_off_mesh_point(pt: &[f32], bmin: &[f32; 3], bmax: &[f32; 3]) -> u8 {
@@ -289,6 +296,22 @@ fn check_len<T>(s: &[T], n: usize) -> Result<(), Error> {
 /// Builds tile bytes from a poly mesh, an optional detail mesh and off-mesh
 /// connections, byte-identical to upstream's `dtCreateNavMeshData`.
 pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
+    create_with_limits(p, &Limits::UNLIMITED)
+}
+
+// Calculate exact output size/counts before allocating any builder storage.
+pub(crate) fn create_with_limits(
+    p: &NavMeshCreateParams,
+    limits: &Limits,
+) -> Result<Vec<u8>, Error> {
+    create_with_workspace(p, limits, &mut Workspace::new())
+}
+
+fn create_with_workspace(
+    p: &NavMeshCreateParams,
+    limits: &Limits,
+    ws: &mut Workspace,
+) -> Result<Vec<u8>, Error> {
     if p.nvp as usize > VERTS_PER_POLYGON || p.nvp < 3 {
         return Err(Error::InvalidParameter("nvp"));
     }
@@ -334,7 +357,7 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
     check_len(p.off_mesh_con_areas, noff)?;
     check_len(p.off_mesh_con_dir, noff)?;
 
-    let mut class = alloc::vec![0u8; noff * 2];
+    let mut off_bounds = None;
     let mut stored_off = 0usize;
     let mut off_link_count = 0usize;
     if noff > 0 {
@@ -359,21 +382,22 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
         let mut bmax = p.bmax;
         bmin[1] = hmin;
         bmax[1] = hmax;
+        off_bounds = Some((bmin, bmax));
         for i in 0..noff {
             let p0 = &p.off_mesh_con_verts[i * 6..];
             let p1 = &p.off_mesh_con_verts[i * 6 + 3..];
-            class[i * 2] = classify_off_mesh_point(p0, &bmin, &bmax);
-            class[i * 2 + 1] = classify_off_mesh_point(p1, &bmin, &bmax);
-            if class[i * 2] == 0xff && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
-                class[i * 2] = 0;
+            let mut c0 = classify_off_mesh_point(p0, &bmin, &bmax);
+            let c1 = classify_off_mesh_point(p1, &bmin, &bmax);
+            if c0 == 0xff && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
+                c0 = 0;
             }
-            if class[i * 2] == 0xff {
+            if c0 == 0xff {
                 off_link_count += 1;
             }
-            if class[i * 2 + 1] == 0xff {
+            if c1 == 0xff {
                 off_link_count += 1;
             }
-            if class[i * 2] == 0xff {
+            if c0 == 0xff {
                 stored_off += 1;
             }
         }
@@ -434,6 +458,26 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
         + dtris_size
         + bv_size
         + off_size;
+    if data_size > limits.max_tile_bytes
+        || tot_poly > limits.max_tile_polys
+        || tot_vert > limits.max_tile_verts
+        || max_link_count > limits.max_tile_links
+        || npolys.max(unique_detail).max(detail_tri_count) > limits.max_tile_detail
+    {
+        return Err(Error::LimitExceeded);
+    }
+    let mut class = ws.vec(noff * 2, 0u8)?;
+    if let Some((bmin, bmax)) = off_bounds {
+        for i in 0..noff {
+            let p0 = &p.off_mesh_con_verts[i * 6..];
+            class[i * 2] = classify_off_mesh_point(p0, &bmin, &bmax);
+            class[i * 2 + 1] =
+                classify_off_mesh_point(&p.off_mesh_con_verts[i * 6 + 3..], &bmin, &bmax);
+            if class[i * 2] == 0xff && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
+                class[i * 2] = 0;
+            }
+        }
+    }
     let mut w = Writer { b: Vec::new() };
     w.b.try_reserve_exact(data_size)
         .map_err(|_| Error::AllocationFailed)?;
@@ -491,7 +535,7 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
             }
         }
     }
-    let mut poly_vert_counts = alloc::vec![0usize; npolys];
+    let mut poly_vert_counts = ws.vec(npolys, 0usize)?;
     {
         let mut c = w.at(polys_at);
         for i in 0..npolys {
@@ -549,7 +593,7 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
     }
     if has_detail {
         let mut vbase = 0usize;
-        let mut dverts: Vec<f32> = Vec::new();
+        let mut dverts = ws.vec_with_capacity(unique_detail * 3)?;
         {
             let mut c = w.at(dmeshes_at);
             for i in 0..npolys {
@@ -596,8 +640,15 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
         }
     }
     if p.build_bv_tree {
-        let mut nodes = alloc::vec![BvItem { bmin: [0; 3], bmax: [0; 3], i: 0 }; npolys * 2];
-        let n = create_bv_tree(p, &mut nodes);
+        let mut nodes = ws.vec(
+            npolys * 2,
+            BvItem {
+                bmin: [0; 3],
+                bmax: [0; 3],
+                i: 0,
+            },
+        )?;
+        let n = create_bv_tree(ws, p, &mut nodes)?;
         let mut c = w.at(bv_at);
         for it in &nodes[..n] {
             for v in it.bmin.iter().chain(it.bmax.iter()) {
@@ -628,4 +679,51 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(w.b)
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn exact_tile_limits_precede_all_builder_allocations() {
+        let p = NavMeshCreateParams {
+            verts: &[0, 0, 0, 0, 0, 1, 1, 0, 1],
+            vert_count: 3,
+            polys: &[0, 1, 2, 0xffff, 0xffff, 0xffff],
+            poly_flags: &[1],
+            poly_areas: &[0],
+            poly_count: 1,
+            nvp: 3,
+            cs: 1.,
+            ch: 1.,
+            ..NavMeshCreateParams::default()
+        };
+        let data = create_nav_mesh_data(&p).unwrap();
+        let limits = Limits {
+            max_tile_bytes: data.len(),
+            max_tile_polys: 1,
+            max_tile_verts: 3,
+            max_tile_links: 3,
+            max_tile_detail: 1,
+            ..Limits::default()
+        };
+        assert_eq!(create_with_limits(&p, &limits).unwrap(), data);
+        for field in 0..5 {
+            let mut tight = limits;
+            match field {
+                0 => tight.max_tile_bytes -= 1,
+                1 => tight.max_tile_polys -= 1,
+                2 => tight.max_tile_verts -= 1,
+                3 => tight.max_tile_links -= 1,
+                _ => tight.max_tile_detail -= 1,
+            }
+            let mut ws = Workspace::new();
+            assert_eq!(
+                create_with_workspace(&p, &tight, &mut ws),
+                Err(Error::LimitExceeded)
+            );
+            assert_eq!(ws.usage().bytes, 0);
+        }
+    }
 }

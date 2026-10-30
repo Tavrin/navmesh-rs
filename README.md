@@ -106,6 +106,7 @@ let input = Input::new(&verts, &tris);
 let mut config = BakeConfig::default();
 config.recast.tile_size = 32; // cells; other Recast settings are also in cell units
 config.tile_limits.max_bytes = 64 << 20;
+config.max_total_bytes = 2 << 30; // setup + retained tiles + concurrent workspaces
 config.tile_limits.max_work = 100_000_000;
 let mut setup = Workspace::new(); // optionally limit validation/bucketing separately
 let baked = bake::tiles_parallel(&input, &config, &mut setup)?;

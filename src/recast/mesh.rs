@@ -158,7 +158,7 @@ impl PolyMesh {
         let mut i = 0usize;
         while i < mesh.nverts as usize {
             if vflags[i] != 0 {
-                if !can_remove_vertex(&mesh, i as u16) {
+                if !can_remove_vertex(ws, &mesh, i as u16)? {
                     i += 1;
                     continue;
                 }
@@ -547,7 +547,15 @@ fn get_poly_merge_value(pa: &[u16], pb: &[u16], verts: &[u16], nvp: usize) -> (i
 }
 
 /// Merges polygon `b` into polygon `a` (`mergePolyVerts`); both are `nvp`-wide rows of `polys`.
-fn merge_poly_verts(polys: &mut [u16], a: usize, b: usize, ea: usize, eb: usize, nvp: usize) {
+fn merge_poly_verts(
+    ws: &mut Workspace,
+    polys: &mut [u16],
+    a: usize,
+    b: usize,
+    ea: usize,
+    eb: usize,
+    nvp: usize,
+) -> Result<(), Error> {
     let pa = &polys[a * nvp..(a + 1) * nvp];
     let pb = &polys[b * nvp..(b + 1) * nvp];
     let na = count_poly_verts(pa, nvp);
@@ -557,7 +565,7 @@ fn merge_poly_verts(polys: &mut [u16], a: usize, b: usize, ea: usize, eb: usize,
     let tmp: &mut [u16] = if nvp <= 64 {
         &mut tmp[..nvp]
     } else {
-        tmpv = alloc::vec![MESH_NULL_IDX; nvp];
+        tmpv = ws.vec(nvp, MESH_NULL_IDX)?;
         &mut tmpv[..]
     };
     let mut n = 0;
@@ -570,6 +578,7 @@ fn merge_poly_verts(polys: &mut [u16], a: usize, b: usize, ea: usize, eb: usize,
         n += 1;
     }
     polys[a * nvp..(a + 1) * nvp].copy_from_slice(tmp);
+    Ok(())
 }
 
 /// The greedy merge loop shared by `rcBuildPolyMesh` and `removeVertex`.
@@ -610,7 +619,7 @@ fn merge_polys(
         if best <= 0 {
             break;
         }
-        merge_poly_verts(polys, bpa, bpb, bea, beb, nvp);
+        merge_poly_verts(ws, polys, bpa, bpb, bea, beb, nvp)?;
         let last = *npolys - 1;
         if let Some((regs, areas)) = regs_areas.as_mut() {
             if regs[bpa] != regs[bpb] {
@@ -627,7 +636,7 @@ fn merge_polys(
     Ok(())
 }
 
-fn can_remove_vertex(mesh: &PolyMesh, rem: u16) -> bool {
+fn can_remove_vertex(ws: &mut Workspace, mesh: &PolyMesh, rem: u16) -> Result<bool, Error> {
     let nvp = mesh.nvp as usize;
     let mut num_touched = 0usize;
     let mut num_remaining_edges = 0i32;
@@ -641,9 +650,10 @@ fn can_remove_vertex(mesh: &PolyMesh, rem: u16) -> bool {
         }
     }
     if num_remaining_edges <= 2 {
-        return false;
+        return Ok(false);
     }
-    let mut edges: Vec<[i32; 3]> = Vec::with_capacity(num_touched * 2);
+    let mut edges: Vec<[i32; 3]> =
+        ws.vec_with_capacity(num_touched.checked_mul(2).ok_or(Error::SizeOverflow)?)?;
     for i in 0..mesh.npolys as usize {
         let p = &mesh.polys[i * nvp * 2..];
         let nv = count_poly_verts(p, nvp);
@@ -668,7 +678,7 @@ fn can_remove_vertex(mesh: &PolyMesh, rem: u16) -> bool {
             k = j;
         }
     }
-    edges.iter().filter(|e| e[2] < 2).count() <= 2
+    Ok(edges.iter().filter(|e| e[2] < 2).count() <= 2)
 }
 
 fn remove_vertex(
@@ -691,12 +701,15 @@ fn remove_vertex(
         for j in 0..nv {
             let (pj, pk) = (mesh.polys[base + j], mesh.polys[base + k]);
             if pj != rem && pk != rem {
-                edges.push([
-                    i32::from(pk),
-                    i32::from(pj),
-                    i32::from(mesh.regs[i]),
-                    i32::from(mesh.areas[i]),
-                ]);
+                ws.push(
+                    &mut edges,
+                    [
+                        i32::from(pk),
+                        i32::from(pj),
+                        i32::from(mesh.regs[i]),
+                        i32::from(mesh.areas[i]),
+                    ],
+                )?;
             }
             k = j;
         }
@@ -734,9 +747,13 @@ fn remove_vertex(
     if edges.is_empty() {
         return Ok(());
     }
-    let mut hole: Vec<i32> = alloc::vec![edges[0][0]];
-    let mut hreg: Vec<i32> = alloc::vec![edges[0][2]];
-    let mut harea: Vec<i32> = alloc::vec![edges[0][3]];
+    let capacity = edges.len().checked_add(1).ok_or(Error::SizeOverflow)?;
+    let mut hole = ws.vec_with_capacity(capacity)?;
+    let mut hreg = ws.vec_with_capacity(capacity)?;
+    let mut harea = ws.vec_with_capacity(capacity)?;
+    hole.push(edges[0][0]);
+    hreg.push(edges[0][2]);
+    harea.push(edges[0][3]);
     while !edges.is_empty() {
         let mut matched = false;
         let mut i = 0usize;
@@ -766,23 +783,24 @@ fn remove_vertex(
         }
     }
     let nhole = hole.len();
-    let mut tverts = alloc::vec![0i32; nhole * 4];
-    let mut thole: Vec<i32> = (0..nhole as i32).collect();
+    let mut tverts = ws.vec(nhole * 4, 0i32)?;
+    let mut thole: Vec<i32> = ws.vec(nhole, 0i32)?;
     for (i, &pi) in hole.iter().enumerate() {
+        thole[i] = i as i32;
         let v = &mesh.verts[pi as usize * 3..pi as usize * 3 + 3];
         tverts[i * 4] = i32::from(v[0]);
         tverts[i * 4 + 1] = i32::from(v[1]);
         tverts[i * 4 + 2] = i32::from(v[2]);
     }
-    let mut tris = alloc::vec![0i32; nhole * 3];
+    let mut tris = ws.vec(nhole * 3, 0i32)?;
     let mut ntris = triangulate(nhole, &tverts, &mut thole, &mut tris);
     if ntris < 0 {
         ntris = -ntris;
     }
     let ntris = ntris as usize;
-    let mut polys = alloc::vec![MESH_NULL_IDX; (ntris + 1) * nvp];
-    let mut pregs = alloc::vec![0u16; ntris];
-    let mut pareas = alloc::vec![0u8; ntris];
+    let mut polys = ws.vec((ntris + 1) * nvp, MESH_NULL_IDX)?;
+    let mut pregs = ws.vec(ntris, 0u16)?;
+    let mut pareas = ws.vec(ntris, 0u8)?;
     let mut npolys = 0usize;
     for t in tris[..ntris * 3].chunks_exact(3) {
         if t[0] != t[1] && t[0] != t[2] && t[1] != t[2] {
@@ -840,11 +858,11 @@ fn build_mesh_adjacency(
         poly_edge: [u16; 2],
         poly: [u16; 2],
     }
-    let max_edges = npolys * nvp;
+    let max_edges = npolys.checked_mul(nvp).ok_or(Error::SizeOverflow)?;
+    ws.work(u64::try_from(max_edges).map_err(|_| Error::SizeOverflow)?)?;
     let mut first_edge = ws.vec(nverts, MESH_NULL_IDX)?;
     let mut next_edge = ws.vec(max_edges, 0u16)?;
     let mut edges: Vec<Edge> = ws.vec_with_capacity(max_edges)?;
-    ws.work(max_edges as u64)?;
     for i in 0..npolys {
         let t = &polys[i * nvp * 2..];
         for j in 0..nvp {
@@ -859,6 +877,10 @@ fn build_mesh_adjacency(
             };
             if v0 < v1 {
                 let e = edges.len();
+                // 0xffff is the chain terminator, so it cannot name an edge.
+                if e >= usize::from(MESH_NULL_IDX) {
+                    return Err(Error::LimitExceeded);
+                }
                 edges.push(Edge {
                     vert: [v0, v1],
                     poly: [i as u16, i as u16],
@@ -904,4 +926,58 @@ fn build_mesh_adjacency(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod adjacency_tests {
+    use super::*;
+    use crate::Limits;
+
+    #[test]
+    fn adjacency_charges_work_before_any_allocation() {
+        let mut polys = [0, 1, 2, MESH_NULL_IDX, MESH_NULL_IDX, MESH_NULL_IDX];
+        let mut ws = Workspace::with_limits(Limits {
+            max_work: 0,
+            ..Limits::default()
+        });
+        assert_eq!(
+            build_mesh_adjacency(&mut ws, &mut polys, 1, 3, 3),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(ws.usage().bytes, 0);
+    }
+
+    #[test]
+    fn adjacency_rejects_edge_sentinel_and_wrap() {
+        // Ascending sides contribute two edges per triangle; the final reverse
+        // triangle contributes one. All chains stay short at the exact boundary.
+        let mut polys = Vec::new();
+        for i in 0..32767u16 {
+            polys.extend_from_slice(&[
+                i,
+                i + 1,
+                i + 2,
+                MESH_NULL_IDX,
+                MESH_NULL_IDX,
+                MESH_NULL_IDX,
+            ]);
+        }
+        polys.extend_from_slice(&[
+            32768,
+            32767,
+            32766,
+            MESH_NULL_IDX,
+            MESH_NULL_IDX,
+            MESH_NULL_IDX,
+        ]);
+        build_mesh_adjacency(&mut Workspace::new(), &mut polys, 32768, 32769, 3).unwrap();
+        // Reversing the final triangle adds edge 65,535, the null sentinel.
+        // There are fewer than 65,534 vertices: a vertex guard cannot protect it.
+        let base = 32767 * 6;
+        polys[base..base + 3].copy_from_slice(&[32766, 32767, 32768]);
+        assert_eq!(
+            build_mesh_adjacency(&mut Workspace::new(), &mut polys, 32768, 32769, 3),
+            Err(Error::LimitExceeded)
+        );
+    }
 }

@@ -307,6 +307,35 @@ Independent release repeats are identical on every crowd and tile-cache case.
   zero-touch/truncation cases above. Oriented-box exactness is measured on the
   oracle platform with its platform math functions.
 
+### Recast and bake deliberate differences from C++
+
+- C++ uses allocator hooks and has no byte/work budgets. Rust charges all detail
+  queues/triangulation buffers, contour winding/hole/simplification/sort storage,
+  region traversal/merge storage, and mesh removal scratch before fallible
+  reservation. Exhaustion returns `Error::LimitExceeded` or
+  `Error::AllocationFailed`, propagated with the ordered tile coordinate.
+  Stable sorting uses fallibly reserved scratch and retains glibc tie order.
+- C++'s adjacency builder stores edge-chain indices in `unsigned short` without
+  checking their range. Index 65,535 collides with its null sentinel, and 65,536
+  wraps to zero. Rust permits indices 0..=65,534 and returns
+  `Error::LimitExceeded` before storing an out-of-range index. This deliberately
+  rejects the C++ defect; no parity is claimed for meshes that trigger it.
+  Adjacency work is charged before its arrays are allocated.
+- Convex marking charges validation, polygon coordinates, rectangle cells and
+  every visited span times polygon vertex count before visiting that cell's spans.
+  C++ does not budget that work. A later cell exhausting work may leave earlier
+  cells marked; a failed bake never returns partial tiles.
+- The bake extension spatially buckets volumes once in input order and only
+  applies volumes overlapping the tile's bordered xz column. Heights retain
+  Recast's quantized span checks: a zero-height geometry bounding box must not
+  exclude volumes that mark the rasterized floor just above it. Setup charges
+  each candidate tile overlap before visiting it, avoiding all-volumes-per-tile
+  scans for spatially independent inputs.
+- Exact Detour output size and polygon/vertex/link/detail counts are computed
+  before builder allocations and checked against tile limits. The public Detour
+  builder retains unlimited defaults; the bake builder applies `tile_limits`.
+  C++ has no equivalent caller-specified limits.
+
 ## Parallel tiled baking
 
 The `bake` extension is **not in recastnavigation**. `tiles` and `tiles_parallel`
@@ -314,8 +343,22 @@ share the tile pipeline; only the latter uses rayon with `parallel`. Both APIs
 remain available without that feature. Validation and spatial triangle bucketing
 are serial, tile pipelines are independent, and insertion into Detour is serial
 in row-major order. Setup and each tile have separate budgets; per-tile byte/work
-charges accumulate across stage resets. Rayon scheduler allocations and aggregate
-process memory are outside those budgets.
+charges accumulate across stage resets. `BakeConfig::max_total_bytes` additionally
+admits setup storage, retained output and concurrent worker storage before any
+tile starts. It defaults to unlimited. A finite aggregate budget requires finite
+`tile_limits.max_bytes`; otherwise it returns `Error::LimitExceeded` without a
+tile location. The conservative reservation is:
+
+`setup_bytes + tile_count * min(max_tile_bytes, max_bytes) + min(tile_count, workers) * max_bytes`
+
+Here the two tile limits come from `tile_limits`; setup includes both result-slot
+vectors. Serial uses one worker; parallel uses the current rayon pool size (one
+without the feature). Arithmetic overflow rejects admission. Setup allocations
+also respect the total ceiling. Empty tiles reserve output space too; a worker's
+output may be counted in both terms. These are charged-storage bounds, excluding
+allocator metadata/transient reallocations, thread stacks and rayon's pool and
+scheduler storage, rather than a process RSS limit. Per-tile limits remain in
+force, and `into_navmesh` uses its own separate limits.
 
 On x86-64 Linux, `nav-port verify-parallel` compares the independent original
 serial driver against the public serial API, then against the public parallel API
@@ -379,6 +422,30 @@ Regressions cover all three partitions, area volumes, triangle areas, off-mesh
 links, empty tiles, one-tile layouts, malformed inputs, setup budgets/retry,
 cumulative stage budgets, format limits, first-tile failures at every requested
 thread count, and a later tile error finishing before the first ordered error.
+
+### Parallel bake safety review rerun (2026-10-30)
+
+After the allocation, aggregate-budget, volume-work, adjacency-range and
+preallocation-limit fixes, fresh pinned C++ oracles and fresh Rust drivers pass
+the complete 21-case corpus in both ref widths: **76,018 records, zero
+mismatches**. The separate debug/release tile-cache campaign passes **9,200**
+comparisons; repeat files are identical. Both crowd campaigns pass in
+both widths and debug/release: **158,400 simulation-tick and 2,469,992 active-agent
+comparisons**, zero mismatches. Parallel identity again passes all **50**
+case/width/thread combinations at 1/2/4/8/16 threads: **28,530 tile-byte and 2,100
+query-record comparisons**, plus ten public serial/API baselines (5,706 tiles,
+420 queries).
+
+The 8-to-64 independent tile/volume fixture charges setup work 442 -> 3,634
+(**8.22x**) and total tile work 671,969 -> 5,481,198 (**8.16x**), below its 9x
+regression ceiling. These are work counters, not wall-clock scaling claims.
+Thirteen added regressions cover the five findings, allocation siblings, exact
+adjacency range, border/height volume selection and finite aggregate admission.
+Workspace tests (88 with parallel, plus 14 doctests), both-width serial/parallel
+Clippy, parallel-off tests, tilecache-only and bake-only feature tests, native
+no_std/libm, wasm without parallel, Rust 1.88, rustdoc, formatting, public text
+and parallel fuzz-source compilation all pass. The complete final gate set was
+rerun after development formatting fixes. The new fuzz target remains unrun.
 
 ## Beyond the records
 

@@ -238,6 +238,39 @@ impl Workspace {
     }
 }
 
+// Stable merge sort with caller-owned, fallibly allocated scratch. Taking the
+// left element on ties preserves the pinned glibc qsort order.
+#[cfg(any(feature = "recast", feature = "detour"))]
+pub(crate) fn stable_sort<T: Copy>(
+    values: &mut [T],
+    scratch: &mut [T],
+    compare: impl Fn(&T, &T) -> core::cmp::Ordering + Copy,
+) {
+    if values.len() < 2 {
+        return;
+    }
+    let mid = values.len() / 2;
+    let len = values.len();
+    let (left, right) = values.split_at_mut(mid);
+    let (sl, sr) = scratch[..len].split_at_mut(mid);
+    stable_sort(left, sl, compare);
+    stable_sort(right, sr, compare);
+    let (mut a, mut b) = (0, mid);
+    for out in scratch.iter_mut().take(values.len()) {
+        if a < mid
+            && (b == values.len()
+                || compare(&values[a], &values[b]) != core::cmp::Ordering::Greater)
+        {
+            *out = values[a];
+            a += 1;
+        } else {
+            *out = values[b];
+            b += 1;
+        }
+    }
+    values.copy_from_slice(&scratch[..values.len()]);
+}
+
 // ---------------------------------------------------------------------------
 // Floating-point helpers. sqrt, floor and ceil are exact IEEE operations on
 // every implementation; cos comes from the platform libm with `std` and from the

@@ -171,3 +171,43 @@ fn one_tile_layout_assembles() {
         .into_navmesh(Limits::default())
         .unwrap();
 }
+
+#[test]
+fn aggregate_failure_is_setup_error_and_retry_preserves_identity() {
+    let (verts, tris) = floor();
+    let input = Input::new(&verts, &tris);
+    let baseline = bake::tiles(&input, &BakeConfig::default(), &mut Workspace::new()).unwrap();
+    let mut c = BakeConfig::default();
+    c.tile_limits.max_bytes = 16 * 1024 * 1024;
+    c.tile_limits.max_tile_bytes = 1024 * 1024;
+    c.max_total_bytes = c.tile_limits.max_bytes; // no room for retained tiles
+    let mut ws = Workspace::new();
+    for parallel in [false, true] {
+        let err = if parallel {
+            bake::tiles_parallel(&input, &c, &mut ws)
+        } else {
+            bake::tiles(&input, &c, &mut ws)
+        }
+        .unwrap_err();
+        assert_eq!(err.tile, None);
+        assert_eq!(err.error, Error::LimitExceeded);
+    }
+    c.max_total_bytes = 1024 * 1024 * 1024;
+    assert_eq!(
+        bake::tiles(&input, &c, &mut ws).unwrap().tiles,
+        baseline.tiles
+    );
+    #[cfg(feature = "parallel")]
+    for n in [1, 2, 4, 8, 16] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build()
+            .unwrap();
+        assert_eq!(
+            pool.install(|| bake::tiles_parallel(&input, &c, &mut ws))
+                .unwrap()
+                .tiles,
+            baseline.tiles
+        );
+    }
+}

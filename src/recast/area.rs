@@ -279,7 +279,18 @@ pub fn mark_convex_poly_area(
     chf: &mut CompactHeightfield,
 ) -> Result<(), Error> {
     ws.begin();
+    // Validation itself visits every cell/span; charge before traversing.
+    ws.work(
+        (chf.cells.len() as u64)
+            .checked_add(
+                (chf.spans.len() as u64)
+                    .checked_mul(4)
+                    .ok_or(Error::SizeOverflow)?,
+            )
+            .ok_or(Error::SizeOverflow)?,
+    )?;
     check_chf(chf)?;
+    ws.work(verts.len() as u64)?;
     if verts.len() < 3 || !verts.len().is_multiple_of(3) {
         return Err(Error::InvalidInput("polygon vertex array"));
     }
@@ -301,6 +312,11 @@ pub fn mark_convex_poly_area(
     for z in minz..=maxz {
         for x in minx..=maxx {
             let c = chf.cells[(x + z * chf.width) as usize];
+            ws.work(
+                u64::from(c.count)
+                    .checked_mul((verts.len() / 3) as u64)
+                    .ok_or(Error::SizeOverflow)?,
+            )?;
             for i in c.index as usize..c.index as usize + c.count as usize {
                 if chf.areas[i] == NULL_AREA {
                     continue;

@@ -223,3 +223,53 @@ fn arbitrary_input_never_panics() {
         let _ = build(&mut ws, &verts, &tris, &s);
     }
 }
+
+#[test]
+fn convex_volume_work_counts_layered_spans_times_polygon_vertices() {
+    use recast::{CompactCell, CompactSpan};
+    let mut chf = CompactHeightfield {
+        width: 1,
+        height: 1,
+        span_count: 8,
+        cs: 1.,
+        ch: 1.,
+        cells: vec![CompactCell { index: 0, count: 8 }],
+        spans: (0..8)
+            .map(|y| CompactSpan {
+                y,
+                con: 0xffffff,
+                ..CompactSpan::default()
+            })
+            .collect(),
+        areas: vec![63; 8],
+        ..CompactHeightfield::default()
+    };
+    let polygon = [0., 0., 0., 0., 0., 1., 1., 0., 1., 1., 0., 0.];
+    // Validation: 1 cell + 4*8 span connections; polygon: 12 scalars;
+    // rectangle: 1 cell; marking: 8 spans * 4 vertices.
+    let exact = 33 + 12 + 1 + 32;
+    let mut ws = Workspace::with_limits(Limits {
+        max_work: exact - 1,
+        ..Limits::default()
+    });
+    assert_eq!(
+        recast::mark_convex_poly_area(&mut ws, &polygon, 0., 8., 3, &mut chf),
+        Err(Error::LimitExceeded)
+    );
+    assert_eq!(chf.areas, [63; 8]); // fail before visiting this cell's spans
+    ws.set_limits(Limits {
+        max_work: exact,
+        ..Limits::default()
+    });
+    recast::mark_convex_poly_area(&mut ws, &polygon, 0., 8., 3, &mut chf).unwrap();
+    assert_eq!(ws.usage().work, exact);
+    assert_eq!(chf.areas, [3; 8]);
+    ws.set_limits(Limits {
+        max_work: 0,
+        ..Limits::default()
+    });
+    assert_eq!(
+        recast::mark_convex_poly_area(&mut ws, &polygon, 0., 8., 3, &mut chf),
+        Err(Error::LimitExceeded)
+    );
+}

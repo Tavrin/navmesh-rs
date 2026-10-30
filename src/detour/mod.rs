@@ -174,3 +174,6 @@ pub fn raw_status<T>(r: &Result<T, Error>, ok: impl FnOnce(&T) -> Status) -> u32
 
 #[cfg(feature = "recast")]
 pub(crate) use tile::check_bake_tile_limits;
+
+#[cfg(feature = "recast")]
+pub(crate) use builder::create_with_limits;

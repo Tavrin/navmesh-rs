@@ -127,6 +127,7 @@ impl PolyMeshDetail {
             hp.height = bounds[i * 4 + 3] - bounds[i * 4 + 2];
             ws.work((hp.width.max(0) as u64) * (hp.height.max(0) as u64))?;
             get_height_data(
+                ws,
                 chf,
                 &p[..npoly],
                 &mesh.verts,
@@ -134,7 +135,7 @@ impl PolyMeshDetail {
                 &mut hp,
                 &mut arr,
                 mesh.regs[i],
-            );
+            )?;
             let nverts = build_poly_detail(
                 ws,
                 &poly[..npoly * 3],
@@ -556,16 +557,18 @@ fn complete_facet(
 }
 
 fn delaunay_hull(
+    ws: &mut Workspace,
     npts: usize,
     pts: &[f32],
     hull: &[i32],
     tris: &mut Vec<i32>,
     edges: &mut Vec<i32>,
-) {
+) -> Result<(), Error> {
     let mut nfaces = 0i32;
     let mut nedges = 0usize;
     let max_edges = npts * 10;
     edges.clear();
+    ws.reserve(edges, max_edges * 4)?;
     edges.resize(max_edges * 4, 0);
     let nhull = hull.len();
     let mut j = nhull.wrapping_sub(1);
@@ -592,6 +595,7 @@ fn delaunay_hull(
         cur += 1;
     }
     tris.clear();
+    ws.reserve(tris, nfaces.max(0) as usize * 4)?;
     tris.resize(nfaces.max(0) as usize * 4, -1);
     for i in 0..nedges {
         let e = [
@@ -634,6 +638,7 @@ fn delaunay_hull(
             i += 1;
         }
     }
+    Ok(())
 }
 
 fn poly_min_extent(verts: &[f32]) -> f32 {
@@ -666,11 +671,18 @@ fn next(i: usize, n: usize) -> usize {
     if i + 1 < n { i + 1 } else { 0 }
 }
 
-fn triangulate_hull(verts: &[f32], hull: &[i32], nin: usize, tris: &mut Vec<i32>) {
+fn triangulate_hull(
+    ws: &mut Workspace,
+    verts: &[f32],
+    hull: &[i32],
+    nin: usize,
+    tris: &mut Vec<i32>,
+) -> Result<(), Error> {
     let nhull = hull.len();
     if nhull < 3 {
-        return;
+        return Ok(());
     }
+    ws.reserve(tris, (nhull - 2) * 4)?;
     let (mut start, mut left, mut right) = (0usize, 1usize, nhull - 1);
     let mut dmin = f32::MAX;
     let v = |k: i32| &verts[k as usize * 3..k as usize * 3 + 3];
@@ -709,6 +721,7 @@ fn triangulate_hull(verts: &[f32], hull: &[i32], nin: usize, tris: &mut Vec<i32>
             right = nright;
         }
     }
+    Ok(())
 }
 
 #[inline(always)]
@@ -871,11 +884,11 @@ fn build_poly_detail(
     }
     let hull = &hull[..nhull];
     if min_extent < sample_dist * 2.0 {
-        triangulate_hull(&verts[..nverts * 3], hull, nin, tris);
+        triangulate_hull(ws, &verts[..nverts * 3], hull, nin, tris)?;
         set_tri_flags(tris, hull);
         return Ok(nverts);
     }
-    triangulate_hull(&verts[..nverts * 3], hull, nin, tris);
+    triangulate_hull(ws, &verts[..nverts * 3], hull, nin, tris)?;
     if tris.is_empty() {
         return Ok(nverts);
     }
@@ -948,7 +961,7 @@ fn build_poly_detail(
             samples[besti * 4 + 3] = 1;
             verts[nverts * 3..nverts * 3 + 3].copy_from_slice(&bestpt);
             nverts += 1;
-            delaunay_hull(nverts, &verts[..nverts * 3], hull, tris, edges);
+            delaunay_hull(ws, nverts, &verts[..nverts * 3], hull, tris, edges)?;
         }
     }
     if tris.len() / 4 > MAX_TRIS {
@@ -959,13 +972,14 @@ fn build_poly_detail(
 }
 
 fn seed_array_with_poly_center(
+    ws: &mut Workspace,
     chf: &CompactHeightfield,
     poly: &[u16],
     verts: &[u16],
     bs: i32,
     hp: &mut HeightPatch,
     array: &mut Vec<i32>,
-) {
+) -> Result<(), Error> {
     const OFFSET: [i32; 18] = [0, 0, -1, -1, 0, -1, 1, -1, 1, 0, 1, 1, 0, 1, -1, 1, -1, 0];
     let (mut start_x, mut start_y, mut start_i) = (0i32, 0i32, -1i32);
     let mut dmin = i32::from(UNSET_HEIGHT);
@@ -1005,6 +1019,7 @@ fn seed_array_with_poly_center(
     pcx /= poly.len() as i32;
     pcy /= poly.len() as i32;
     array.clear();
+    ws.reserve(array, 3)?;
     array.extend_from_slice(&[start_x, start_y, start_i]);
     let mut dirs = [0i32, 1, 2, 3];
     hp.fill(0);
@@ -1046,11 +1061,13 @@ fn seed_array_with_poly_center(
             }
             hp.set(hpx, hpy, 1);
             let idx = chf.cells[((nx + bs) + (ny + bs) * chf.width) as usize].index as i32 + con;
+            ws.reserve(array, 3)?;
             array.extend_from_slice(&[nx, ny, idx]);
         }
         dirs.swap(direct, 3);
     }
     array.clear();
+    ws.reserve(array, 3)?;
     array.extend_from_slice(&[cx + bs, cy + bs, ci]);
     hp.fill(UNSET_HEIGHT);
     if ci >= 0 {
@@ -1059,9 +1076,11 @@ fn seed_array_with_poly_center(
     } else {
         array.clear();
     }
+    Ok(())
 }
 
 fn get_height_data(
+    ws: &mut Workspace,
     chf: &CompactHeightfield,
     poly: &[u16],
     verts: &[u16],
@@ -1069,7 +1088,7 @@ fn get_height_data(
     hp: &mut HeightPatch,
     queue: &mut Vec<i32>,
     region: u16,
-) {
+) -> Result<(), Error> {
     queue.clear();
     hp.fill(UNSET_HEIGHT);
     let mut empty = true;
@@ -1101,6 +1120,7 @@ fn get_height_data(
                         }
                     }
                     if border {
+                        ws.reserve(queue, 3)?;
                         queue.extend_from_slice(&[x, y, i as i32]);
                     }
                     break;
@@ -1109,7 +1129,7 @@ fn get_height_data(
         }
     }
     if empty {
-        seed_array_with_poly_center(chf, poly, verts, bs, hp, queue);
+        seed_array_with_poly_center(ws, chf, poly, verts, bs, hp, queue)?;
     }
     const RETRACT_SIZE: usize = 256;
     let mut head = 0usize;
@@ -1143,7 +1163,105 @@ fn get_height_data(
             }
             let ai = chf.cells[(ax + ay * chf.width) as usize].index as i32 + con;
             hp.set(hx, hy, chf.spans[ai as usize].y);
+            ws.reserve(queue, 3)?;
             queue.extend_from_slice(&[ax, ay, ai]);
         }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use crate::{
+        Limits,
+        recast::{CompactCell, CompactSpan},
+    };
+
+    #[test]
+    fn height_queue_and_center_seed_reserve_fallibly() {
+        let mut a = CompactSpan {
+            reg: 1,
+            con: 0xffffff,
+            ..CompactSpan::default()
+        };
+        let mut b = CompactSpan {
+            reg: 2,
+            con: 0xffffff,
+            ..CompactSpan::default()
+        };
+        a.set_con(2, 0);
+        b.set_con(0, 0);
+        let chf = CompactHeightfield {
+            width: 2,
+            height: 1,
+            span_count: 2,
+            cells: alloc::vec![
+                CompactCell { index: 0, count: 1 },
+                CompactCell { index: 1, count: 1 }
+            ],
+            spans: alloc::vec![a, b],
+            areas: alloc::vec![63;2],
+            ..CompactHeightfield::default()
+        };
+        let mut hp = HeightPatch {
+            data: alloc::vec![0;2],
+            xmin: 0,
+            ymin: 0,
+            width: 2,
+            height: 1,
+        };
+        let mut queue = Vec::new();
+        let mut ws = Workspace::with_limits(Limits {
+            max_bytes: 0,
+            ..Limits::default()
+        });
+        assert_eq!(
+            get_height_data(&mut ws, &chf, &[0], &[0, 0, 0], 0, &mut hp, &mut queue, 1),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(ws.usage().bytes, 12);
+        assert_eq!(queue.capacity(), 0);
+        ws.begin();
+        assert_eq!(
+            get_height_data(
+                &mut ws,
+                &chf,
+                &[0],
+                &[0, 0, 0],
+                0,
+                &mut hp,
+                &mut queue,
+                MULTIPLE_REGS
+            ),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(ws.usage().bytes, 12);
+        assert_eq!(queue.capacity(), 0);
+        ws.set_limits(Limits::default());
+        ws.begin();
+        get_height_data(&mut ws, &chf, &[0], &[0, 0, 0], 0, &mut hp, &mut queue, 1).unwrap();
+        assert_eq!(hp.data, [0, 0]);
+    }
+
+    #[test]
+    fn detail_triangulation_storage_is_charged() {
+        let mut ws = Workspace::with_limits(Limits {
+            max_bytes: 0,
+            ..Limits::default()
+        });
+        let mut tris = Vec::new();
+        let mut edges = Vec::new();
+        assert_eq!(
+            delaunay_hull(&mut ws, 3, &[0.; 9], &[0, 1, 2], &mut tris, &mut edges),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(edges.capacity(), 0);
+        ws.begin();
+        assert_eq!(
+            triangulate_hull(&mut ws, &[0.; 9], &[0, 1, 2], 3, &mut tris),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(tris.capacity(), 0);
     }
 }

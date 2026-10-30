@@ -10,7 +10,8 @@
 //! allocation. [`BakeConfig::tile_limits`] applies independently to each tile,
 //! cumulatively across its stages (bytes are conservative allocation charges,
 //! not peak resident memory). Each tile owns a separate workspace. Concurrent
-//! tiles and retained outputs multiply memory use; these are not process limits.
+//! memory is admitted with [`BakeConfig::max_total_bytes`] before tile work.
+//! This bounds charged storage, excluding allocator metadata, stacks and the pool.
 //! Rayon owns its scheduler/pool allocation costs. Without `parallel`, this API
 //! supports `no_std` + `alloc`, including wasm.
 
@@ -105,6 +106,15 @@ pub struct BakeConfig {
     pub walkable_climb: f32,
     /// Independent cumulative budget for each tile.
     pub tile_limits: Limits,
+    /// Aggregate charged-storage budget for setup, retained outputs and active
+    /// workers. `usize::MAX` disables it. A finite value requires a finite
+    /// `tile_limits.max_bytes`. Before tile work, reserve setup charges plus
+    /// `tile_count * min(max_tile_bytes, max_bytes)` retained bytes plus
+    /// `min(tile_count, worker_count) * max_bytes` working bytes. Serial uses one
+    /// worker; parallel uses the current rayon pool size. Conservative: outputs
+    /// may be counted twice, including empty tiles. Excludes allocator metadata,
+    /// thread stacks and rayon-owned storage. Failure has no tile location.
+    pub max_total_bytes: usize,
 }
 
 impl Default for BakeConfig {
@@ -135,6 +145,7 @@ impl Default for BakeConfig {
             walkable_radius: 0.6,
             walkable_climb: 0.9,
             tile_limits: Limits::default(),
+            max_total_bytes: usize::MAX,
         }
     }
 }
@@ -220,6 +231,7 @@ fn integer(v: f32) -> Result<i32, Error> {
 struct Prepared {
     configs: Vec<Config>,
     buckets: Vec<Vec<usize>>,
+    volume_buckets: Vec<Vec<usize>>,
     params: NavMeshParams,
     columns: i32,
 }
@@ -390,10 +402,46 @@ fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prep
             }
         }
     }
+    // Bucket volumes spatially once, preserving their input order per tile.
+    // Tiles are vertical columns: use bordered xz overlap, and retain height
+    // filtering in Recast's quantized span domain (not the geometry's y bounds).
+    let mut volume_buckets = ws.vec(count, Vec::new())?;
+    for (i, v) in input.volumes.iter().enumerate() {
+        work(ws, v.verts.len())?;
+        let (lo, hi) = recast::calc_bounds(v.verts);
+        let cell = |v: f32, n: i32| (floorf(v) as i32).clamp(0, n - 1);
+        let x0 = cell((lo[0] - bmin[0] - margin) / tcs, tw);
+        let x1 = cell((hi[0] - bmin[0] + margin) / tcs, tw);
+        let y0 = cell((lo[2] - bmin[2] - margin) / tcs, th);
+        let y1 = cell((hi[2] - bmin[2] + margin) / tcs, th);
+        work(
+            ws,
+            usize::try_from(
+                (x1 - x0 + 1)
+                    .checked_mul(y1 - y0 + 1)
+                    .ok_or(Error::SizeOverflow)?,
+            )
+            .map_err(|_| Error::SizeOverflow)?,
+        )?;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let at = (y * tw + x) as usize;
+                let cfg = &configs[at];
+                if lo[0] <= cfg.bmax[0]
+                    && hi[0] >= cfg.bmin[0]
+                    && lo[2] <= cfg.bmax[2]
+                    && hi[2] >= cfg.bmin[2]
+                {
+                    ws.push(&mut volume_buckets[at], i)?;
+                }
+            }
+        }
+    }
     let tile_bits = count.next_power_of_two().trailing_zeros();
     Ok(Prepared {
         configs,
         buckets,
+        volume_buckets,
         columns: tw,
         params: NavMeshParams {
             orig: bmin,
@@ -459,6 +507,7 @@ fn build_tile(
     c: &BakeConfig,
     cfg: &Config,
     bucket: &[usize],
+    volume_bucket: &[usize],
     x: i32,
     y: i32,
 ) -> Result<Option<Vec<u8>>, Error> {
@@ -467,6 +516,20 @@ fn build_tile(
         limits: c.tile_limits,
         usage: Usage::default(),
     };
+    build_tile_in_workspace(input, c, cfg, bucket, volume_bucket, x, y, &mut tw)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tile_in_workspace(
+    input: &Input<'_>,
+    c: &BakeConfig,
+    cfg: &Config,
+    bucket: &[usize],
+    volume_bucket: &[usize],
+    x: i32,
+    y: i32,
+    tw: &mut TileWorkspace,
+) -> Result<Option<Vec<u8>>, Error> {
     let (tris, mut areas) = tw.stage(|ws| {
         work(ws, bucket.len())?;
         let mut tris =
@@ -527,7 +590,8 @@ fn build_tile(
         tw.stage(|ws| CompactHeightfield::build(ws, cfg.walkable_height, cfg.walkable_climb, &hf))?;
     drop(hf);
     tw.stage(|ws| recast::erode_walkable_area(ws, cfg.walkable_radius, &mut chf))?;
-    for v in input.volumes {
+    for &i in volume_bucket {
+        let v = &input.volumes[i];
         tw.stage(|ws| {
             recast::mark_convex_poly_area(ws, v.verts, v.hmin, v.hmax, v.area, &mut chf)
         })?;
@@ -652,7 +716,7 @@ fn build_tile(
             .ok_or(Error::SizeOverflow)?;
         work(ws, bound.checked_add(sort_work).ok_or(Error::SizeOverflow)?)?;
         ws.charge_bytes::<u8>(bound)?;
-        let data = detour::create_nav_mesh_data(&params)?;
+        let data = detour::create_with_limits(&params, &c.tile_limits)?;
         if data.len() > c.tile_limits.max_tile_bytes {
             return Err(Error::LimitExceeded);
         }
@@ -690,7 +754,21 @@ fn bake(
     ws: &mut Workspace,
     parallel: bool,
 ) -> Result<BakedTiles, BakeError> {
-    let p = prepare(input, c, ws)?;
+    // Also enforce the aggregate ceiling during setup, before its allocations.
+    let setup_limits = ws.limits();
+    let mut capped = setup_limits;
+    capped.max_bytes = capped.max_bytes.min(c.max_total_bytes);
+    ws.set_limits(capped);
+    let prepared = prepare(input, c, ws);
+    ws.set_limits(setup_limits);
+    let p = prepared?;
+    let slot_bytes = p
+        .configs
+        .len()
+        .checked_mul(core::mem::size_of::<Tile>() + core::mem::size_of::<TileResult>())
+        .and_then(|n| n.checked_add(ws.usage().bytes))
+        .ok_or(Error::SizeOverflow)?;
+    check_total_bytes(c, slot_bytes, p.configs.len(), worker_count(parallel))?;
     work(ws, p.configs.len())?;
     let mut output = ws.vec_with_capacity::<Tile>(p.configs.len())?;
     // Slots are allocated fallibly and byte-charged before rayon sees them.
@@ -702,7 +780,15 @@ fn bake(
     };
     let build = |i: usize| -> Result<Option<Vec<u8>>, Error> {
         let (x, y) = coord(i)?;
-        build_tile(input, c, &p.configs[i], &p.buckets[i], x, y)
+        build_tile(
+            input,
+            c,
+            &p.configs[i],
+            &p.buckets[i],
+            &p.volume_buckets[i],
+            x,
+            y,
+        )
     };
     fill_results(&mut results, parallel, build);
     for (i, result) in results.into_iter().enumerate() {
@@ -717,6 +803,38 @@ fn bake(
         params: p.params,
         tiles: output,
     })
+}
+
+fn worker_count(parallel: bool) -> usize {
+    #[cfg(feature = "parallel")]
+    if parallel {
+        return rayon::current_num_threads();
+    }
+    let _ = parallel;
+    1
+}
+
+fn check_total_bytes(
+    c: &BakeConfig,
+    setup: usize,
+    count: usize,
+    workers: usize,
+) -> Result<(), Error> {
+    if c.max_total_bytes == usize::MAX {
+        return Ok(());
+    }
+    if c.tile_limits.max_bytes == usize::MAX {
+        return Err(Error::LimitExceeded);
+    }
+    let retained = count.checked_mul(c.tile_limits.max_tile_bytes.min(c.tile_limits.max_bytes));
+    let active = count.min(workers).checked_mul(c.tile_limits.max_bytes);
+    let required = retained
+        .and_then(|n| active.and_then(|a| n.checked_add(a)))
+        .and_then(|n| n.checked_add(setup));
+    if required.is_none_or(|n| n > c.max_total_bytes) {
+        return Err(Error::LimitExceeded);
+    }
+    Ok(())
 }
 
 type TileResult = Result<Option<Vec<u8>>, Error>;
@@ -752,6 +870,185 @@ fn fill_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_reserves_retained_outputs_and_all_workers_before_work() {
+        let mut c = BakeConfig::default();
+        c.tile_limits.max_bytes = 100;
+        c.tile_limits.max_tile_bytes = 20;
+        c.max_total_bytes = 7 + 8 * 20 + 4 * 100;
+        assert_eq!(check_total_bytes(&c, 7, 8, 4), Ok(()));
+        c.max_total_bytes -= 1;
+        assert_eq!(check_total_bytes(&c, 7, 8, 4), Err(Error::LimitExceeded));
+        assert_eq!(check_total_bytes(&c, 7, 8, 1), Ok(()));
+        c.tile_limits.max_bytes = usize::MAX;
+        assert_eq!(check_total_bytes(&c, 7, 8, 1), Err(Error::LimitExceeded));
+        c.tile_limits.max_bytes = usize::MAX - 1;
+        assert_eq!(check_total_bytes(&c, 7, 8, 1), Err(Error::LimitExceeded));
+        c.max_total_bytes = usize::MAX;
+        assert_eq!(check_total_bytes(&c, 7, 8, 16), Ok(()));
+    }
+
+    #[test]
+    fn volume_buckets_keep_border_overlap_order_and_quantized_heights() {
+        let verts = [0., 0., 0., 0., 0., 9.6, 19.2, 0., 9.6, 19.2, 0., 0.];
+        let tris = [0, 1, 2, 0, 2, 3];
+        let local = [9., 0., 2., 9., 0., 7., 10., 0., 7., 10., 0., 2.];
+        let outside = [100., 0., 2., 100., 0., 7., 101., 0., 7., 101., 0., 2.];
+        let volumes = [
+            AreaVolume {
+                verts: &outside,
+                hmin: -1.,
+                hmax: 2.,
+                area: 1,
+            },
+            AreaVolume {
+                verts: &local,
+                hmin: 0.1,
+                hmax: 0.3,
+                area: 3,
+            },
+            AreaVolume {
+                verts: &local,
+                hmin: 0.1,
+                hmax: 0.3,
+                area: 7,
+            },
+        ];
+        let mut input = Input::new(&verts, &tris);
+        input.volumes = &volumes;
+        let c = BakeConfig::default();
+        let p = prepare(&input, &c, &mut Workspace::new()).unwrap();
+        assert_eq!(p.configs.len(), 2);
+        for i in 0..2 {
+            assert_eq!(p.volume_buckets[i], [1, 2]);
+            let culled = build_tile(
+                &input,
+                &c,
+                &p.configs[i],
+                &p.buckets[i],
+                &p.volume_buckets[i],
+                i as i32,
+                0,
+            )
+            .unwrap();
+            let all = build_tile(
+                &input,
+                &c,
+                &p.configs[i],
+                &p.buckets[i],
+                &[0, 1, 2],
+                i as i32,
+                0,
+            )
+            .unwrap();
+            assert_eq!(culled, all);
+            let no_volumes =
+                build_tile(&input, &c, &p.configs[i], &p.buckets[i], &[], i as i32, 0).unwrap();
+            assert_ne!(culled, no_volumes);
+        }
+    }
+
+    #[test]
+    fn spatial_volumes_scale_with_tiles_and_preserve_mark_order() {
+        fn run(n: usize) -> (u64, u64) {
+            let mut verts = Vec::new();
+            let mut tris = Vec::new();
+            let mut polygons = Vec::new();
+            let tile_width = 9.6;
+            for i in 0..n {
+                let x = i as f32 * tile_width;
+                let b = (verts.len() / 3) as i32;
+                verts.extend_from_slice(&[
+                    x,
+                    0.,
+                    0.,
+                    x,
+                    0.,
+                    tile_width,
+                    x + tile_width,
+                    0.,
+                    tile_width,
+                    x + tile_width,
+                    0.,
+                    0.,
+                ]);
+                tris.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+                polygons.push([
+                    x + 2.,
+                    0.,
+                    2.,
+                    x + 2.,
+                    0.,
+                    4.,
+                    x + 4.,
+                    0.,
+                    4.,
+                    x + 4.,
+                    0.,
+                    2.,
+                ]);
+            }
+            let volumes: Vec<_> = polygons
+                .iter()
+                .map(|v| AreaVolume {
+                    verts: v,
+                    hmin: -1.,
+                    hmax: 2.,
+                    area: 3,
+                })
+                .collect();
+            let mut input = Input::new(&verts, &tris);
+            input.volumes = &volumes;
+            let c = BakeConfig::default();
+            let mut ws = Workspace::new();
+            let p = prepare(&input, &c, &mut ws).unwrap();
+            assert_eq!(p.configs.len(), n);
+            assert_eq!(p.volume_buckets.iter().map(Vec::len).sum::<usize>(), n);
+            let setup = ws.usage().work;
+            let mut work = 0;
+            for i in 0..n {
+                let mut tw = TileWorkspace {
+                    ws: Workspace::new(),
+                    limits: c.tile_limits,
+                    usage: Usage::default(),
+                };
+                let data = build_tile_in_workspace(
+                    &input,
+                    &c,
+                    &p.configs[i],
+                    &p.buckets[i],
+                    &p.volume_buckets[i],
+                    i as i32,
+                    0,
+                    &mut tw,
+                )
+                .unwrap();
+                assert!(data.is_some());
+                work += tw.usage.work;
+                if n == 8 {
+                    let all: Vec<_> = (0..volumes.len()).collect();
+                    let unculled =
+                        build_tile(&input, &c, &p.configs[i], &p.buckets[i], &all, i as i32, 0)
+                            .unwrap();
+                    assert_eq!(data, unculled);
+                }
+            }
+            (setup, work)
+        }
+        let a = run(8);
+        let b = run(64);
+        #[cfg(feature = "std")]
+        std::println!(
+            "tile/volume scaling 8 -> 64: setup {} -> {}, tile work {} -> {}",
+            a.0,
+            b.0,
+            a.1,
+            b.1
+        );
+        assert!(b.0 <= a.0 * 9);
+        assert!(b.1 <= a.1 * 9);
+    }
 
     #[test]
     fn tile_budget_is_cumulative_across_stage_resets() {
