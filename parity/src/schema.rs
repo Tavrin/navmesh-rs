@@ -722,7 +722,7 @@ fn obstacles(c: &mut Cursor) -> DecodeResult<()> {
             2 => &["x0", "y0", "z0", "x1", "y1", "z1"],
             3 => &["cx", "cy", "cz", "hx", "hy", "hz", "yaw"],
             4 => &["index"],
-            5 => &[],
+            5 | 6 => &[],
             _ => return Err(c.error("op", format!("unknown obstacle op {op}"))),
         };
         for &a in args {

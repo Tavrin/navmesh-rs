@@ -1,8 +1,8 @@
 # navmesh-rs
 
 A pure-Rust port of [recastnavigation](https://github.com/recastnavigation/recastnavigation)'s
-Recast (navmesh generation), Detour (navmesh runtime and queries), and DetourCrowd
-(agent simulation and local avoidance).
+Recast (navmesh generation), Detour (navmesh runtime and queries), DetourCrowd
+(agent simulation and local avoidance), and DetourTileCache (dynamic obstacles).
 
 The port follows upstream function by function and is checked against it record by record: on
 x86-64 Linux with default features, every Recast stage, the navmesh tile bytes and every Detour
@@ -142,6 +142,7 @@ phases applied; do not consume that tick as a successful simulation result.
 |---|---|---|
 | `recast` | yes | navmesh generation |
 | `detour` | yes | tile data, navmesh, queries |
+| `tilecache` | yes | Cached layers, dynamic obstacles and incremental rebuilds; implies `recast` and `detour`. |
 | `crowd` | yes | Agent simulation, corridors, avoidance and path queue; implies `detour`. |
 | `std` | yes | floating-point functions from the platform libm |
 | `libm` | no | floating-point functions from the `libm` crate; required without `std` |
@@ -151,9 +152,8 @@ phases applied; do not consume that tick as a successful simulation result.
 
 ## Status and limits
 
-- Ported: Recast, Detour and DetourCrowd.
-- Not ported yet: DetourTileCache (layers,
-  obstacles, incremental rebuild), merging and copying polygon meshes, and big-endian tile data.
+- Ported: Recast, Detour, DetourCrowd and DetourTileCache.
+- Not ported yet: merging and copying polygon meshes, and big-endian tile data.
 - The API follows upstream's stage functions; there is no single-call bake helper yet.
 - Bit-exactness with the C++ library is checked on x86-64 Linux with glibc. On other
   platforms the results can differ in the last bit where upstream calls `cos`/`sin`
@@ -173,3 +173,39 @@ the upstream licence is reproduced in [NOTICE](NOTICE).
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 this crate by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
 any additional terms or conditions.
+
+### Dynamic obstacles
+
+The default `tilecache` feature adds `tilecache::TileCache`, validated `DTLR`
+layer encoding/decoding, region/contour/polygon builders, cylinder/box/oriented-box
+obstacles and incremental navmesh rebuilding. `RawCompressor` stores grids without
+compression; applications can implement `LayerCompressor` for other codecs.
+
+```rust
+use navmesh_rs::{Limits, Error};
+use navmesh_rs::tilecache::{TileCache, TileCacheParams, RawCompressor,
+    DefaultMeshProcess, ObstacleShape};
+use navmesh_rs::detour::NavMesh;
+
+fn carve(cache: &mut TileCache, nav: &mut NavMesh) -> Result<(), Error> {
+    let obstacle = cache.add_obstacle(ObstacleShape::Cylinder {
+        pos: [4.0, 0.0, 4.0], radius: 0.8, height: 2.0,
+    })?;
+    while !cache.update(1.0 / 30.0, nav)? {}
+    cache.remove_obstacle(obstacle)?;
+    while !cache.update(1.0 / 30.0, nav)? {}
+    Ok(())
+}
+let params = TileCacheParams::new(32, 32, 0.3, 0.2, 128, 128);
+let cache = TileCache::new(params, RawCompressor, DefaultMeshProcess, Limits::default())?;
+// Add encoded layers, then build_nav_mesh_tiles_at before carving.
+# Ok::<(), Error>(())
+```
+
+`MeshProcess` maps polygon areas/flags and optionally supplies off-mesh links.
+Handles are salted; stale references, full pools, more than eight touched layers,
+malformed grids and exhausted work/byte limits return errors. Tile membership is
+fixed while obstacle requests/rebuilds are pending. An update rebuilds at most one
+layer; errors preserve that pending rebuild for retry. Completed earlier rebuilds
+remain applied. Custom codecs and hooks are responsible for their own internal
+resource use; they write into the cache's budgeted output slices.

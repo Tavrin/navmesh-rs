@@ -8,6 +8,10 @@ Translated crowd sources: DetourCrowd.cpp, DetourPathCorridor.cpp,
 DetourLocalBoundary.cpp, DetourObstacleAvoidance.cpp, DetourProximityGrid.cpp,
 DetourPathQueue.cpp and their public headers (DetourCrowd/Source and Include).
 
+Translated tile-cache sources: DetourTileCache.cpp, DetourTileCacheBuilder.cpp
+and their public headers (DetourTileCache/Source and Include).
+No FastLZ source is included; the supplied compressor stores raw grids.
+
 --------------------------------------------------------------------------------
 
 Copyright (c) 2009 Mikko Mononen memon@inside.org

@@ -16,4 +16,4 @@ default = ["polyref64"]
 polyref64 = ["navmesh-rs/polyref64"]
 
 [dependencies]
-navmesh-rs = { path = "..", default-features = false, features = ["std", "recast", "detour", "crowd"] }
+navmesh-rs = { path = "..", default-features = false, features = ["std", "recast", "detour", "crowd", "tilecache"] }

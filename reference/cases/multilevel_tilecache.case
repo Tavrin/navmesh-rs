@@ -1,0 +1,18 @@
+# Multiple stacked layers, slot reuse, and add/remove in one request batch.
+mesh = gen_multilevel.obj
+mode = tilecache
+tile_size = 32
+queries = 24
+tc_obstacle = cylinder 9.6 -1 9.6 1 20
+tc_obstacle = box 15 -1 15 18 20 18
+tc_obstacle = update
+tc_obstacle = remove 0
+tc_obstacle = update
+tc_obstacle = obox 9.6 4 9.6 1.5 6 0.5 0.7
+tc_obstacle = update
+tc_obstacle = remove 2
+tc_obstacle = remove 1
+tc_obstacle = update
+tc_obstacle = cylinder 20 -1 20 1 20
+tc_obstacle = remove 3
+tc_obstacle = update

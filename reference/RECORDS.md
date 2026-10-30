@@ -60,8 +60,9 @@ switches, `queries`, `seed`, `crowd_agents`, `crowd_ticks`, and three repeatable
 - `area_volume = area hmin hmax x0 z0 x1 z1 x2 z2 ...`: a convex volume marked with
   `rcMarkConvexPolyArea` after erosion (area 1..62), as the demo does.
 - `tc_obstacle = cylinder x y z radius height | box x0 y0 z0 x1 y1 z1 | obox cx cy cz hx hy hz
-  yaw | remove N | update`: the tile-cache obstacle script, run in order. `remove N` removes the
-  N-th obstacle added (from 0); `update` calls `dtTileCache::update` until it reports up to date.
+  yaw | remove N | update | update_once`: the tile-cache obstacle script, run in order. `remove N` removes the
+  N-th obstacle added (from 0); `update` calls `dtTileCache::update` until it reports up to date; `update_once`
+  calls it exactly once, recording the intermediate state and up-to-date flag.
 
 Defaults are the upstream demo defaults. Settings are converted to cell units exactly as the demo
 does (`ceilf` height and radius, `floorf` climb, truncated edge length, squared region sizes).
@@ -150,7 +151,16 @@ or points for the first two) and hold one entry per pair; `status` is the raw `d
 | `crowd_remove_readd` | agents 1, 5, 9, ... removed at T/3; as many new agents added at 2T/3 |
 | `crowd_tile_swap` | at T/2 the tile under agent 0 is removed and the same bytes added back (on a copy of the navmesh) |
 | `malformed_tiles` | upstream verdicts on a fresh navmesh with the baked parameters: valid add, same location again, wrong magic, wrong version, more polygons than ref bits, remove of a null ref, remove twice, re-add into the freed slot with the stale ref |
-| `tilecache_obstacles` | per script step: the op and its arguments; for adds and removes the status, obstacle ref and number of tiles touched; for `update` the iteration count, status, up-to-date flag, every non-empty obstacle slot (index, ref, state, type, salt) and, for every tile touched since the previous update, the navmesh-resident tile bytes (links included) |
+| `tilecache_obstacles` | per script step: the op and its arguments; for adds and removes the status, obstacle ref and number of tiles touched; for `update`/`update_once` the iteration count, status, up-to-date flag, every non-empty obstacle slot (index, ref, state, type, salt) and, for every tile touched since the previous update, the navmesh-resident tile bytes (links included) |
+
+After every tile-cache script `update` or `update_once`, the harness also records every query
+family under both filters, prefixed `obstacle_update_N.` (N starts at 1).
+The ordinary query layouts and exact comparison rules apply unchanged.
+
+`reference/run-tilecache-parity.sh` accepts separately built 32/64-bit oracle and
+Rust drivers, optional debug drivers, and compares complete records plus independent
+release repeats on every tile-cache case. It never supplies oracle tile bytes to
+the Rust tile-cache build.
 
 Random points come from `findRandomPoint` driven by a fixed xorshift32 (`seed` in the case
 file), so the query set is a function of the navmesh, the filter and the seed only; a navmesh
