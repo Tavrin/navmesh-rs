@@ -33,9 +33,12 @@ tilecache = ["recast", "detour"]
 # 64-bit poly refs (upstream's DT_POLYREF64); without it refs are 32-bit. The width
 # is part of the tile byte format (links hold refs).
 polyref64 = []
+# Opt-in concurrent tile baking; the bake API also works serially without rayon.
+parallel = ["dep:rayon"]
 
 [dependencies]
 libm = { version = "0.2.16", optional = true }
+rayon = { version = "1.11", optional = true }
 
 [workspace]
 members = ["parity"]

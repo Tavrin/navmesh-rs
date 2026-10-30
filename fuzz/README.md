@@ -42,3 +42,7 @@ cargo +nightly fuzz run tilecache_update corpus/tilecache_update -- -max_len=409
 ```
 
 Receipts of the runs are in [`../docs/FUZZ-RECEIPTS.md`](../docs/FUZZ-RECEIPTS.md).
+
+`parallel_bake` (enable `--features parallel`) compares bounded serial and rayon
+bakes, including the first error and tile coordinates. Its source is compiled;
+no fuzz execution is claimed for this extension.

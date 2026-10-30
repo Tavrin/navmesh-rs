@@ -1,8 +1,8 @@
 # Design: a pure-Rust port of recastnavigation
 
 This is the design the port follows. Recast, Detour, DetourCrowd and DetourTileCache are ported;
-the bake API and the extensions below are not yet. Where this document describes something not
-built yet (bake API, `'MSET'` sets, big-endian tile reading, `parallel`, `serde`), it is the plan,
+the tiled bake extension is available; other extensions below remain plans. Where this document
+describes something not built yet (solo bake helper, `'MSET'` sets, big-endian tile reading, `serde`), it is the plan,
 not the current API; the README and the crate documentation describe what exists, and
 `docs/VERIFICATION.md` what is checked.
 
@@ -202,15 +202,25 @@ added it follows the meshoptimizer-rs rule (scalar canonical bytes, documented s
 
 ### Parallel tile baking
 
-`bake::tiles` with the `parallel` feature: (1) bucket triangles by tile in one pass, in parallel
-over triangle chunks, then merged in input order (the per-tile triangle order is part of the
-contract because rasterization order affects span merging); (2) build tiles with rayon, each
-worker with its own `Workspace` and per-tile `Limits`; (3) collect `TileData` in row-major order;
-(4) add tiles to the navmesh serially or with `NavMesh::add_tiles` that connects internal links in
-parallel and external links in a second pass over tile pairs. Output bytes equal the serial path
-at any thread count; the differential suite runs the tiled cases at 1 and N threads. Incremental
-rebake: the same path for a set of dirty tiles, with source hashes per tile so unchanged tiles are
-skipped.
+Implemented: `bake::tiles` is serial and `bake::tiles_parallel` opts into rayon
+when `parallel` is enabled, with a serial fallback otherwise. The API is available
+whenever Recast and Detour are enabled; the feature gates only the rayon dependency.
+Triangle bucketing is currently serial, in input order, using spatial tile ranges
+and exact bordered overlap. Each tile runs its full Recast-to-Detour pipeline in a
+separate workspace with an independent cumulative budget. Preallocated ordered
+result slots avoid unordered error reduction: the first failure in row-major order
+wins, after workers finish. Navmesh insertion remains serial.
+
+`BakeConfig` accepts cell-unit `recast::Config` settings plus world-unit Detour agent
+metadata. Mesh bounds, grid size and borders are derived. `Input` borrows geometry,
+optional triangle areas, convex volumes and off-mesh connections. The caller's
+workspace budgets setup and retained result slots; tile budgets include conservative
+allocation charges across stages. Rayon scheduler costs and aggregate process memory
+are outside those limits. See `VERIFICATION.md` for identity and timing evidence.
+
+Planned separately: parallel chunk bucketing/ordered merge, incremental dirty-tile
+rebakes/source hashes, world-unit settings conversion, solo helper, and parallel
+navmesh linking. None is required by the current tiled API.
 
 ### Serialization
 
@@ -253,11 +263,11 @@ Each step ends with a proof gate before the next one starts.
 | Step | Work | Proof gate | State |
 |---|---|---|---|
 | Oracle | the harness: generation, tile, query, crowd, tile-cache and obstacle records, malformed-tile verdicts; Rust record encoder and differ in `parity/`; corpus | records reproducible run to run; every record kind decoded by the Rust differ; corpus hashes pinned | done (second machine and CI job not yet) |
-| Recast | all generation stages, three partitions, layers; stage API; `Workspace`/`Limits` | every Recast stage record bit-exact on every case; instructions within 1.25× of the oracle | done (bake API not yet) |
+| Recast | all generation stages, three partitions, layers; stage API; `Workspace`/`Limits` | every Recast stage record bit-exact on every case; instructions within 1.25× of the oracle | done (solo bake helper not yet) |
 | Detour | tile data builder and validating reader, navmesh, node pool, all queries, filters | `navmesh_tiles` byte-exact; all query records exact; malformed tile corpus rejected with typed errors; fuzzing without panics | done (`'MSET'` sets not yet) |
 | Crowd | crowd, corridor, boundary, avoidance, proximity grid, path queue | crowd records exact for 300 ticks on all crowd cases and all avoidance presets on the oracle platform | ported; see VERIFICATION.md |
 | TileCache | layers, compression trait plus raw storage, obstacles, incremental rebuild | obstacle-script records produce byte-exact tiles after each update | ported; see VERIFICATION.md |
-| Extensions | in the order of section 8 | each extension's own measurement, and every default-feature record unchanged | not started |
+| Extensions | in the order of section 8 | each extension's own measurement, and every default-feature record unchanged | tiled parallel bake implemented; other extensions planned |
 
 ## 10. Licence and attribution
 

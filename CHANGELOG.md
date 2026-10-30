@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+- Add the `bake` extension (not in recastnavigation): serial tiled generation,
+  opt-in rayon tile workers through `parallel`, deterministic tile/error ordering,
+  independent per-tile limits, and serial navmesh assembly. The API remains
+  available without rayon, including `no_std`/wasm builds.
+
 ## [Unreleased]
 
 ## [0.1.1] - 2026-10-30
