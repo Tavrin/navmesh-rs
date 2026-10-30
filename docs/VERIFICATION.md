@@ -415,8 +415,9 @@ passes with warnings denied for all three configurations. Formatting, public-tex
 Rust 1.88, rustdoc with warnings denied, native no_std/libm, and the wasm32 build
 also pass. Wasm is built **without `parallel`**; threaded rayon on wasm is not
 qualified. The new `parallel_bake` fuzz target compiles with its `parallel` feature;
-**it has not been run**. The complete gate rerun passes after correcting an initial
-iterator lint.
+it and `recast_input` later ran under the release rule with no crash (see
+[`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md), "Parallel bake release run"). The complete
+gate rerun passes after correcting an initial iterator lint.
 
 Regressions cover all three partitions, area volumes, triangle areas, off-mesh
 links, empty tiles, one-tile layouts, malformed inputs, setup budgets/retry,
@@ -445,7 +446,8 @@ Workspace tests (88 with parallel, plus 14 doctests), both-width serial/parallel
 Clippy, parallel-off tests, tilecache-only and bake-only feature tests, native
 no_std/libm, wasm without parallel, Rust 1.88, rustdoc, formatting, public text
 and parallel fuzz-source compilation all pass. The complete final gate set was
-rerun after development formatting fixes. The new fuzz target remains unrun.
+rerun after development formatting fixes. The new fuzz target was not yet run at that
+point; its release-rule run is recorded in [`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md).
 
 ## Beyond the records
 

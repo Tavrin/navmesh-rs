@@ -44,5 +44,20 @@ cargo +nightly fuzz run tilecache_update corpus/tilecache_update -- -max_len=409
 Receipts of the runs are in [`../docs/FUZZ-RECEIPTS.md`](../docs/FUZZ-RECEIPTS.md).
 
 `parallel_bake` (enable `--features parallel`) compares bounded serial and rayon
-bakes, including the first error and tile coordinates. Its source is compiled;
-no fuzz execution is claimed for this extension.
+bakes, including the first error and tile coordinates. It builds a mesh, tile
+settings, triangle areas, up to three area volumes, tight per-tile limits and an
+aggregate byte budget from the input (layout in the target source). Under an
+aggregate budget the serial and parallel bakes reserve for different worker
+counts, so an aggregate rejection of only the parallel bake is not a mismatch.
+Seed writer and run:
+
+```sh
+cargo run --release --bin seeds --features parallel -- parallel corpus/parallel_bake
+cargo +nightly fuzz run parallel_bake --features parallel corpus/parallel_bake -- -max_len=4096
+```
+
+`seeds recast` also writes `-border` inputs (no erosion, a border), which reach
+the polygon mesh's border-vertex removal. `seeds recast-grid <dir>` writes two
+meshes of 5,041 plus-shaped islands that the polygon mesh turns into about 50,000
+polygons, past the 16-bit edge numbering of the adjacency builder; they are the
+seeds that reach its `LimitExceeded` guard.

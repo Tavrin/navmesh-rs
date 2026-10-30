@@ -10,6 +10,9 @@ All notable changes to this project are documented in this file. The format foll
   opt-in rayon tile workers through `parallel`, deterministic tile/error ordering,
   independent per-tile limits, and serial navmesh assembly. The API remains
   available without rayon, including `no_std`/wasm builds.
+- Fuzzing: `parallel_bake` also varies triangle areas, area volumes, per-tile limits and
+  the aggregate budget; new `seeds parallel` and `seeds recast-grid` modes and `-border`
+  Recast seeds reach the new allocation charges, the volume marking and the edge-count guard.
 
 ## [Unreleased]
 
