@@ -62,6 +62,8 @@
 //! path across it.
 //!
 //! ```
+//! # #[cfg(all(feature = "recast", feature = "detour"))]
+//! # {
 //! use navmesh_rs::detour::{self, DefaultFilter, NavMesh, NavMeshCreateParams, NavMeshQuery};
 //! use navmesh_rs::recast::{self, CompactHeightfield, ContourSet, Heightfield, PolyMesh, PolyMeshDetail};
 //! use navmesh_rs::{Error, Workspace};
@@ -128,6 +130,9 @@
 //!     assert_eq!(corners.len(), 2); // an open floor: a straight segment
 //!     Ok(())
 //! }
+//! # main()?;
+//! # }
+//! # Ok::<(), navmesh_rs::Error>(())
 //! ```
 
 #![no_std]

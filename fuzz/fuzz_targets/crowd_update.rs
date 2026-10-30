@@ -35,7 +35,7 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut crowd) = Crowd::new(&mut ws, &nav, 8, 0.6) else {
         return;
     };
-    for chunk in data.chunks_exact(16).take(64) {
+    for chunk in data.as_chunks::<16>().0.iter().take(64) {
         let v = core::array::from_fn(|i| {
             f32::from_bits(u32::from_le_bytes(
                 chunk[i * 4..i * 4 + 4].try_into().unwrap(),
