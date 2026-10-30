@@ -245,9 +245,9 @@ fn convex_volume_work_counts_layered_spans_times_polygon_vertices() {
         ..CompactHeightfield::default()
     };
     let polygon = [0., 0., 0., 0., 0., 1., 1., 0., 1., 1., 0., 0.];
-    // Validation: 1 cell + 4*8 span connections; polygon: 12 scalars;
-    // rectangle: 1 cell; marking: 8 spans * 4 vertices.
-    let exact = 33 + 12 + 1 + 32;
+    // Validation: 1 cell + 4*8 span connections + 1 row; polygon: 12 scalars;
+    // rectangle: 1 cell + 1 row; marking: 8 spans * 4 vertices.
+    let exact = 34 + 12 + 2 + 32;
     let mut ws = Workspace::with_limits(Limits {
         max_work: exact - 1,
         ..Limits::default()
@@ -272,4 +272,125 @@ fn convex_volume_work_counts_layered_spans_times_polygon_vertices() {
         recast::mark_convex_poly_area(&mut ws, &polygon, 0., 8., 3, &mut chf),
         Err(Error::LimitExceeded)
     );
+}
+
+#[test]
+fn sliver_grid_returns_typed_error() {
+    // A very narrow, long triangle rounds one grid dimension to zero and
+    // saturates the other. Transpose it to cover both orientations.
+    for transpose in [false, true] {
+        let mut verts = [0.0, 0.0, 0.0, 0.001, 0.0, 1.0e10, 0.0, 0.0, 1.0e10];
+        if transpose {
+            for v in verts.as_chunks_mut::<3>().0 {
+                v.swap(0, 2);
+            }
+        }
+        let (bmin, bmax) = recast::calc_bounds(&verts);
+        let (w, h) = recast::calc_grid_size(&bmin, &bmax, DEFAULT.cs);
+        assert_eq!(
+            (w, h),
+            if transpose {
+                (i32::MAX, 0)
+            } else {
+                (0, i32::MAX)
+            }
+        );
+        let mut ws = Workspace::new();
+        assert!(matches!(
+            build(&mut ws, &verts, &[0, 1, 2], &DEFAULT),
+            Err(Error::InvalidParameter("heightfield size"))
+        ));
+    }
+}
+
+#[test]
+fn degenerate_public_grids_are_rejected_by_stages() {
+    let mut ws = Workspace::new();
+    for (w, h) in [(0, 1), (1, 0), (0, i32::MAX), (i32::MAX, 0)] {
+        assert!(matches!(
+            Heightfield::new(&mut ws, w, h, [0.0; 3], [1.0; 3], 1.0, 1.0),
+            Err(Error::InvalidParameter("heightfield size"))
+        ));
+        let mut hf = Heightfield::new(&mut ws, 0, 0, [0.0; 3], [1.0; 3], 1.0, 1.0).unwrap();
+        hf.width = w;
+        hf.height = h;
+        assert!(matches!(
+            hf.filter_ledge_spans(&mut ws, 1, 1),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            CompactHeightfield::build(&mut ws, 1, 1, &hf),
+            Err(Error::InvalidInput(_))
+        ));
+        let mut chf = CompactHeightfield {
+            width: w,
+            height: h,
+            ..Default::default()
+        };
+        assert!(matches!(
+            ContourSet::build(&mut ws, &chf, 1.0, 10, 0),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            HeightfieldLayerSet::build(&mut ws, &chf, 0, 1),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            recast::build_distance_field(&mut ws, &mut chf),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            recast::build_regions(&mut ws, &mut chf, 0, 0, 0),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            recast::build_regions_monotone(&mut ws, &mut chf, 0, 0, 0),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            recast::build_layer_regions(&mut ws, &mut chf, 0, 0),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            recast::erode_walkable_area(&mut ws, 0, &mut chf),
+            Err(Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            recast::median_filter_walkable_area(&mut ws, &mut chf),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    let chf = CompactHeightfield::default();
+    assert!(ContourSet::build(&mut ws, &chf, 1.0, 10, 0).is_ok());
+    assert!(HeightfieldLayerSet::build(&mut ws, &chf, 0, 1).is_ok());
+}
+
+#[test]
+fn empty_span_rows_consume_work() {
+    let mut ws = Workspace::new();
+    let hf = Heightfield::new(&mut ws, 1, 32, [0.0; 3], [1.0, 1.0, 32.0], 1.0, 1.0).unwrap();
+    let chf = CompactHeightfield::build(&mut ws, 1, 1, &hf).unwrap();
+    // Validation costs one unit per cell and row. Each subsequent empty row must also
+    // cost work, despite there being no spans to visit.
+    ws.set_limits(Limits {
+        max_work: 64,
+        ..Limits::UNLIMITED
+    });
+    assert!(matches!(
+        ContourSet::build(&mut ws, &chf, 1.0, 10, 0),
+        Err(Error::LimitExceeded)
+    ));
+    assert!(matches!(
+        HeightfieldLayerSet::build(&mut ws, &chf, 0, 1),
+        Err(Error::LimitExceeded)
+    ));
+    let mut chf = chf;
+    assert!(matches!(
+        recast::median_filter_walkable_area(&mut ws, &mut chf),
+        Err(Error::LimitExceeded)
+    ));
+    assert!(matches!(
+        recast::build_distance_field(&mut ws, &mut chf),
+        Err(Error::LimitExceeded)
+    ));
 }

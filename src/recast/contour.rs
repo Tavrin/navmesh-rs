@@ -62,7 +62,7 @@ impl ContourSet {
         build_flags: i32,
     ) -> Result<ContourSet, Error> {
         ws.begin();
-        check_chf(chf)?;
+        check_chf(ws, chf)?;
         let w = chf.width;
         let h = chf.height;
         let border = chf.border_size;
@@ -88,6 +88,7 @@ impl ContourSet {
         ws.work(n as u64 * 2)?;
         let mut flags = ws.vec(n, 0u8)?;
         for y in 0..h {
+            ws.work(1)?;
             for x in 0..w {
                 let c = chf.cells[(x + y * w) as usize];
                 for i in c.index as usize..c.index as usize + c.count as usize {
@@ -110,6 +111,7 @@ impl ContourSet {
         let mut verts: Vec<i32> = Vec::new();
         let mut simplified: Vec<i32> = Vec::new();
         for y in 0..h {
+            ws.work(1)?;
             for x in 0..w {
                 let c = chf.cells[(x + y * w) as usize];
                 for i in c.index as usize..c.index as usize + c.count as usize {

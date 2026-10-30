@@ -103,7 +103,7 @@ impl HeightfieldLayerSet {
         walkable_height: i32,
     ) -> Result<HeightfieldLayerSet, Error> {
         ws.begin();
-        check_chf(chf)?;
+        check_chf(ws, chf)?;
         if border_size < 0 {
             return Err(Error::InvalidParameter("border size"));
         }
@@ -128,6 +128,7 @@ impl HeightfieldLayerSet {
         let mut prev_count = [0i32; 256];
         let mut reg_id: u8 = 0;
         for y in border_size..h - border_size {
+            ws.work(1)?;
             prev_count[..usize::from(reg_id)].fill(0);
             let mut sweep_id: u8 = 0;
             for x in border_size..w - border_size {
@@ -205,6 +206,7 @@ impl HeightfieldLayerSet {
         )?;
         let fail = || Error::FormatLimit("too many overlapping layers");
         for y in 0..h {
+            ws.work(1)?;
             for x in 0..w {
                 let c = chf.cells[(x + y * w) as usize];
                 let mut lregs = [0u8; MAX_LAYERS];
@@ -431,6 +433,7 @@ impl HeightfieldLayerSet {
             layer.bmin[1] = bmin[1] + hmin as f32 * chf.ch;
             layer.bmax[1] = bmin[1] + hmax as f32 * chf.ch;
             for y in 0..lh {
+                ws.work(1)?;
                 for x in 0..lw {
                     let cx = border_size + x;
                     let cy = border_size + y;

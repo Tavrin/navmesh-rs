@@ -6,6 +6,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ## Unreleased
 
+- Reject grids with exactly one zero dimension with a typed error instead of
+  returning an empty mesh, including sliver meshes with a saturated dimension.
+  Validate mutated public grid dimensions and charge empty-row traversal work.
+
 - Add the `bake` extension (not in recastnavigation): serial tiled generation,
   opt-in rayon tile workers through `parallel`, deterministic tile/error ordering,
   independent per-tile limits, and serial navmesh assembly. The API remains

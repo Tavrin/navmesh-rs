@@ -309,6 +309,14 @@ Independent release repeats are identical on every crowd and tile-cache case.
 
 ### Recast and bake deliberate differences from C++
 
+- Grids with exactly one zero dimension return a typed error instead of an empty
+  mesh: `Heightfield::new` returns `Error::InvalidParameter`, and stages reject
+  inconsistent public heightfield dimensions with `Error::InvalidInput`.
+  This includes sliver meshes whose rounded grid is zero by a saturated row or
+  column count. A zero-by-zero grid remains valid. Compact-grid validation and
+  stage row traversal charge work even when rows contain no spans; finite work
+  budgets can therefore fail earlier with `Error::LimitExceeded`.
+
 - C++ uses allocator hooks and has no byte/work budgets. Rust charges all detail
   queues/triangulation buffers, contour winding/hole/simplification/sort storage,
   region traversal/merge storage, and mesh removal scratch before fallible
@@ -448,6 +456,24 @@ no_std/libm, wasm without parallel, Rust 1.88, rustdoc, formatting, public text
 and parallel fuzz-source compilation all pass. The complete final gate set was
 rerun after development formatting fixes. The new fuzz target was not yet run at that
 point; its release-rule run is recorded in [`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md).
+
+### Degenerate-grid regression rerun (2026-10-31)
+
+After rejecting grids with exactly one zero dimension and charging empty-row
+traversal, fresh pinned C++ and Rust drivers pass all 21 corpus cases in both
+reference widths: **76,018 records, zero mismatches**. Separate tile-cache checks
+pass **9,200** debug/release comparisons with identical repeats. The original and
+300-tick crowd campaigns pass **158,400 tick and 2,469,992 active-agent
+comparisons** across both widths and debug/release. Parallel identity passes all
+**50** case/width/thread combinations: **28,530 tile-byte and 2,100 query-record
+comparisons**, plus ten serial/API baselines (5,706 tiles and 420 queries).
+
+The three new regressions cover both sliver orientations, mutated public grids,
+and finite work limits on rows without spans. Workspace tests (91 with parallel,
+plus 14 doctests), both-width serial/parallel Clippy, feature-specific tests,
+no_std/libm, wasm without parallel, Rust 1.88, rustdoc, fuzz-source compilation,
+formatting and public-text checks all pass. The full gate set was rerun after
+fixing a constant-chunk iterator lint in the new regression.
 
 ## Beyond the records
 

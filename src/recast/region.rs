@@ -127,9 +127,10 @@ fn box_blur(chf: &CompactHeightfield, thr: i32, src: &[u16], dst: &mut [u16]) {
 /// (`rcBuildDistanceField`); fills `chf.dist` and `chf.max_distance`.
 pub fn build_distance_field(ws: &mut Workspace, chf: &mut CompactHeightfield) -> Result<(), Error> {
     ws.begin();
-    validate_chf(chf)?;
+    validate_chf(ws, chf)?;
     let n = chf.spans.len();
-    ws.work(n as u64 * 4)?;
+    // Four grid passes also visit columns with no spans.
+    ws.work(n as u64 * 4 + (chf.cells.len() as u64 + chf.height as u64) * 4)?;
     chf.dist = Vec::new();
     let mut src = ws.vec(n, 0u16)?;
     let mut dst = ws.vec(n, 0u16)?;
@@ -279,6 +280,7 @@ fn expand_regions(
     if fill_stack {
         stack.clear();
         for y in 0..chf.height {
+            ws.work(1)?;
             for x in 0..chf.width {
                 let c = chf.cells[(x + y * chf.width) as usize];
                 for i in c.index as usize..c.index as usize + c.count as usize {
@@ -369,6 +371,7 @@ fn sort_cells_by_level(
         s.clear();
     }
     for y in 0..chf.height {
+        ws.work(1)?;
         for x in 0..chf.width {
             let c = chf.cells[(x + y * chf.width) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -622,6 +625,7 @@ fn merge_and_filter_regions(
     for i in 0..nreg {
         regions.push(Region::new(i as u16));
     }
+    ws.work(chf.height as u64)?;
     for_spans!(chf, x, y, c, i, {
         let r = src_reg[i];
         if r == 0 || usize::from(r) >= nreg {
@@ -778,8 +782,8 @@ fn compress_region_ids(regions: &mut [Region], max_region_id: &mut u16, src_reg:
     }
 }
 
-fn check_partition(chf: &CompactHeightfield, border: i32) -> Result<(), Error> {
-    validate_chf(chf)?;
+fn check_partition(ws: &mut Workspace, chf: &CompactHeightfield, border: i32) -> Result<(), Error> {
+    validate_chf(ws, chf)?;
     if border < 0 {
         return Err(Error::InvalidParameter("border size"));
     }
@@ -795,7 +799,7 @@ pub fn build_regions(
     merge_region_area: i32,
 ) -> Result<(), Error> {
     ws.begin();
-    check_partition(chf, border_size)?;
+    check_partition(ws, chf, border_size)?;
     let n = chf.spans.len();
     if chf.dist.len() != n {
         return Err(Error::InvalidInput(
@@ -812,6 +816,10 @@ pub fn build_regions(
     let mut region_id: u16 = 1;
     let mut level: u16 = (chf.max_distance.wrapping_add(1)) & !1;
     const EXPAND_ITERS: i32 = 8;
+    if border_size > 0 {
+        // Bound the four border rectangles, including empty rows.
+        ws.work((chf.cells.len() as u64 + chf.height as u64) * 4)?;
+    }
     paint_border(chf, border_size, &mut region_id, &mut src_reg);
     chf.border_size = border_size;
     let chf_ref: &CompactHeightfield = chf;
@@ -913,10 +921,15 @@ fn sweep_regions(
     let w = chf.width;
     let h = chf.height;
     let mut id: u16 = 1;
+    if border > 0 {
+        // Bound the four border rectangles, including empty rows.
+        ws.work((chf.cells.len() as u64 + chf.height as u64) * 4)?;
+    }
     paint_border(chf, border, &mut id, src_reg);
     let mut sweeps: Vec<Sweep> = ws.vec(w.max(h).max(1) as usize, Sweep::default())?;
     let mut prev: Vec<i32> = ws.vec(256, 0)?;
     for y in border..h - border {
+        ws.work(1)?;
         let need = usize::from(id) + 1;
         if prev.len() < need {
             let grow = need - prev.len();
@@ -1003,7 +1016,7 @@ pub fn build_regions_monotone(
     merge_region_area: i32,
 ) -> Result<(), Error> {
     ws.begin();
-    check_partition(chf, border_size)?;
+    check_partition(ws, chf, border_size)?;
     let mut src_reg = ws.vec(chf.spans.len(), 0u16)?;
     let mut max_regions = sweep_regions(ws, chf, border_size, &mut src_reg)?;
     chf.border_size = border_size;
@@ -1036,6 +1049,7 @@ fn merge_and_filter_layer_regions(
     }
     let mut lregs: Vec<i32> = Vec::new();
     for y in 0..chf.height {
+        ws.work(1)?;
         for x in 0..chf.width {
             let c = chf.cells[(x + y * chf.width) as usize];
             lregs.clear();
@@ -1153,7 +1167,7 @@ pub fn build_layer_regions(
     min_region_area: i32,
 ) -> Result<(), Error> {
     ws.begin();
-    check_partition(chf, border_size)?;
+    check_partition(ws, chf, border_size)?;
     let mut src_reg = ws.vec(chf.spans.len(), 0u16)?;
     let mut max_regions = sweep_regions(ws, chf, border_size, &mut src_reg)?;
     chf.border_size = border_size;

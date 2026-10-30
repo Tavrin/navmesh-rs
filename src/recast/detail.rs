@@ -32,7 +32,7 @@ impl PolyMeshDetail {
         sample_max_error: f32,
     ) -> Result<PolyMeshDetail, Error> {
         ws.begin();
-        check_chf(chf)?;
+        check_chf(ws, chf)?;
         let mut dmesh = PolyMeshDetail::default();
         if mesh.nverts == 0 || mesh.npolys == 0 {
             return Ok(dmesh);
