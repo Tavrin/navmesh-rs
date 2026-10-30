@@ -3,6 +3,8 @@
 //! corrupted tile bytes. Bit-exactness against the C++ oracle is checked by
 //! `nav-parity` over the corpus (see `docs/VERIFICATION.md`).
 
+#![cfg(all(feature = "recast", feature = "detour"))]
+
 use navmesh_rs::detour::{
     self, DefaultFilter, MeshTile, NavMesh, NavMeshCreateParams, NavMeshParams, NavMeshQuery,
     Status,

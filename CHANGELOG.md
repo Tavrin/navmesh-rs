@@ -6,33 +6,51 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
-### Fixed
-
-- Clear crowd animation, movement targets and cached state when reusing agent slots.
-- Charge proximity-grid collision chains to the update work budget; reject stale
-  targets, exhausted helper pools and zero agent speeds with typed errors.
-- Make crowd state enums and parameter structs non-exhaustive; retain default and
-  quality-preset construction. Document the adaptive sampler's C++ parity domain.
+## [0.1.1] - 2026-10-30
 
 ### Added
 
-- DetourTileCache: validated little-endian layers, raw compression and a pluggable
-  compressor trait, region/contour/polygon building, salted tile/obstacle handles,
-  all three obstacle forms and incremental navmesh handoff with mesh-process hooks.
-- Tile-cache layer/obstacle differential records and queries after script updates,
-  malformed-layer, lifecycle, resource-limit and scaling regressions, and a layer
-  decode/obstacle-update fuzz target source.
+- Crowd simulation: corridor maintenance, steering, separation, local avoidance,
+  path queues and off-mesh animation.
+- Tile cache with cylinder, box and oriented-box dynamic obstacles and incremental
+  navmesh rebuilding.
+- A pluggable layer compressor trait with raw storage provided by default.
+- Crowd and tile-cache seed modes for the fuzz corpus generator.
+- Non-exhaustive crowd parameters and state enums, with defaults and avoidance
+  quality presets for construction.
 
-- DetourCrowd: crowd manager, corridor maintenance, local walls, proximity grid,
-  sliced path queue, steering, separation, grid and adaptive avoidance, and off-mesh
-  animation; full per-tick trajectory and corridor comparison with the reference.
+### Fixed
 
-- Recast port: every generation stage from walkable-triangle marking to the detail mesh,
-  the three partitions (watershed, monotone, layers), area volumes and heightfield layers.
-- Detour port: tile data creation in upstream's `DNAV` v7 layout (32- and 64-bit poly refs),
-  the navmesh with a validating tile reader, off-mesh connections, and every navmesh query
-  (nearest polygon, plain/sliced/partial path finding, straight paths, raycasts, distance to
-  wall, move along surface, polygon searches, wall segments, random points, heights).
-- `Workspace` and `Limits` for per-call memory and work limits; typed `Error` values instead
-  of upstream's asserts and status codes.
-- `no_std` + `alloc` support and `wasm32` builds.
+- Clear animation, movement targets and cached state when reusing crowd slots.
+- Use `as_chunks` for complete 16-byte records in the crowd fuzz target, fixing
+  Clippy on current toolchains.
+- Gate integration tests and the build example on their required features.
+
+### Deliberate differences from C++
+
+- Validate inputs and references, report exhausted capacities and work budgets,
+  reset reused slots, require positive agent speeds and reject out-of-range cells.
+- Define adaptive avoidance for even division counts, where upstream reads
+  uninitialized samples; no C++ parity is claimed for those counts.
+- Validate tile-cache layers and codec output, keep tile membership stable during
+  updates, reject touched-layer overflow and retain all queued rebuilds.
+- Complete zero-touch obstacle lifecycles, charge allocation and algorithm work,
+  and retain failed rebuilds for retry without rolling back completed work.
+- Reserve full vertex triples in tile-cache removal instead of reproducing an
+  upstream buffer overrun. See [verification](docs/VERIFICATION.md) for the full
+  differences and parity boundaries.
+
+## [0.1.0]
+
+### Added
+
+- Recast navmesh generation, including all three partitions, area volumes and
+  heightfield layers.
+- Detour tile creation, tiled navmeshes, off-mesh connections and navmesh queries
+  with 32-bit or 64-bit polygon references.
+- Per-call memory and work limits with typed errors.
+- `no_std` with `alloc` and `wasm32` support.
+
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/Tavrin/navmesh-rs/releases/tag/v0.1.0

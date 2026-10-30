@@ -3,6 +3,8 @@
 //! against the C++ oracle is checked by `nav-parity` over the corpus (see
 //! `docs/VERIFICATION.md`).
 
+#![cfg(feature = "recast")]
+
 use navmesh_rs::recast::{
     self, CompactHeightfield, ContourSet, Heightfield, HeightfieldLayerSet, PolyMesh,
     PolyMeshDetail,
