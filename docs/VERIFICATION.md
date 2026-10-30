@@ -237,7 +237,8 @@ regression pass in both ref widths. Three new compile-fail doctests enforce non-
 and mesh types; constructors/defaults allow public-field customization.
 Workspace tests (67 tests plus 13 doctests), both-width Clippy and debug/release
 builds, Rust 1.88, native no-std/libm, wasm32 build, documentation, fuzz-source
-compilation, formatting and public-text checks pass. The fuzz target was not run.
+compilation, formatting and public-text checks pass. The `tilecache_update` fuzz target has
+since run under the release rule with no crash ([`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md)).
 
 Unit regressions cover truncated/oversized layers, invalid headers, area ids and
 connections, invalid codec output lengths, all shapes and marking, full carving
@@ -319,7 +320,7 @@ Independent release repeats are identical on every crowd and tile-cache case.
 ## Not covered yet
 
 - Compressed codecs beyond raw storage are supplied by applications and are not
-  compared. The tile-cache fuzz source is compile-checked, not a completed campaign.
+  compared.
 - Only x86-64 Linux with glibc has been compared with upstream. Other platforms can differ in the
   last bit where upstream calls `cos`/`sin`; the `libm` feature has not been compared with the
   driver.

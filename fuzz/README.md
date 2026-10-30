@@ -23,9 +23,22 @@ Release rule: each target starts from the corpus seeds and runs until its covera
 flat for 10 minutes, for at least 10 and at most 120 CPU-minutes, with no crash.
 
 `crowd_update` creates a bounded crowd on a small mesh and applies arbitrary
-agent positions, targets, velocities, removals, resets and update intervals.
+agent positions, targets, velocities, removals, resets and update intervals
+(up to 64 records of 16 bytes).
 
-`tilecache_update` decodes arbitrary raw layer bytes, exercises region/contour/poly
-building under limits, and runs cylinder, box, oriented-box, removal and update
-sequences over a valid seeded cache. The source is supplied for fuzzing; its
-addition does not imply a completed fuzz campaign.
+`tilecache_update` takes `[mode][layer length][layer bytes][16-byte operations]`. The layer
+is a raw layer (mutated header and grids) or a grid specification turned into a valid
+layer. It is decoded, run through region/contour/poly building under limits, and added to
+the cache beside a fixed flat layer; the operations add cylinder, box and oriented-box
+obstacles, remove them, and update or drain the rebuild queue.
+
+Both have seed writers:
+
+```sh
+cargo run --release --bin seeds -- crowd corpus/crowd_update
+cargo run --release --bin seeds -- tilecache corpus/tilecache_update
+cargo +nightly fuzz run crowd_update corpus/crowd_update -- -max_len=1024
+cargo +nightly fuzz run tilecache_update corpus/tilecache_update -- -max_len=4096
+```
+
+Receipts of the runs are in [`../docs/FUZZ-RECEIPTS.md`](../docs/FUZZ-RECEIPTS.md).
