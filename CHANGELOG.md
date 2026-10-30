@@ -4,7 +4,9 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## [Unreleased]
+
+## [0.1.2] - 2026-10-31
 
 - Reject grids with exactly one zero dimension with a typed error instead of
   returning an empty mesh, including sliver meshes with a saturated dimension.
@@ -17,8 +19,6 @@ All notable changes to this project are documented in this file. The format foll
 - Fuzzing: `parallel_bake` also varies triangle areas, area volumes, per-tile limits and
   the aggregate budget; new `seeds parallel` and `seeds recast-grid` modes and `-border`
   Recast seeds reach the new allocation charges, the volume marking and the edge-count guard.
-
-## [Unreleased]
 
 ## [0.1.1] - 2026-10-30
 
@@ -65,6 +65,7 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Tavrin/navmesh-rs/releases/tag/v0.1.0
