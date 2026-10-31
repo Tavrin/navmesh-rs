@@ -62,7 +62,7 @@ impl ContourSet {
         build_flags: i32,
     ) -> Result<ContourSet, Error> {
         ws.begin();
-        check_chf(chf)?;
+        check_chf(ws, chf)?;
         let w = chf.width;
         let h = chf.height;
         let border = chf.border_size;
@@ -88,6 +88,7 @@ impl ContourSet {
         ws.work(n as u64 * 2)?;
         let mut flags = ws.vec(n, 0u8)?;
         for y in 0..h {
+            ws.work(1)?;
             for x in 0..w {
                 let c = chf.cells[(x + y * w) as usize];
                 for i in c.index as usize..c.index as usize + c.count as usize {
@@ -110,6 +111,7 @@ impl ContourSet {
         let mut verts: Vec<i32> = Vec::new();
         let mut simplified: Vec<i32> = Vec::new();
         for y in 0..h {
+            ws.work(1)?;
             for x in 0..w {
                 let c = chf.cells[(x + y * w) as usize];
                 for i in c.index as usize..c.index as usize + c.count as usize {
@@ -126,12 +128,13 @@ impl ContourSet {
                     simplified.clear();
                     walk_contour(ws, x, y, i, chf, &mut flags, &mut verts)?;
                     simplify_contour(
+                        ws,
                         &verts,
                         &mut simplified,
                         max_error,
                         max_edge_len,
                         build_flags,
-                    );
+                    )?;
                     remove_degenerate_segments(&mut simplified);
                     if simplified.len() / 4 >= 3 {
                         let mut cv = ws.vec_with_capacity(simplified.len())?;
@@ -160,17 +163,7 @@ impl ContourSet {
 
         // Merge holes into their outlines.
         if !cset.conts.is_empty() {
-            let winding: Vec<i8> = cset
-                .conts
-                .iter()
-                .map(|c| {
-                    if calc_area_of_polygon_2d(&c.verts) < 0 {
-                        -1
-                    } else {
-                        1
-                    }
-                })
-                .collect();
+            let winding = contour_winding(ws, &cset.conts)?;
             let nholes = winding.iter().filter(|&&w| w < 0).count();
             if nholes > 0 {
                 let nregions = usize::from(chf.max_regions) + 1;
@@ -184,7 +177,7 @@ impl ContourSet {
                     if winding[i] > 0 {
                         outline[r] = Some(i);
                     } else {
-                        holes[r].push(i);
+                        ws.push(&mut holes[r], i)?;
                     }
                 }
                 for r in 0..nregions {
@@ -347,7 +340,13 @@ fn distance_pt_seg(x: i32, z: i32, px: i32, pz: i32, qx: i32, qz: i32) -> f32 {
     dx * dx + dz * dz
 }
 
-fn insert_point(simplified: &mut Vec<i32>, at: usize, points: &[i32], maxi: usize) {
+fn insert_point(
+    ws: &mut Workspace,
+    simplified: &mut Vec<i32>,
+    at: usize,
+    points: &[i32],
+    maxi: usize,
+) -> Result<(), Error> {
     let p = [
         points[maxi * 4],
         points[maxi * 4 + 1],
@@ -355,19 +354,22 @@ fn insert_point(simplified: &mut Vec<i32>, at: usize, points: &[i32], maxi: usiz
         maxi as i32,
     ];
     let pos = (at + 1) * 4;
+    ws.reserve(simplified, 4)?;
     simplified.splice(pos..pos, p);
+    Ok(())
 }
 
 fn simplify_contour(
+    ws: &mut Workspace,
     points: &[i32],
     simplified: &mut Vec<i32>,
     max_error: f32,
     max_edge_len: i32,
     build_flags: i32,
-) {
+) -> Result<(), Error> {
     let pn = points.len() / 4;
     if pn == 0 {
-        return;
+        return Ok(());
     }
     let has_connections = points
         .chunks_exact(4)
@@ -380,6 +382,7 @@ fn simplify_contour(
             let area_borders =
                 (points[i * 4 + 3] & AREA_BORDER) != (points[ii * 4 + 3] & AREA_BORDER);
             if different_regs || area_borders {
+                ws.reserve(simplified, 4)?;
                 simplified.extend_from_slice(&[
                     points[i * 4],
                     points[i * 4 + 1],
@@ -401,6 +404,7 @@ fn simplify_contour(
                 (urx, ury, urz, uri) = (x, y, z, k as i32);
             }
         }
+        ws.reserve(simplified, 8)?;
         simplified.extend_from_slice(&[llx, lly, llz, lli, urx, ury, urz, uri]);
     }
     let mut i = 0;
@@ -437,7 +441,7 @@ fn simplify_contour(
             }
         }
         match maxi {
-            Some(m) if maxd > max_error * max_error => insert_point(simplified, i, points, m),
+            Some(m) if maxd > max_error * max_error => insert_point(ws, simplified, i, points, m)?,
             _ => i += 1,
         }
     }
@@ -482,7 +486,7 @@ fn simplify_contour(
                 }
             }
             match maxi {
-                Some(m) => insert_point(simplified, i, points, m),
+                Some(m) => insert_point(ws, simplified, i, points, m)?,
                 None => i += 1,
             }
         }
@@ -493,6 +497,7 @@ fn simplify_contour(
         simplified[i * 4 + 3] = (points[ai * 4 + 3] & (CONTOUR_REG_MASK | AREA_BORDER))
             | (points[bi * 4 + 3] & BORDER_VERTEX);
     }
+    Ok(())
 }
 
 fn calc_area_of_polygon_2d(verts: &[i32]) -> i32 {
@@ -620,10 +625,22 @@ fn remove_degenerate_segments(simplified: &mut Vec<i32>) {
 }
 
 /// Merges hole contour `b` into outline `a` at vertices `ia` and `ib`.
-fn merge_contours(conts: &mut [Contour], a: usize, b: usize, ia: usize, ib: usize) {
+fn merge_contours(
+    ws: &mut Workspace,
+    conts: &mut [Contour],
+    a: usize,
+    b: usize,
+    ia: usize,
+    ib: usize,
+) -> Result<(), Error> {
     let na = conts[a].verts.len() / 4;
     let nb = conts[b].verts.len() / 4;
-    let mut verts = Vec::with_capacity((na + nb + 2) * 4);
+    let count = na
+        .checked_add(nb)
+        .and_then(|n| n.checked_add(2))
+        .and_then(|n| n.checked_mul(4))
+        .ok_or(Error::SizeOverflow)?;
+    let mut verts = ws.vec_with_capacity(count)?;
     for i in 0..=na {
         let s = ((ia + i) % na) * 4;
         verts.extend_from_slice(&conts[a].verts[s..s + 4]);
@@ -634,6 +651,7 @@ fn merge_contours(conts: &mut [Contour], a: usize, b: usize, ia: usize, ib: usiz
     }
     conts[a].verts = verts;
     conts[b].verts = Vec::new();
+    Ok(())
 }
 
 #[derive(Clone, Copy, Default)]
@@ -649,21 +667,22 @@ fn merge_region_holes(
     hole_ids: &[usize],
 ) -> Result<(), Error> {
     // (contour, minx, minz, leftmost), sorted stably like glibc's merge-sort qsort.
-    let mut holes: Vec<(usize, i32, i32, usize)> = hole_ids
-        .iter()
-        .map(|&h| {
-            let v = &conts[h].verts;
-            let (mut minx, mut minz, mut leftmost) = (v[0], v[2], 0);
-            for k in 1..v.len() / 4 {
-                let (x, z) = (v[k * 4], v[k * 4 + 2]);
-                if x < minx || (x == minx && z < minz) {
-                    (minx, minz, leftmost) = (x, z, k);
-                }
+    let mut holes = ws.vec_with_capacity(hole_ids.len())?;
+    for &h in hole_ids {
+        let v = &conts[h].verts;
+        let (mut minx, mut minz, mut leftmost) = (v[0], v[2], 0);
+        for k in 1..v.len() / 4 {
+            let (x, z) = (v[k * 4], v[k * 4 + 2]);
+            if x < minx || (x == minx && z < minz) {
+                (minx, minz, leftmost) = (x, z, k);
             }
-            (h, minx, minz, leftmost)
-        })
-        .collect();
-    holes.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+        }
+        holes.push((h, minx, minz, leftmost));
+    }
+    let mut hole_scratch = ws.vec(holes.len(), (0, 0, 0, 0))?;
+    crate::common::stable_sort(&mut holes, &mut hole_scratch, |a, b| {
+        a.1.cmp(&b.1).then(a.2.cmp(&b.2))
+    });
     let max_verts = conts[outline].verts.len() / 4
         + holes
             .iter()
@@ -673,6 +692,7 @@ fn merge_region_holes(
     // persists across holes, so stale entries are part of the behaviour. Zeroed
     // here where upstream's buffer is uninitialised.
     let mut diags: Vec<Diag> = ws.vec(max_verts.max(holes.len()), Diag::default())?;
+    let mut diag_scratch = ws.vec(diags.len(), Diag::default())?;
     for i in 0..holes.len() {
         let hole = holes[i].0;
         let hn = conts[hole].verts.len() / 4;
@@ -702,7 +722,14 @@ fn merge_region_holes(
                     nd += 1;
                 }
             }
-            diags[..nd].sort_by_key(|d| d.dist);
+            if diag_scratch.len() < nd {
+                let additional = nd - diag_scratch.len();
+                ws.reserve(&mut diag_scratch, additional)?;
+                diag_scratch.resize(nd, Diag::default());
+            }
+            crate::common::stable_sort(&mut diags[..nd], &mut diag_scratch[..nd], |a, b| {
+                a.dist.cmp(&b.dist)
+            });
             index = None;
             for j in 0..nd {
                 let pt = &ov[diags[j].vert * 4..diags[j].vert * 4 + 4];
@@ -725,8 +752,72 @@ fn merge_region_holes(
             best = (best + 1) % hn;
         }
         if let Some(index) = index {
-            merge_contours(conts, outline, hole, index, best);
+            merge_contours(ws, conts, outline, hole, index, best)?;
         }
     }
     Ok(())
+}
+
+fn contour_winding(ws: &mut Workspace, conts: &[Contour]) -> Result<Vec<i8>, Error> {
+    let mut winding = ws.vec_with_capacity(conts.len())?;
+    for c in conts {
+        winding.push(if calc_area_of_polygon_2d(&c.verts) < 0 {
+            -1
+        } else {
+            1
+        });
+    }
+    Ok(winding)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use crate::Limits;
+
+    #[test]
+    fn winding_and_hole_merge_charge_before_allocation() {
+        let contour = Contour {
+            verts: alloc::vec![0, 0, 0, 0, 0, 0, 4, 0, 4, 0, 4, 0, 4, 0, 0, 0],
+            ..Contour::default()
+        };
+        let mut conts = [contour.clone(), contour];
+        let mut ws = Workspace::with_limits(Limits {
+            max_bytes: 0,
+            ..Limits::default()
+        });
+        assert_eq!(contour_winding(&mut ws, &conts), Err(Error::LimitExceeded));
+        assert_eq!(ws.usage().bytes, 2);
+        ws.begin();
+        let original = conts[0].verts.clone();
+        assert_eq!(
+            merge_contours(&mut ws, &mut conts, 0, 1, 0, 0),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(ws.usage().bytes, 10 * 4 * 4);
+        assert_eq!(conts[0].verts, original);
+        ws.set_limits(Limits::default());
+        ws.begin();
+        merge_contours(&mut ws, &mut conts, 0, 1, 0, 0).unwrap();
+        assert_eq!(conts[0].verts.len(), 40);
+        assert!(conts[1].verts.is_empty());
+    }
+
+    #[test]
+    fn hole_sort_storage_is_charged() {
+        let c = Contour {
+            verts: alloc::vec![0, 0, 0, 0, 0, 0, 4, 0, 4, 0, 4, 0],
+            ..Contour::default()
+        };
+        let mut conts = [c.clone(), c];
+        let mut ws = Workspace::with_limits(Limits {
+            max_bytes: 0,
+            ..Limits::default()
+        });
+        assert_eq!(
+            merge_region_holes(&mut ws, &mut conts, 0, &[1]),
+            Err(Error::LimitExceeded)
+        );
+        assert!(ws.usage().bytes > 0);
+    }
 }

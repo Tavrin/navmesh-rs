@@ -16,6 +16,9 @@
 //!   navmesh (validated tiles, links, poly refs: 64-bit with the default `polyref64`
 //!   feature, 32-bit without) and every navmesh query.
 //!
+//! The `bake` extension (Recast + Detour) builds tiles serially or, with the
+//! optional `parallel` dependency, on rayon workers; insertion stays ordered.
+//!
 //! Every stage takes a [`Workspace`], which carries the caller's [`Limits`] and
 //! reports the [`Usage`] of the last call. Stages never panic; invalid input and
 //! exhausted limits are reported as [`Error`].
@@ -52,6 +55,7 @@
 //! - `crowd` (default): agent simulation and local avoidance; implies `detour`.
 //! - `tilecache` (default): cached layers and dynamic obstacles; implies Recast and Detour.
 //! - `std` (default): floating-point functions from the platform libm.
+//! - `parallel`: rayon-backed tile baking (opt-in; bake functions remain available without it).
 //! - `libm`: floating-point functions from the `libm` crate; required without `std`.
 //! - `polyref64` (default): 64-bit poly refs (upstream's `DT_POLYREF64`); without it
 //!   refs are 32-bit. The width is part of the tile byte format.
@@ -171,3 +175,6 @@ pub mod crowd;
 
 #[cfg(feature = "tilecache")]
 pub mod tilecache;
+
+#[cfg(all(feature = "recast", feature = "detour"))]
+pub mod bake;

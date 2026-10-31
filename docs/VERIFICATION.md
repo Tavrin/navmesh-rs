@@ -307,6 +307,174 @@ Independent release repeats are identical on every crowd and tile-cache case.
   zero-touch/truncation cases above. Oriented-box exactness is measured on the
   oracle platform with its platform math functions.
 
+### Recast and bake deliberate differences from C++
+
+- Grids with exactly one zero dimension return a typed error instead of an empty
+  mesh: `Heightfield::new` returns `Error::InvalidParameter`, and stages reject
+  inconsistent public heightfield dimensions with `Error::InvalidInput`.
+  This includes sliver meshes whose rounded grid is zero by a saturated row or
+  column count. A zero-by-zero grid remains valid. Compact-grid validation and
+  stage row traversal charge work even when rows contain no spans; finite work
+  budgets can therefore fail earlier with `Error::LimitExceeded`.
+
+- C++ uses allocator hooks and has no byte/work budgets. Rust charges all detail
+  queues/triangulation buffers, contour winding/hole/simplification/sort storage,
+  region traversal/merge storage, and mesh removal scratch before fallible
+  reservation. Exhaustion returns `Error::LimitExceeded` or
+  `Error::AllocationFailed`, propagated with the ordered tile coordinate.
+  Stable sorting uses fallibly reserved scratch and retains glibc tie order.
+- C++'s adjacency builder stores edge-chain indices in `unsigned short` without
+  checking their range. Index 65,535 collides with its null sentinel, and 65,536
+  wraps to zero. Rust permits indices 0..=65,534 and returns
+  `Error::LimitExceeded` before storing an out-of-range index. This deliberately
+  rejects the C++ defect; no parity is claimed for meshes that trigger it.
+  Adjacency work is charged before its arrays are allocated.
+- Convex marking charges validation, polygon coordinates, rectangle cells and
+  every visited span times polygon vertex count before visiting that cell's spans.
+  C++ does not budget that work. A later cell exhausting work may leave earlier
+  cells marked; a failed bake never returns partial tiles.
+- The bake extension spatially buckets volumes once in input order and only
+  applies volumes overlapping the tile's bordered xz column. Heights retain
+  Recast's quantized span checks: a zero-height geometry bounding box must not
+  exclude volumes that mark the rasterized floor just above it. Setup charges
+  each candidate tile overlap before visiting it, avoiding all-volumes-per-tile
+  scans for spatially independent inputs.
+- Exact Detour output size and polygon/vertex/link/detail counts are computed
+  before builder allocations and checked against tile limits. The public Detour
+  builder retains unlimited defaults; the bake builder applies `tile_limits`.
+  C++ has no equivalent caller-specified limits.
+
+## Parallel tiled baking
+
+The `bake` extension is **not in recastnavigation**. `tiles` and `tiles_parallel`
+share the tile pipeline; only the latter uses rayon with `parallel`. Both APIs
+remain available without that feature. Validation and spatial triangle bucketing
+are serial, tile pipelines are independent, and insertion into Detour is serial
+in row-major order. Setup and each tile have separate budgets; per-tile byte/work
+charges accumulate across stage resets. `BakeConfig::max_total_bytes` additionally
+admits setup storage, retained output and concurrent worker storage before any
+tile starts. It defaults to unlimited. A finite aggregate budget requires finite
+`tile_limits.max_bytes`; otherwise it returns `Error::LimitExceeded` without a
+tile location. The conservative reservation is:
+
+`setup_bytes + tile_count * min(max_tile_bytes, max_bytes) + min(tile_count, workers) * max_bytes`
+
+Here the two tile limits come from `tile_limits`; setup includes both result-slot
+vectors. Serial uses one worker; parallel uses the current rayon pool size (one
+without the feature). Arithmetic overflow rejects admission. Setup allocations
+also respect the total ceiling. Empty tiles reserve output space too; a worker's
+output may be counted in both terms. These are charged-storage bounds, excluding
+allocator metadata/transient reallocations, thread stacks and rayon's pool and
+scheduler storage, rather than a process RSS limit. Per-tile limits remain in
+force, and `into_navmesh` uses its own separate limits.
+
+On x86-64 Linux, `nav-port verify-parallel` compares the independent original
+serial driver against the public serial API, then against the public parallel API
+at **1, 2, 4, 8 and 16 threads**, with both polygon-reference widths. Comparisons
+include the complete DNAV tile bytes and all 21 query families under both filters,
+using the public ordered navmesh assembler for the parallel results.
+
+| Case | Nonempty tiles per bake | Query records per bake |
+|---|---:|---:|
+| dungeon_tiled | 41 | 42 |
+| nav_test_tiled | 66 | 42 |
+| seams_tiled | 16 | 42 |
+| terrain_small_tiled | 49 | 42 |
+| terrain_large_tiled | 2,681 | 42 |
+
+All **50 parallel case/width/thread combinations** pass: **28,530 tile-byte** and
+**2,100 query-record comparisons**, zero mismatches. The ten additional public
+serial/API baseline checks also pass (5,706 tiles and 420 query records).
+Every input mesh SHA-256 matches the repository manifests. This is serial/parallel
+identity evidence; it does not rerun the earlier C++ oracle campaigns above.
+
+### Wall time
+
+Measured 2026-10-30 on an AMD Ryzen 9 7945HX, release profile, Rust 1.98.1,
+with the processes restricted to CPUs 0,2,...,30 (one logical CPU per physical
+core, the same affinity mask for every configuration). Values are **median ms of
+five interleaved samples** per configuration, after one warmup each. Round order
+rotates and alternates direction. These are shared-host observations, with boost
+enabled; affinity does not reserve exclusive cores or fix CPU frequency.
+
+The timed interval includes input validation, triangle bucketing, all tile stages,
+ordered output and public navmesh assembly. It excludes OBJ loading, pool startup,
+queries and destruction of the assembled navmesh. Serial bucketing and insertion
+remain in every interval; no algorithm changes or single-tile acceleration are
+claimed.
+
+| Case | Ref bits | Serial | Rayon 1 | Rayon 2 | Rayon 4 | Rayon 8 | Rayon 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| terrain_small_tiled | 32 | 80.048 | 82.457 | 42.545 | 23.165 | 13.522 | 11.882 |
+| terrain_small_tiled | 64 | 81.945 | 79.418 | 41.480 | 22.841 | 13.116 | 11.124 |
+| terrain_large_tiled | 32 | 2912.815 | 2873.817 | 1578.098 | 854.902 | 483.144 | 325.919 |
+| terrain_large_tiled | 64 | 2851.153 | 2856.590 | 1505.990 | 831.592 | 476.162 | 342.498 |
+
+Reproduce with `reference/run-parallel.py <fresh-output-directory>`, setting
+`NAV_PORT32`, `NAV_PORT64` to release `nav-port` binaries built with `parallel`
+(and with/without `polyref64`), `NAV_CORPUS_DIR` to the hash-checked corpus, and
+`NAV_BENCH_CPUS` to the affinity mask. The runner retains `identity.json`, all
+120 individual timing samples in `samples.jsonl`, and medians in `summary.json`.
+
+### Gates and boundaries
+
+Workspace tests pass with defaults and with `parallel` in both ref widths; Clippy
+passes with warnings denied for all three configurations. Formatting, public-text,
+Rust 1.88, rustdoc with warnings denied, native no_std/libm, and the wasm32 build
+also pass. Wasm is built **without `parallel`**; threaded rayon on wasm is not
+qualified. The new `parallel_bake` fuzz target compiles with its `parallel` feature;
+it and `recast_input` later ran under the release rule with no crash (see
+[`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md), "Parallel bake release run"). The complete
+gate rerun passes after correcting an initial iterator lint.
+
+Regressions cover all three partitions, area volumes, triangle areas, off-mesh
+links, empty tiles, one-tile layouts, malformed inputs, setup budgets/retry,
+cumulative stage budgets, format limits, first-tile failures at every requested
+thread count, and a later tile error finishing before the first ordered error.
+
+### Parallel bake safety review rerun (2026-10-30)
+
+After the allocation, aggregate-budget, volume-work, adjacency-range and
+preallocation-limit fixes, fresh pinned C++ oracles and fresh Rust drivers pass
+the complete 21-case corpus in both ref widths: **76,018 records, zero
+mismatches**. The separate debug/release tile-cache campaign passes **9,200**
+comparisons; repeat files are identical. Both crowd campaigns pass in
+both widths and debug/release: **158,400 simulation-tick and 2,469,992 active-agent
+comparisons**, zero mismatches. Parallel identity again passes all **50**
+case/width/thread combinations at 1/2/4/8/16 threads: **28,530 tile-byte and 2,100
+query-record comparisons**, plus ten public serial/API baselines (5,706 tiles,
+420 queries).
+
+The 8-to-64 independent tile/volume fixture charges setup work 442 -> 3,634
+(**8.22x**) and total tile work 671,969 -> 5,481,198 (**8.16x**), below its 9x
+regression ceiling. These are work counters, not wall-clock scaling claims.
+Thirteen added regressions cover the five findings, allocation siblings, exact
+adjacency range, border/height volume selection and finite aggregate admission.
+Workspace tests (88 with parallel, plus 14 doctests), both-width serial/parallel
+Clippy, parallel-off tests, tilecache-only and bake-only feature tests, native
+no_std/libm, wasm without parallel, Rust 1.88, rustdoc, formatting, public text
+and parallel fuzz-source compilation all pass. The complete final gate set was
+rerun after development formatting fixes. The new fuzz target was not yet run at that
+point; its release-rule run is recorded in [`FUZZ-RECEIPTS.md`](FUZZ-RECEIPTS.md).
+
+### Degenerate-grid regression rerun (2026-10-31)
+
+After rejecting grids with exactly one zero dimension and charging empty-row
+traversal, fresh pinned C++ and Rust drivers pass all 21 corpus cases in both
+reference widths: **76,018 records, zero mismatches**. Separate tile-cache checks
+pass **9,200** debug/release comparisons with identical repeats. The original and
+300-tick crowd campaigns pass **158,400 tick and 2,469,992 active-agent
+comparisons** across both widths and debug/release. Parallel identity passes all
+**50** case/width/thread combinations: **28,530 tile-byte and 2,100 query-record
+comparisons**, plus ten serial/API baselines (5,706 tiles and 420 queries).
+
+The three new regressions cover both sliver orientations, mutated public grids,
+and finite work limits on rows without spans. Workspace tests (91 with parallel,
+plus 14 doctests), both-width serial/parallel Clippy, feature-specific tests,
+no_std/libm, wasm without parallel, Rust 1.88, rustdoc, fuzz-source compilation,
+formatting and public-text checks all pass. The full gate set was rerun after
+fixing a constant-chunk iterator lint in the new regression.
+
 ## Beyond the records
 
 - Tile bytes are untrusted input. Besides the `malformed_tiles` records, unit tests mutate tiles

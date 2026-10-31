@@ -559,3 +559,9 @@ impl MeshTile {
         if n == 0 { NULL_LINK } else { 0 }
     }
 }
+
+// Bake output limits without allocating decoded runtime sections.
+#[cfg(feature = "recast")]
+pub(crate) fn check_bake_tile_limits(data: &[u8], limits: &Limits) -> Result<(), Error> {
+    check_limits(&peek_header(data)?, data.len(), limits)
+}

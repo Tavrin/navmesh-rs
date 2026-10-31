@@ -5,6 +5,8 @@
 //! ```text
 //! nav-port bake  <case-file> --records FILE
 //! nav-port bench <case-file> [--repeat N]
+//! nav-port verify-parallel <case-file>       # requires parallel feature
+//! nav-port bench-tiles <case-file> --threads N [--repeat N]
 //! ```
 //!
 //! Produces Recast, Detour, crowd and tile-cache records. Mesh paths that are not absolute
@@ -1357,9 +1359,181 @@ fn tiles_from(path: &str, b: &mut Baked) -> Result<(), String> {
     Ok(())
 }
 
+fn bake_extension_tiles(
+    c: &Case,
+    g: &Geometry,
+    parallel: bool,
+) -> Result<navmesh_rs::bake::BakedTiles, String> {
+    use navmesh_rs::bake::{self, AreaVolume, BakeConfig, Input, Partition};
+    if c.mode != "tiled" {
+        return Err("extension requires mode = tiled".into());
+    }
+    let volumes: Vec<_> = c
+        .area_volumes
+        .iter()
+        .map(|v| {
+            let mut out = AreaVolume::default();
+            out.verts = &v.verts;
+            out.hmin = v.hmin;
+            out.hmax = v.hmax;
+            out.area = v.area;
+            out
+        })
+        .collect();
+    let mut om_verts = Vec::new();
+    let mut om_rad = Vec::new();
+    let mut om_dir = Vec::new();
+    for o in c.off_mesh.as_chunks::<8>().0 {
+        om_verts.extend_from_slice(&o[..6]);
+        om_rad.push(o[6]);
+        om_dir.push(u8::from(o[7] != 0.0));
+    }
+    let n = om_rad.len();
+    let om_flags = vec![1; n];
+    let om_areas = vec![0; n];
+    let om_ids: Vec<u32> = (0..n).map(|i| u32::try_from(i).unwrap() + 1000).collect();
+    let mut input = Input::new(&g.verts, &g.tris);
+    input.volumes = &volumes;
+    input.off_mesh = detour::NavMeshCreateParams {
+        off_mesh_con_verts: &om_verts,
+        off_mesh_con_rad: &om_rad,
+        off_mesh_con_dir: &om_dir,
+        off_mesh_con_flags: &om_flags,
+        off_mesh_con_areas: &om_areas,
+        off_mesh_con_user_id: &om_ids,
+        off_mesh_con_count: i32::try_from(n).map_err(|e| e.to_string())?,
+        ..Default::default()
+    };
+    let mut cfg = BakeConfig::default();
+    cfg.recast = make_config(c);
+    cfg.recast.tile_size = c.tile_size;
+    cfg.partition = match c.partition.as_str() {
+        "watershed" => Partition::Watershed,
+        "monotone" => Partition::Monotone,
+        "layers" => Partition::Layers,
+        _ => return Err("partition".into()),
+    };
+    cfg.filter_low_hanging = c.filter_low_hanging;
+    cfg.filter_ledge = c.filter_ledge;
+    cfg.filter_low_height = c.filter_walkable_low_height;
+    cfg.walkable_height = c.agent_height;
+    cfg.walkable_radius = c.agent_radius;
+    cfg.walkable_climb = c.agent_max_climb;
+    let mut ws = Workspace::new();
+    let baked = if parallel {
+        bake::tiles_parallel(&input, &cfg, &mut ws)
+    } else {
+        bake::tiles(&input, &cfg, &mut ws)
+    }
+    .map_err(|e| e.to_string())?;
+    Ok(baked)
+}
+
+#[cfg(feature = "parallel")]
+fn bake_extension(c: &Case, g: &Geometry, parallel: bool) -> Result<Baked, String> {
+    let baked = bake_extension_tiles(c, g, parallel)?;
+    Ok(Baked {
+        params: Some(baked.params),
+        cache: None,
+        tiles: baked
+            .tiles
+            .into_iter()
+            .filter_map(|t| t.data.map(|d| (t.x, t.y, 0, d)))
+            .collect(),
+    })
+}
+
+#[cfg(feature = "parallel")]
+fn identity_records(c: &Case, b: &Baked, nav: Option<NavMesh>) -> Result<(Vec<u8>, usize), String> {
+    let mut sink = Sink {
+        writer: Some(RecordFileWriter::new(&[])),
+    };
+    record_navmesh(b, &mut sink);
+    let nav = match nav {
+        Some(nav) => nav,
+        None => assemble(b).map_err(|e| e.to_string())?,
+    };
+    record_queries(c, &nav, &DefaultFilter::default(), "", &mut sink).map_err(|e| e.to_string())?;
+    record_queries(c, &nav, &cost_filter(), "filtered.", &mut sink).map_err(|e| e.to_string())?;
+    let bytes = sink.writer.unwrap().finish();
+    let file = navmesh_parity::container::RecordFile::from_bytes("identity", bytes.clone())
+        .map_err(|e| e.to_string())?;
+    Ok((bytes, file.entries.len() - 1))
+}
+
+#[cfg(feature = "parallel")]
+fn verify_parallel(c: &Case, g: &Geometry) -> Result<(), String> {
+    // Independent pre-extension driver, then the public serial API, then rayon.
+    let baseline = bake(c, g, &mut Sink { writer: None }).map_err(|e| e.to_string())?;
+    let (expected, queries) = identity_records(c, &baseline, None)?;
+    let serial = bake_extension(c, g, false)?;
+    if identity_records(c, &serial, None)?.0 != expected {
+        return Err("public serial differs from driver".into());
+    }
+    for threads in [1, 2, 4, 8, 16] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let baked = pool.install(|| bake_extension_tiles(c, g, true))?;
+        let got = Baked {
+            params: Some(baked.params),
+            cache: None,
+            tiles: baked
+                .tiles
+                .iter()
+                .filter_map(|t| t.data.clone().map(|d| (t.x, t.y, 0, d)))
+                .collect(),
+        };
+        let nav = baked
+            .into_navmesh(Limits::default())
+            .map_err(|e| e.to_string())?;
+        if identity_records(c, &got, Some(nav))?.0 != expected {
+            return Err(format!("identity failed at {threads} threads"));
+        }
+        println!(
+            "{{\"threads\":{threads},\"tiles\":{},\"query_records\":{queries},\"equal\":true}}",
+            got.tiles.len()
+        );
+    }
+    Ok(())
+}
+
+fn bench_extension(c: &Case, g: &Geometry, threads: usize, repeat: usize) -> Result<(), String> {
+    #[cfg(feature = "parallel")]
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads.max(1))
+        .build()
+        .map_err(|e| e.to_string())?;
+    #[cfg(not(feature = "parallel"))]
+    if threads != 0 {
+        return Err("enable parallel for threaded benchmarking".into());
+    }
+    for sample in 0..repeat {
+        let start = Instant::now();
+        #[cfg(feature = "parallel")]
+        let baked = if threads == 0 {
+            bake_extension_tiles(c, g, false)
+        } else {
+            pool.install(|| bake_extension_tiles(c, g, true))
+        }?;
+        #[cfg(not(feature = "parallel"))]
+        let baked = bake_extension_tiles(c, g, false)?;
+        // Includes validation, bucketing, all tile stages and deterministic
+        // navmesh insertion; excludes OBJ parsing, pool creation and queries.
+        let nav = baked
+            .into_navmesh(Limits::default())
+            .map_err(|e| e.to_string())?;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(nav);
+        println!("{{\"sample\":{sample},\"threads\":{threads},\"ms\":{ms:.3}}}");
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: nav-port bake <case> --records FILE | bench <case> [--repeat N]";
+    let usage = "usage: nav-port bake <case> --records FILE | bench <case> [--repeat N] | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
     let (cmd, case_path) = match (args.first(), args.get(1)) {
         (Some(a), Some(b)) => (a.as_str(), b.as_str()),
         _ => return Err(usage.into()),
@@ -1376,6 +1550,13 @@ fn run() -> Result<(), String> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     match cmd {
+        #[cfg(feature = "parallel")]
+        "verify-parallel" => verify_parallel(&case, &g),
+        "bench-tiles" => {
+            let threads = opt("--threads").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let repeat = opt("--repeat").and_then(|v| v.parse().ok()).unwrap_or(1);
+            bench_extension(&case, &g, threads, repeat)
+        }
         "bake" => {
             let out = opt("--records").ok_or(usage)?;
             let mut writer = RecordFileWriter::new(&[

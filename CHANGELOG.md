@@ -6,6 +6,20 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-31
+
+- Reject grids with exactly one zero dimension with a typed error instead of
+  returning an empty mesh, including sliver meshes with a saturated dimension.
+  Validate mutated public grid dimensions and charge empty-row traversal work.
+
+- Add the `bake` extension (not in recastnavigation): serial tiled generation,
+  opt-in rayon tile workers through `parallel`, deterministic tile/error ordering,
+  independent per-tile limits, and serial navmesh assembly. The API remains
+  available without rayon, including `no_std`/wasm builds.
+- Fuzzing: `parallel_bake` also varies triangle areas, area volumes, per-tile limits and
+  the aggregate budget; new `seeds parallel` and `seeds recast-grid` modes and `-border`
+  Recast seeds reach the new allocation charges, the volume marking and the edge-count guard.
+
 ## [0.1.1] - 2026-10-30
 
 ### Added
@@ -51,6 +65,7 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Tavrin/navmesh-rs/releases/tag/v0.1.0

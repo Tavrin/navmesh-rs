@@ -5,6 +5,8 @@
 //! seeds recast <out-dir> <mesh.obj>...      each mesh with demo settings, per partition
 //! seeds crowd <out-dir>                     `crowd_update` inputs, 16-byte records
 //! seeds tilecache <out-dir>                 `tilecache_update` inputs (layout in the target)
+//! seeds parallel <out-dir>                  `parallel_bake` inputs (layout in the target)
+//! seeds recast-grid <out-dir>               two `recast_input` meshes with 50,000 polygons
 //! ```
 use navmesh_fuzz::{RecastInput, demo_settings, run_recast};
 use navmesh_rs::Workspace;
@@ -83,7 +85,8 @@ fn recast_seeds(out: &Path, files: &[String]) -> Result<usize, String> {
             .file_stem()
             .unwrap_or_default()
             .to_string_lossy();
-        // Three partitions with demo settings, and one with every optional step on.
+        // Three partitions with demo settings, one with every optional step on, two with a
+        // border, one with polygons of 70 vertices.
         for (name, settings) in [
             ("watershed", demo_settings(0)),
             ("monotone", demo_settings(1)),
@@ -92,6 +95,29 @@ fn recast_seeds(out: &Path, files: &[String]) -> Result<usize, String> {
                 let mut s = demo_settings(0);
                 s[0] = 0xfc;
                 s[14] = 3;
+                s
+            }),
+            // No erosion and a border: regions meet the border strip, so contour vertices
+            // there are flagged and later removed from the polygon mesh.
+            ("border", {
+                let mut s = demo_settings(0);
+                s[6] = 0;
+                s[14] = 4;
+                s
+            }),
+            ("border-small-regions", {
+                let mut s = demo_settings(0);
+                s[6] = 0;
+                s[7] = 0;
+                s[8] = 0;
+                s[11] = 3;
+                s[14] = 4;
+                s
+            }),
+            // More than 64 vertices per polygon, the size of the stack buffer in polygon merging.
+            ("wide-polys", {
+                let mut s = demo_settings(0);
+                s[11] = 70;
                 s
             }),
         ] {
@@ -108,6 +134,59 @@ fn recast_seeds(out: &Path, files: &[String]) -> Result<usize, String> {
             std::fs::write(out.join(format!("{stem}-{name}")), bytes).map_err(|e| e.to_string())?;
             written += 1;
         }
+    }
+    Ok(written)
+}
+
+/// Two `recast_input` seeds with more polygons than a 16-bit edge index can number: a 71 x 71
+/// lattice of plus-shaped islands (two overlapping bars each, one cell wide, five cells apart)
+/// that the polygon mesh triangulates into ten polygons per island (`nvp = 3`, no simplification
+/// error, no merging). They reach the edge-count guard of the polygon mesh adjacency, which
+/// no other input in the corpus does.
+fn recast_grid_seeds(out: &Path) -> Result<usize, String> {
+    const SIDE: usize = 71;
+    const PITCH: f64 = 5.0;
+    let cs = 0.1f64;
+    let mut verts = Vec::new();
+    let mut tris = Vec::new();
+    let mut rect = |x0: f64, x1: f64, z0: f64, z1: f64| {
+        let base = (verts.len() / 3) as i32;
+        for (x, z) in [(x0, z0), (x0, z1), (x1, z0), (x1, z1)] {
+            verts.extend_from_slice(&[(x * cs) as f32, 0.0, (z * cs) as f32]);
+        }
+        // Up-facing winding: (a, b, c) and (c, b, d).
+        tris.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+    };
+    for a in 0..SIDE {
+        for b in 0..SIDE {
+            let (x, z) = (a as f64 * PITCH, b as f64 * PITCH);
+            // Bars inset from cell boundaries so each covers exactly its cells.
+            rect(x + 0.1, x + 2.9, z + 1.1, z + 1.9);
+            rect(x + 1.1, x + 1.9, z + 0.1, z + 2.9);
+        }
+    }
+    let mut written = 0;
+    for (name, partition) in [("watershed", 0u8), ("monotone", 1)] {
+        // Flags: partition only (the span filters would remove isolated cells); cell size 0.1;
+        // slope 45; height 10, climb 4, radius 0; every area, edge and error limit 0; three
+        // vertices per polygon; no detail sampling; no border.
+        let settings = [partition, 9, 19, 45, 10, 4, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0];
+        let input = RecastInput {
+            settings,
+            verts: verts.clone(),
+            tris: tris.clone(),
+        };
+        let bytes = input
+            .encode()
+            .filter(|b| b.len() <= MAX_RECAST_SEED)
+            .ok_or("grid seed does not fit the recast layout")?;
+        println!(
+            "grid-{name}: {} bytes, {:?}",
+            bytes.len(),
+            run_recast(&input)
+        );
+        std::fs::write(out.join(format!("grid-plus-{name}")), bytes).map_err(|e| e.to_string())?;
+        written += 1;
     }
     Ok(written)
 }
@@ -371,15 +450,123 @@ fn tilecache_seeds(out: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+/// Vertices (three bytes each) and triangles of a `parallel_bake` seed mesh: four square
+/// vertices first (the area volumes use them), then a grid of quads (at most 128 triangles).
+/// `kind` 0 flat, 1 hills, 2 stairs, 3 flat with diagonal holes (each 8 x 8 quads of 3.5 units),
+/// 4 a 3 x 3 plane with its centre quad missing, 5 a 5 x 5 plane with two interior holes.
+fn bake_mesh(kind: u8) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
+    let (n, step): (u8, u8) = match kind {
+        4 => (3, 24),
+        5 => (5, 20),
+        _ => (8, 28),
+    };
+    let (lo, hi) = (2 + step * n / 4, 2 + step * n / 4 * 3);
+    let mut verts = vec![[lo, 40, lo], [lo, 40, hi], [hi, 40, hi], [hi, 40, lo]];
+    let mut tris = vec![[0, 1, 2], [0, 2, 3]];
+    for j in 0..=n {
+        for i in 0..=n {
+            let y = match kind {
+                1 => 32 + 6 * ((i * j) % 4),
+                2 => 20 + 10 * i,
+                _ => 32,
+            };
+            verts.push([2 + step * i, y, 2 + step * j]);
+        }
+    }
+    let at = |i: u8, j: u8| 4 + j * (n + 1) + i;
+    for j in 0..n {
+        for i in 0..n {
+            let hole = match kind {
+                3 => (i + j) % 5 == 2,
+                4 => (i, j) == (1, 1),
+                5 => (i, j) == (1, 1) || (i, j) == (3, 3),
+                _ => false,
+            };
+            if hole {
+                continue;
+            }
+            tris.push([at(i, j), at(i, j + 1), at(i + 1, j)]);
+            tris.push([at(i + 1, j), at(i, j + 1), at(i + 1, j + 1)]);
+        }
+    }
+    tris.truncate(128);
+    (verts, tris)
+}
+
+/// `parallel_bake` inputs (layout in the target): six meshes, three partitions and six feature
+/// sets (defaults, areas and volumes, filters off, tight tile limits, three aggregate budgets),
+/// plus two raw-float inputs with extreme coordinates.
+fn parallel_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    let mut put = |name: String, bytes: Vec<u8>| -> Result<(), String> {
+        std::fs::write(out.join(name), bytes).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+    // (name, features, budget k, parameter byte)
+    let sets: [(&str, u8, u8, u8); 6] = [
+        ("plain", 0x00, 0, 0),
+        ("volumes", 0x0e, 0, 5),
+        ("nofilter", 0x0f, 0, 9),
+        ("tight", 0x40, 0, 10),
+        ("budget-fit", 0x1e, 200, 7),
+        ("budget-low", 0x2e, 3, 7),
+    ];
+    for kind in 0..6u8 {
+        let (verts, tris) = bake_mesh(kind);
+        for part in 0..3u8 {
+            for (n, &(name, features, k, param)) in sets.iter().enumerate() {
+                // The small planes fit one tile, so their holes stay inside one contour set.
+                let tile = if kind >= 4 {
+                    48
+                } else {
+                    [24u8, 0, 48, 8, 30, 16][n]
+                };
+                let radius = (n as u8 + part) % 4;
+                let vp = (n as u8 + kind) % 4;
+                let cs = [0u8, 0, 1, 2, 0, 3][n];
+                let mut v = vec![
+                    tile,
+                    part | radius << 2 | vp << 5,
+                    cs << 2,
+                    features,
+                    k,
+                    param,
+                ];
+                v.push(verts.len() as u8);
+                v.extend(verts.iter().flatten());
+                v.extend(tris.iter().flatten());
+                put(format!("pb-k{kind}-p{part}-{name}"), v)?;
+            }
+        }
+    }
+    for (name, scale) in [("huge", 1e30f32), ("nan", f32::NAN)] {
+        let mut v = vec![24u8, 0, 1, 0x1e, 0, 1, 6];
+        for p in [
+            [0.0, 0.0, 0.0],
+            [scale, 0.0, 0.0],
+            [0.0, 0.0, scale],
+            [4.0, 0.0, 4.0],
+            [0.0, 1.0, 4.0],
+            [4.0, 0.0, 0.0],
+        ] {
+            v.extend(p.iter().flat_map(|f: &f32| f.to_le_bytes()));
+        }
+        v.extend([0u8, 1, 2, 3, 4, 5]);
+        put(format!("pb-raw-{name}"), v)?;
+    }
+    Ok(written)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let no_inputs = matches!(
         args.first().map(String::as_str),
-        Some("crowd" | "tilecache")
+        Some("crowd" | "tilecache" | "parallel" | "recast-grid")
     );
     if args.len() < if no_inputs { 2 } else { 3 } {
         eprintln!(
-            "usage: seeds tiles|recast <out-dir> <input>... | seeds crowd|tilecache <out-dir>"
+            "usage: seeds tiles|recast <out-dir> <input>... | seeds crowd|tilecache|parallel|recast-grid <out-dir>"
         );
         return ExitCode::from(2);
     }
@@ -391,8 +578,10 @@ fn main() -> ExitCode {
     let result = match args[0].as_str() {
         "tiles" => tiles(out, &args[2..]),
         "recast" => recast_seeds(out, &args[2..]),
+        "recast-grid" => recast_grid_seeds(out),
         "crowd" => crowd_seeds(out),
         "tilecache" => tilecache_seeds(out),
+        "parallel" => parallel_seeds(out),
         other => Err(format!("unknown mode {other}")),
     };
     match result {

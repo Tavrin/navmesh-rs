@@ -88,6 +88,42 @@ fn build_and_query(verts: &[f32], tris: &[i32]) -> Result<(), Error> {
 Tiled navmeshes use `NavMesh::new` with `NavMeshParams` and `add_tile` per tile. The crate
 documentation lists every stage and query.
 
+## Tiled baking
+
+The `bake` module is an extension **not in recastnavigation**, available whenever
+`recast` and `detour` are enabled. Enable `parallel` to opt into rayon tile workers:
+
+```toml
+navmesh-rs = { version = "0.1", features = ["parallel"] }
+```
+
+```rust
+use navmesh_rs::{bake::{self, BakeConfig, Input}, Limits, Workspace};
+
+let verts = [0., 0., 0., 0., 0., 24., 24., 0., 24., 24., 0., 0.];
+let tris = [0, 1, 2, 0, 2, 3];
+let input = Input::new(&verts, &tris);
+let mut config = BakeConfig::default();
+config.recast.tile_size = 32; // cells; other Recast settings are also in cell units
+config.tile_limits.max_bytes = 64 << 20;
+config.max_total_bytes = 2 << 30; // setup + retained tiles + concurrent workspaces
+config.tile_limits.max_work = 100_000_000;
+let mut setup = Workspace::new(); // optionally limit validation/bucketing separately
+let baked = bake::tiles_parallel(&input, &config, &mut setup)?;
+let nav = baked.into_navmesh(Limits::default())?;
+# Ok::<(), bake::BakeError>(())
+```
+
+`tiles` always builds serially. `tiles_parallel` uses the current rayon pool with
+`parallel`, or the serial implementation without it. Custom rayon pools control
+thread counts. Both preserve triangle order and return row-major tiles, including
+empty tiles; insertion into the navmesh stays serial. Errors identify the first
+failing tile in that order. Input supports per-triangle areas, convex area volumes
+and off-mesh connections. Limits apply independently and cumulatively per tile;
+setup has its own workspace budget. Retained output and concurrent tiles add to
+memory use, and rayon's scheduler allocations are outside these budgets.
+`parallel` is off by default; leave it off for wasm and `no_std` builds.
+
 ## Crowd
 
 Enable the default `crowd` feature to manage agents over an existing navmesh.
@@ -184,6 +220,7 @@ resource use; they write into the cache's budgeted output slices.
 | `crowd` | yes | Agent simulation, corridors, avoidance and path queue; implies `detour`. |
 | `std` | yes | floating-point functions from the platform libm |
 | `libm` | no | floating-point functions from the `libm` crate; required without `std` |
+| `parallel` | no | rayon tile workers; serial bake API remains available without it |
 | `polyref64` | yes | 64-bit poly refs; off gives upstream's 32-bit refs |
 
 `no_std`: `default-features = false, features = ["libm", "recast", "detour", "crowd", "tilecache", "polyref64"]`.
@@ -192,7 +229,7 @@ resource use; they write into the cache's budgeted output slices.
 
 - Ported: Recast, Detour, DetourCrowd and DetourTileCache.
 - Not ported yet: merging and copying polygon meshes, and big-endian tile data.
-- The API follows upstream's stage functions; there is no single-call bake helper yet.
+- Stage functions follow upstream; the `bake` extension provides serial and parallel tiled builds.
 - Bit-exactness with the C++ library is checked on x86-64 Linux with glibc. On other
   platforms the results can differ in the last bit where upstream calls `cos`/`sin`
   (the walkable-slope threshold and avoidance sampling).

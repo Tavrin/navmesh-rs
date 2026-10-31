@@ -127,9 +127,10 @@ fn box_blur(chf: &CompactHeightfield, thr: i32, src: &[u16], dst: &mut [u16]) {
 /// (`rcBuildDistanceField`); fills `chf.dist` and `chf.max_distance`.
 pub fn build_distance_field(ws: &mut Workspace, chf: &mut CompactHeightfield) -> Result<(), Error> {
     ws.begin();
-    validate_chf(chf)?;
+    validate_chf(ws, chf)?;
     let n = chf.spans.len();
-    ws.work(n as u64 * 4)?;
+    // Four grid passes also visit columns with no spans.
+    ws.work(n as u64 * 4 + (chf.cells.len() as u64 + chf.height as u64) * 4)?;
     chf.dist = Vec::new();
     let mut src = ws.vec(n, 0u16)?;
     let mut dst = ws.vec(n, 0u16)?;
@@ -279,6 +280,7 @@ fn expand_regions(
     if fill_stack {
         stack.clear();
         for y in 0..chf.height {
+            ws.work(1)?;
             for x in 0..chf.width {
                 let c = chf.cells[(x + y * chf.width) as usize];
                 for i in c.index as usize..c.index as usize + c.count as usize {
@@ -369,6 +371,7 @@ fn sort_cells_by_level(
         s.clear();
     }
     for y in 0..chf.height {
+        ws.work(1)?;
         for x in 0..chf.width {
             let c = chf.cells[(x + y * chf.width) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -475,33 +478,44 @@ fn can_merge_with_region(a: &Region, b: &Region) -> bool {
     !a.floors.contains(&i32::from(b.id))
 }
 
-fn add_unique_floor_region(reg: &mut Region, n: i32) {
+fn add_unique_floor_region(ws: &mut Workspace, reg: &mut Region, n: i32) -> Result<(), Error> {
     if !reg.floors.contains(&n) {
-        reg.floors.push(n);
+        ws.push(&mut reg.floors, n)?;
     }
+    Ok(())
 }
 
-fn add_unique_connection(reg: &mut Region, n: i32) {
+fn add_unique_connection(ws: &mut Workspace, reg: &mut Region, n: i32) -> Result<(), Error> {
     if !reg.connections.contains(&n) {
-        reg.connections.push(n);
+        ws.push(&mut reg.connections, n)?;
     }
+    Ok(())
 }
 
 /// `mergeRegions(regions[a], regions[b])`; `a != b`.
-fn merge_regions(regions: &mut [Region], a: usize, b: usize) -> bool {
+fn merge_regions(
+    ws: &mut Workspace,
+    regions: &mut [Region],
+    a: usize,
+    b: usize,
+) -> Result<bool, Error> {
     let aid = i32::from(regions[a].id);
     let bid = i32::from(regions[b].id);
     let acon = core::mem::take(&mut regions[a].connections);
     let Some(insa) = acon.iter().position(|&c| c == bid) else {
         regions[a].connections = acon;
-        return false;
+        return Ok(false);
     };
     let Some(insb) = regions[b].connections.iter().position(|&c| c == aid) else {
         regions[a].connections = acon;
-        return false;
+        return Ok(false);
     };
     let bcon = core::mem::take(&mut regions[b].connections);
-    let mut out = Vec::with_capacity(acon.len() + bcon.len());
+    let mut out = ws.vec_with_capacity(
+        acon.len()
+            .checked_add(bcon.len())
+            .ok_or(Error::SizeOverflow)?,
+    )?;
     let ni = acon.len();
     for i in 0..ni.saturating_sub(1) {
         out.push(acon[(insa + 1 + i) % ni]);
@@ -514,12 +528,12 @@ fn merge_regions(regions: &mut [Region], a: usize, b: usize) -> bool {
     regions[a].connections = out;
     let bfloors = core::mem::take(&mut regions[b].floors);
     for &f in &bfloors {
-        add_unique_floor_region(&mut regions[a], f);
+        add_unique_floor_region(ws, &mut regions[a], f)?;
     }
     regions[b].floors = bfloors;
     regions[a].span_count += regions[b].span_count;
     regions[b].span_count = 0;
-    true
+    Ok(true)
 }
 
 fn is_solid_edge(
@@ -539,6 +553,7 @@ fn is_solid_edge(
 
 #[allow(clippy::too_many_arguments)]
 fn walk_contour(
+    ws: &mut Workspace,
     mut x: i32,
     mut y: i32,
     mut i: usize,
@@ -546,14 +561,14 @@ fn walk_contour(
     chf: &CompactHeightfield,
     src_reg: &[u16],
     cont: &mut Vec<i32>,
-) {
+) -> Result<(), Error> {
     let start_dir = dir;
     let start_i = i;
     let mut cur_reg = match nei(chf, x, y, i, dir) {
         Some((_, _, ai)) => src_reg[ai],
         None => 0,
     };
-    cont.push(i32::from(cur_reg));
+    ws.push(cont, i32::from(cur_reg))?;
     let mut iter = 0;
     loop {
         iter += 1;
@@ -567,12 +582,12 @@ fn walk_contour(
             };
             if r != cur_reg {
                 cur_reg = r;
-                cont.push(i32::from(cur_reg));
+                ws.push(cont, i32::from(cur_reg))?;
             }
             dir = (dir + 1) & 3;
         } else {
             let Some((nx, ny, ni)) = nei(chf, x, y, i, dir) else {
-                return;
+                return Ok(());
             };
             x = nx;
             y = ny;
@@ -594,6 +609,7 @@ fn walk_contour(
             }
         }
     }
+    Ok(())
 }
 
 fn merge_and_filter_regions(
@@ -609,6 +625,7 @@ fn merge_and_filter_regions(
     for i in 0..nreg {
         regions.push(Region::new(i as u16));
     }
+    ws.work(chf.height as u64)?;
     for_spans!(chf, x, y, c, i, {
         let r = src_reg[i];
         if r == 0 || usize::from(r) >= nreg {
@@ -627,14 +644,14 @@ fn merge_and_filter_regions(
             if floor == r {
                 reg.overlap = true;
             }
-            add_unique_floor_region(reg, i32::from(floor));
+            add_unique_floor_region(ws, reg, i32::from(floor))?;
         }
         if !reg.connections.is_empty() {
             continue;
         }
         reg.area_type = chf.areas[i];
         if let Some(ndir) = (0..4).find(|&d| is_solid_edge(chf, src_reg, x, y, i, d)) {
-            walk_contour(x, y, i, ndir, chf, src_reg, &mut reg.connections);
+            walk_contour(ws, x, y, i, ndir, chf, src_reg, &mut reg.connections)?;
         }
     });
     ws.work(nreg as u64)?;
@@ -652,10 +669,10 @@ fn merge_and_filter_regions(
         stack.clear();
         trace.clear();
         regions[i].visited = true;
-        stack.push(i);
+        ws.push(&mut stack, i)?;
         while let Some(ri) = stack.pop() {
             span_count += regions[ri].span_count;
-            trace.push(ri);
+            ws.push(&mut trace, ri)?;
             for j in 0..regions[ri].connections.len() {
                 let c = regions[ri].connections[j];
                 if c & i32::from(BORDER_REG) != 0 {
@@ -668,7 +685,7 @@ fn merge_and_filter_regions(
                 if nr.visited || nr.id == 0 || (nr.id & BORDER_REG) != 0 {
                     continue;
                 }
-                stack.push(usize::from(nr.id));
+                ws.push(&mut stack, usize::from(nr.id))?;
                 nr.visited = true;
             }
         }
@@ -714,7 +731,7 @@ fn merge_and_filter_regions(
             if merge_id != reg.id {
                 let old = reg.id;
                 let target = usize::from(merge_id);
-                if target != i && target < nreg && merge_regions(&mut regions, target, i) {
+                if target != i && target < nreg && merge_regions(ws, &mut regions, target, i)? {
                     for r in regions.iter_mut() {
                         if r.id == 0 || (r.id & BORDER_REG) != 0 {
                             continue;
@@ -765,8 +782,8 @@ fn compress_region_ids(regions: &mut [Region], max_region_id: &mut u16, src_reg:
     }
 }
 
-fn check_partition(chf: &CompactHeightfield, border: i32) -> Result<(), Error> {
-    validate_chf(chf)?;
+fn check_partition(ws: &mut Workspace, chf: &CompactHeightfield, border: i32) -> Result<(), Error> {
+    validate_chf(ws, chf)?;
     if border < 0 {
         return Err(Error::InvalidParameter("border size"));
     }
@@ -782,7 +799,7 @@ pub fn build_regions(
     merge_region_area: i32,
 ) -> Result<(), Error> {
     ws.begin();
-    check_partition(chf, border_size)?;
+    check_partition(ws, chf, border_size)?;
     let n = chf.spans.len();
     if chf.dist.len() != n {
         return Err(Error::InvalidInput(
@@ -799,6 +816,10 @@ pub fn build_regions(
     let mut region_id: u16 = 1;
     let mut level: u16 = (chf.max_distance.wrapping_add(1)) & !1;
     const EXPAND_ITERS: i32 = 8;
+    if border_size > 0 {
+        // Bound the four border rectangles, including empty rows.
+        ws.work((chf.cells.len() as u64 + chf.height as u64) * 4)?;
+    }
     paint_border(chf, border_size, &mut region_id, &mut src_reg);
     chf.border_size = border_size;
     let chf_ref: &CompactHeightfield = chf;
@@ -900,10 +921,15 @@ fn sweep_regions(
     let w = chf.width;
     let h = chf.height;
     let mut id: u16 = 1;
+    if border > 0 {
+        // Bound the four border rectangles, including empty rows.
+        ws.work((chf.cells.len() as u64 + chf.height as u64) * 4)?;
+    }
     paint_border(chf, border, &mut id, src_reg);
     let mut sweeps: Vec<Sweep> = ws.vec(w.max(h).max(1) as usize, Sweep::default())?;
     let mut prev: Vec<i32> = ws.vec(256, 0)?;
     for y in border..h - border {
+        ws.work(1)?;
         let need = usize::from(id) + 1;
         if prev.len() < need {
             let grow = need - prev.len();
@@ -990,7 +1016,7 @@ pub fn build_regions_monotone(
     merge_region_area: i32,
 ) -> Result<(), Error> {
     ws.begin();
-    check_partition(chf, border_size)?;
+    check_partition(ws, chf, border_size)?;
     let mut src_reg = ws.vec(chf.spans.len(), 0u16)?;
     let mut max_regions = sweep_regions(ws, chf, border_size, &mut src_reg)?;
     chf.border_size = border_size;
@@ -1023,6 +1049,7 @@ fn merge_and_filter_layer_regions(
     }
     let mut lregs: Vec<i32> = Vec::new();
     for y in 0..chf.height {
+        ws.work(1)?;
         for x in 0..chf.width {
             let c = chf.cells[(x + y * chf.width) as usize];
             lregs.clear();
@@ -1038,12 +1065,12 @@ fn merge_and_filter_layer_regions(
                 reg.area_type = area;
                 reg.ymin = reg.ymin.min(s.y);
                 reg.ymax = reg.ymax.max(s.y);
-                lregs.push(i32::from(ri));
+                ws.push(&mut lregs, i32::from(ri))?;
                 for dir in 0..4 {
                     if let Some((_, _, ai)) = nei(chf, x, y, i, dir) {
                         let rai = src_reg[ai];
                         if rai > 0 && usize::from(rai) < nreg && rai != ri {
-                            add_unique_connection(reg, i32::from(rai));
+                            add_unique_connection(ws, reg, i32::from(rai))?;
                         }
                         if rai & BORDER_REG != 0 {
                             reg.connects_to_border = true;
@@ -1054,8 +1081,8 @@ fn merge_and_filter_layer_regions(
             for i in 0..lregs.len().saturating_sub(1) {
                 for j in i + 1..lregs.len() {
                     if lregs[i] != lregs[j] {
-                        add_unique_floor_region(&mut regions[lregs[i] as usize], lregs[j]);
-                        add_unique_floor_region(&mut regions[lregs[j] as usize], lregs[i]);
+                        add_unique_floor_region(ws, &mut regions[lregs[i] as usize], lregs[j])?;
+                        add_unique_floor_region(ws, &mut regions[lregs[j] as usize], lregs[i])?;
                     }
                 }
             }
@@ -1067,15 +1094,20 @@ fn merge_and_filter_layer_regions(
     for r in regions.iter_mut() {
         r.id = 0;
     }
-    let mut stack: alloc::collections::VecDeque<usize> = alloc::collections::VecDeque::new();
+    // Each region is enqueued once. An indexed Vec keeps FIFO order without
+    // VecDeque's power-of-two capacity rounding escaping the byte charge.
+    let mut stack = ws.vec_with_capacity(nreg)?;
     for i in 1..nreg {
         if regions[i].id != 0 {
             continue;
         }
         regions[i].id = layer_id;
         stack.clear();
-        stack.push_back(i);
-        while let Some(ri) = stack.pop_front() {
+        stack.push(i);
+        let mut head = 0;
+        while head < stack.len() {
+            let ri = stack[head];
+            head += 1;
             let ncons = regions[ri].connections.len();
             for j in 0..ncons {
                 let n = regions[ri].connections[j] as usize;
@@ -1085,11 +1117,11 @@ fn merge_and_filter_layer_regions(
                 if regions[i].floors.contains(&(n as i32)) {
                     continue;
                 }
-                stack.push_back(n);
+                stack.push(n);
                 regions[n].id = layer_id;
                 let floors = core::mem::take(&mut regions[n].floors);
                 for &f in &floors {
-                    add_unique_floor_region(&mut regions[i], f);
+                    add_unique_floor_region(ws, &mut regions[i], f)?;
                 }
                 regions[n].floors = floors;
                 let (nymin, nymax, nspans, nborder) = (
@@ -1135,7 +1167,7 @@ pub fn build_layer_regions(
     min_region_area: i32,
 ) -> Result<(), Error> {
     ws.begin();
-    check_partition(chf, border_size)?;
+    check_partition(ws, chf, border_size)?;
     let mut src_reg = ws.vec(chf.spans.len(), 0u16)?;
     let mut max_regions = sweep_regions(ws, chf, border_size, &mut src_reg)?;
     chf.border_size = border_size;
@@ -1145,4 +1177,38 @@ pub fn build_layer_regions(
         s.reg = *r;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+    use crate::Limits;
+
+    #[test]
+    fn region_merge_and_floor_growth_obey_byte_limits() {
+        let mut regions = [Region::new(1), Region::new(2)];
+        regions[0].connections = alloc::vec![2, 0];
+        regions[1].connections = alloc::vec![1, 0];
+        let mut ws = Workspace::with_limits(Limits {
+            max_bytes: 0,
+            ..Limits::default()
+        });
+        assert_eq!(
+            merge_regions(&mut ws, &mut regions, 0, 1),
+            Err(Error::LimitExceeded)
+        );
+        assert_eq!(ws.usage().bytes, 16);
+        ws.begin();
+        assert_eq!(
+            add_unique_floor_region(&mut ws, &mut regions[0], 3),
+            Err(Error::LimitExceeded)
+        );
+        assert!(regions[0].floors.is_empty());
+        ws.set_limits(Limits::default());
+        ws.begin();
+        regions[0].connections = alloc::vec![2, 0];
+        regions[1].connections = alloc::vec![1, 0];
+        assert_eq!(merge_regions(&mut ws, &mut regions, 0, 1), Ok(true));
+        assert_eq!(regions[0].connections, [0]);
+    }
 }

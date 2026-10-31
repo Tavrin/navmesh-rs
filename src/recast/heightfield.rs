@@ -60,6 +60,8 @@ impl<'a> Iterator for ColumnIter<'a> {
 
 impl Heightfield {
     /// An empty heightfield over the given grid (`rcCreateHeightfield`).
+    /// Both dimensions must be positive or both zero; a grid with exactly one
+    /// zero dimension returns [`Error::InvalidParameter`].
     pub fn new(
         ws: &mut Workspace,
         width: i32,
@@ -70,7 +72,7 @@ impl Heightfield {
         ch: f32,
     ) -> Result<Heightfield, Error> {
         ws.begin();
-        if width < 0 || height < 0 {
+        if width < 0 || height < 0 || (width == 0) != (height == 0) {
             return Err(Error::InvalidParameter("heightfield size"));
         }
         if !(cs > 0.0 && ch > 0.0 && cs.is_finite() && ch.is_finite()) {
@@ -117,7 +119,11 @@ impl Heightfield {
     /// Checks that the public grid fields still match the span storage.
     pub(crate) fn check(&self) -> Result<(), Error> {
         let cells = (self.width.max(0) as usize).checked_mul(self.height.max(0) as usize);
-        if self.width < 0 || self.height < 0 || cells != Some(self.heads.len()) {
+        if self.width < 0
+            || self.height < 0
+            || (self.width == 0) != (self.height == 0)
+            || cells != Some(self.heads.len())
+        {
             return Err(Error::InvalidInput(
                 "heightfield size changed after creation",
             ));

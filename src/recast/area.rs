@@ -4,21 +4,36 @@ use super::{CompactHeightfield, NOT_CONNECTED, NULL_AREA, dir_offset_x, dir_offs
 use crate::common::{sqr, sqrtf, v3, vmax, vmin};
 use crate::{Error, Workspace};
 
-pub(crate) fn check_chf(chf: &CompactHeightfield) -> Result<(), Error> {
+pub(crate) fn check_chf(ws: &mut Workspace, chf: &CompactHeightfield) -> Result<(), Error> {
     let cells = (chf.width.max(0) as usize).checked_mul(chf.height.max(0) as usize);
     if chf.width < 0
         || chf.height < 0
+        || (chf.width == 0) != (chf.height == 0)
         || cells != Some(chf.cells.len())
         || chf.spans.len() != chf.span_count.max(0) as usize
         || chf.areas.len() != chf.spans.len()
-        || chf
-            .cells
-            .iter()
-            .any(|c| c.index as usize + c.count as usize > chf.spans.len())
+    {
+        return Err(Error::InvalidInput("inconsistent compact heightfield"));
+    }
+    // Validation itself visits every cell/span; charge before traversing.
+    ws.work(
+        (chf.cells.len() as u64)
+            .checked_add(
+                (chf.spans.len() as u64)
+                    .checked_mul(4)
+                    .ok_or(Error::SizeOverflow)?,
+            )
+            .ok_or(Error::SizeOverflow)?,
+    )?;
+    if chf
+        .cells
+        .iter()
+        .any(|c| c.index as usize + c.count as usize > chf.spans.len())
     {
         return Err(Error::InvalidInput("inconsistent compact heightfield"));
     }
     for z in 0..chf.height {
+        ws.work(1)?;
         for x in 0..chf.width {
             let c = chf.cells[(x + z * chf.width) as usize];
             for s in &chf.spans[c.index as usize..c.index as usize + c.count as usize] {
@@ -68,13 +83,14 @@ pub fn erode_walkable_area(
     chf: &mut CompactHeightfield,
 ) -> Result<(), Error> {
     ws.begin();
-    check_chf(chf)?;
+    check_chf(ws, chf)?;
     let w = chf.width;
     let h = chf.height;
     let n = chf.spans.len();
     ws.work(n as u64 * 3 + chf.cells.len() as u64)?;
     let mut dist = ws.vec(n, 0xffu8)?;
     for z in 0..h {
+        ws.work(1)?;
         for x in 0..w {
             let c = chf.cells[(x + z * w) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -102,6 +118,7 @@ pub fn erode_walkable_area(
         }
     };
     for z in 0..h {
+        ws.work(1)?;
         for x in 0..w {
             let c = chf.cells[(x + z * w) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -121,6 +138,7 @@ pub fn erode_walkable_area(
         }
     }
     for z in (0..h).rev() {
+        ws.work(1)?;
         for x in (0..w).rev() {
             let c = chf.cells[(x + z * w) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -155,12 +173,13 @@ pub fn median_filter_walkable_area(
     chf: &mut CompactHeightfield,
 ) -> Result<(), Error> {
     ws.begin();
-    check_chf(chf)?;
+    check_chf(ws, chf)?;
     let w = chf.width;
     let h = chf.height;
     ws.work(chf.spans.len() as u64)?;
     let mut areas = ws.vec(chf.spans.len(), 0xffu8)?;
     for z in 0..h {
+        ws.work(1)?;
         for x in 0..w {
             let c = chf.cells[(x + z * w) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -226,7 +245,7 @@ pub fn mark_box_area(
     chf: &mut CompactHeightfield,
 ) -> Result<(), Error> {
     ws.begin();
-    check_chf(chf)?;
+    check_chf(ws, chf)?;
     if bmin.iter().chain(&bmax).any(|v| !v.is_finite()) {
         return Err(Error::InvalidInput("non-finite box bounds"));
     }
@@ -235,6 +254,7 @@ pub fn mark_box_area(
     };
     ws.work(((maxx - minx + 1) as u64) * ((maxz - minz + 1) as u64))?;
     for z in minz..=maxz {
+        ws.work(1)?;
         for x in minx..=maxx {
             let c = chf.cells[(x + z * chf.width) as usize];
             for i in c.index as usize..c.index as usize + c.count as usize {
@@ -279,7 +299,8 @@ pub fn mark_convex_poly_area(
     chf: &mut CompactHeightfield,
 ) -> Result<(), Error> {
     ws.begin();
-    check_chf(chf)?;
+    check_chf(ws, chf)?;
+    ws.work(verts.len() as u64)?;
     if verts.len() < 3 || !verts.len().is_multiple_of(3) {
         return Err(Error::InvalidInput("polygon vertex array"));
     }
@@ -299,8 +320,14 @@ pub fn mark_convex_poly_area(
     };
     ws.work(((maxx - minx + 1) as u64) * ((maxz - minz + 1) as u64))?;
     for z in minz..=maxz {
+        ws.work(1)?;
         for x in minx..=maxx {
             let c = chf.cells[(x + z * chf.width) as usize];
+            ws.work(
+                u64::from(c.count)
+                    .checked_mul((verts.len() / 3) as u64)
+                    .ok_or(Error::SizeOverflow)?,
+            )?;
             for i in c.index as usize..c.index as usize + c.count as usize {
                 if chf.areas[i] == NULL_AREA {
                     continue;
@@ -333,7 +360,7 @@ pub fn mark_cylinder_area(
     chf: &mut CompactHeightfield,
 ) -> Result<(), Error> {
     ws.begin();
-    check_chf(chf)?;
+    check_chf(ws, chf)?;
     if pos.iter().any(|v| !v.is_finite()) || !radius.is_finite() || !height.is_finite() {
         return Err(Error::InvalidInput("non-finite cylinder"));
     }
@@ -345,6 +372,7 @@ pub fn mark_cylinder_area(
     ws.work(((maxx - minx + 1) as u64) * ((maxz - minz + 1) as u64))?;
     let r2 = radius * radius;
     for z in minz..=maxz {
+        ws.work(1)?;
         for x in minx..=maxx {
             let c = chf.cells[(x + z * chf.width) as usize];
             let cx = chf.bmin[0] + (x as f32 + 0.5) * chf.cs;

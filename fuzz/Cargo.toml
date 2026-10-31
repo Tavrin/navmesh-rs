@@ -11,6 +11,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+rayon = { version = "1.11", optional = true }
 navmesh-rs = { path = ".." }
 navmesh-parity = { path = "../parity" }
 
@@ -51,3 +52,14 @@ path = "fuzz_targets/tilecache_update.rs"
 test = false
 doc = false
 bench = false
+
+[features]
+parallel = ["navmesh-rs/parallel", "dep:rayon"]
+
+[[bin]]
+name = "parallel_bake"
+path = "fuzz_targets/parallel_bake.rs"
+test = false
+doc = false
+bench = false
+required-features = ["parallel"]
