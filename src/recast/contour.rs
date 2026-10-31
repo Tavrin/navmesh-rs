@@ -2,7 +2,7 @@
 
 use alloc::vec::Vec;
 
-use super::area::check_chf;
+use super::detail::check_surface_chf;
 use super::{
     AREA_BORDER, BORDER_REG, BORDER_VERTEX, CONTOUR_REG_MASK, CompactHeightfield, NOT_CONNECTED,
     dir_offset_x, dir_offset_y,
@@ -62,7 +62,7 @@ impl ContourSet {
         build_flags: i32,
     ) -> Result<ContourSet, Error> {
         ws.begin();
-        check_chf(ws, chf)?;
+        check_surface_chf(ws, chf)?;
         let w = chf.width;
         let h = chf.height;
         let border = chf.border_size;

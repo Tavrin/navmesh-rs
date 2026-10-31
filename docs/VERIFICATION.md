@@ -838,3 +838,102 @@ terrain_large_tiled: instruction millions / wall milliseconds per complete bake,
 | mesh | 112.23 / 16.73 | 112.23 / 20.08 | 80.64 / 15.07 |
 | detail | 1245.69 / 78.92 | 1229.96 / 97.69 | 164.80 / 24.17 |
 | tile | 40.36 / 38.68 | 40.36 / 48.62 | 23.44 / 7.12 |
+
+## Structural terrain-stage validation diagnosis
+
+Instruction sampling (`perf record -e instructions:u -c 50000 -g`) and
+`perf annotate --stdio` on release Rust and the pinned C++ oracle locate the
+large detail-mesh gap in `area::check_chf`, called once at entry to each public
+stage. The solo compact field contains **11,648,569 cells and 5,594,809 spans**.
+The existing dense specialization requires one span in every cell, so this
+sparse field takes the general four-direction connection-validation loop.
+C++ performs no equivalent full-field validation in `rcBuildPolyMeshDetail` or
+`rcBuildContours`.
+
+Separate diagnostic probes measured **801.64 million instructions** validating
+the solo field at each stage entry. Actual detail construction used **24.36
+million**, compared with **31.33 million** for C++; contour construction used
+**613.38 million**, compared with **559.02 million** for C++. Thus validation
+accounts for about **97% of the detail stage** and **57% of contours** before
+this change. This is additional whole-grid work, rather than extra per-polygon
+sampling or triangulation. The stage totals below exclude these nested probes;
+their syscall/printing overhead is material when accumulated across small tiles.
+
+Independent counting builds produced exactly the same helper counts in Rust
+and C++, including the same total polygon-height-patch area:
+
+| Helper or loop bound (each implementation) | Solo | Tiled sum |
+|---|---:|---:|
+| Detail polygons / height patches / hull triangulations | 1,570 | 11,297 |
+| Height samples (`getHeight`) | 14,034 | 90,114 |
+| Total height-patch cells | 98,961 | 425,355 |
+| Interior distance-to-polygon / distance-to-triangle-mesh calls | 0 | 0 |
+| Delaunay hull / edge lookup / facet completion calls | 0 | 0 |
+| Contour walks / simplifications | 349 | 7,740 |
+| Contour corner-height calls | 23,964 | 156,530 |
+| Contour point-to-segment distance calls | 78,838 | 371,978 |
+| Contour hole merges | 0 | 2 |
+
+The fix is confined to detail and contour entry validation. A shared private
+validator checks single-layer cell ranges and connections in one row pass,
+using adjacent row slices and packed connection masks. Empty cells need a range
+check; they do not each need four neighbouring-span lookups. Multilayer or
+noncanonical connections fall back to the general validator. Finite work
+budgets use the original path, including its exact error and charging order.
+There is no validation cache, new public API, or unchecked-input bypass.
+Differential regressions compare errors and work accounting with the original
+validator across every direction/layer, cell edits, unused/aliased spans,
+empty blocks and rows, and finite budgets.
+
+Rejected experiments are retained separately: a block-based shortcut still
+scanned neighbours of almost every empty cell (363,189 of 364,018 solo blocks
+mixed occupied and empty cells); a contour row-iterator rewrite increased
+instructions and was removed. An initial counter build had a C++ destructor
+symbol collision; corrected per-module destructors produce the matching counts
+above. An initial regression incorrectly compared unlimited dense-error
+accounting with the finite-budget path; the corrected test compares matching
+paths. A scratch-artifact cache collision selected a diagnostic binary during
+one parity attempt; accepted builds force recompilation before copying each
+binary. These attempts are excluded from accepted performance and gate results.
+
+### Retained measurements
+
+Baseline source is `b79a953e8d2c486529f284bed05986d2c6db909e`. The final
+comparison uses default 64-bit poly refs, Rust 1.98.1 and GCC 13.3.0 on the
+Ryzen 9 7945HX, CPU 6,
+with three interleaved before/C++/after rounds per case. Hardware instructions
+exclude kernel/hypervisor work. Only the matching outer stage boundaries are
+instrumented; tiled entries sum all tiles. Values are medians of each round's
+stage totals. Wall times come from a shared machine and are observations,
+not an isolated throughput guarantee.
+
+| Case | Stage | Before M instructions / ms | After M instructions / ms | C++ M instructions / ms | Before → after / C++ instructions |
+|---|---|---:|---:|---:|---:|
+| terrain_large_solo | detail | 826.00 / 54.45 | 303.71 / 26.08 | 31.33 / 4.23 | 26.363 → 9.693 |
+| terrain_large_solo | contours | 1415.01 / 107.89 | 892.73 / 81.69 | 559.02 / 63.11 | 2.531 → 1.597 |
+| terrain_large_tiled | detail | 1229.96 / 77.40 | 528.98 / 46.79 | 164.80 / 21.75 | 7.463 → 3.210 |
+| terrain_large_tiled | contours | 2034.76 / 169.33 | 1333.78 / 134.27 | 887.25 / 105.35 | 2.293 → 1.503 |
+
+Detail instructions fall **63.2% solo / 57.0% tiled**; contours fall **36.9% /
+34.5%**. The **at-most-1.1x C++ target is not reached for either stage**.
+Full-field input validation remains material, and C++ has no corresponding
+pass. The retained change preserves these checks and the existing contour and
+detail algorithms.
+
+Retained receipts include the three-round `final-<case>-<implementation>-<round>.tsv`
+stage logs, `profile-binaries.sha256`, instruction-sampling reports and assembly
+annotations (`report-final.txt`, `annotate-final.txt`), and independent
+`counts-<case>-<implementation>.tsv` helper counters. Hardware-counter FFI and
+counter instrumentation exist only in temporary profiling copies; the library
+keeps its unsafe-code prohibition. Binary/source hashes and the numerical
+summary are retained with the run receipts. Earlier experiments and failed
+checks remain separate from this final source and measurement set.
+
+Final validation returned **0** for formatting, all CI Clippy feature sets with
+warnings denied, tests and doctests, parallel and 32-bit configurations, both
+native no_std configurations, wasm32, documentation, Rust 1.88, and the
+public-text guard. All **76,018 parity records** (38,009 in each reference width)
+match C++, and all **3,035 determinism digests** match the unchanged golden file.
+All five tiled cases retain serial/parallel identity at 1, 2, 4, 8 and 16 threads
+in both reference widths. These results qualify output identity and the measured
+instruction reductions; they do not establish the unmet 1.1x performance target.
