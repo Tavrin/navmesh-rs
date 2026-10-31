@@ -485,13 +485,101 @@ fixing a constant-chunk iterator lint in the new regression.
   CPU-minutes per target) with no crash.
 - Limits: unit tests check that exhausted `Limits` give errors, not panics.
 
+## Cross-platform determinism
+
+Contract. With the `libm` feature, every recorded output (Recast stage records, Detour tile
+bytes, query results, crowd trajectories, tile-cache layers and rebuilt tiles) of the cases below
+is byte-identical on x86-64 Linux, AArch64 Linux and wasm32. The default `std` build is identical
+to the C++ oracle on x86-64 glibc (above) and can differ in the last bit on other platforms where
+`cos`/`sin` are called. The `libm` build is a separate contract: it is not compared with the C++
+library and need not equal the default build, although on this corpus on x86-64 Linux the two
+produce the same digests (no `cos`/`sin` result differs in the last bit).
+
+Sources of platform variance found and handled:
+
+- `cos`/`sin` (walkable slope, oriented-box obstacles, avoidance sampling): platform libm with
+  `std`, the `libm` crate with the feature. `sqrt`, `floor` and `ceil` are exact IEEE operations
+  and the same either way. No other transcendental, `powf`, `round` or `mul_add` is used.
+- FMA contraction: Rust never contracts `a * b + c`; the `libm` crate does not call `fma` in
+  `cosf`/`sinf`.
+- Sorting: stable sorts with upstream comparators; the unstable sorts are on totally ordered
+  integer keys, where equal keys are indistinguishable.
+- Hash iteration: none. The hashes (vertex, proximity grid, tile cache, node pool) are integer
+  and masked, so `usize` width does not change a bucket.
+- Pointer width: only the byte accounting (`Usage::bytes`, `Limits::max_bytes`) depends on it;
+  outputs do not. Work accounting is in `u64`.
+- NaN bit patterns: records compare float bit patterns; none differed on wasm32.
+
+Check. `reference/determinism.sh` bakes eight cases that use only downloaded meshes
+(`reference/corpus/fetch.sh --public-only`: solo, tiled and tile-cache builds, queries, crowds,
+obstacle scripts), writes one line per record (`case record length digest`) and one per case for
+the whole stream, and compares them with the committed `reference/determinism.golden` (3,035
+lines). It needs no C++ oracle. CI runs it on x86-64 Linux, AArch64 Linux (`ubuntu-24.04-arm`) and
+wasm32 (`wasm32-wasip1` under wasmtime).
+
+Results at the commit that added it:
+
+| Target | Run | Result |
+|---|---|---|
+| x86-64 Linux, `libm` | local | 3,035 digests equal the golden file |
+| wasm32-wasip1 (wasmtime 50.0.1), `libm` | local | 3,035 digests equal the golden file |
+| AArch64 Linux, `libm` | CI only | not run locally |
+| x86-64 Linux, default `std` | local | digests equal those of the sources before the budget and link changes (identity of the default build) |
+
+## Work budgets
+
+Upstream budgets only the sliced A*. Every Detour query that can walk an unbounded part of the
+navmesh now has a budgeted form taking a `Budget`, and `Crowd::update_budgeted` bounds a crowd
+tick. One unit is one expansion: a polygon popped from a search, a polygon a raycast enters, a
+portal the string-pulling funnel examines, a tile or candidate polygon of a box query. A charge
+that does not fit is refused before the work is done, so a call never spends more than its
+budget. Unbudgeted calls are unchanged and run the same per-polygon code.
+
+`nav-port budget <case>` checks every budgeted form over the case's query set: with a sufficient
+budget (and for the resumable searches, stepped eight units at a time) the result equals the
+unbudgeted call, and no call or step spends more than its budget. CI runs it on `nav_test_solo`
+and `dungeon_tiled` (63 random query pairs each, all equal, none over budget). Worst work per call
+(units) and worst wall time (microseconds, release build, one x86-64 machine, noisy at this
+scale), `nav_test_solo`:
+
+| query | 1 | 16 | 64 | 256 | 1024 | unlimited |
+|---|---|---|---|---|---|---|
+| find_path | 1 / 0.4 | 16 / 1.9 | 64 / 10.0 | 77 / 7.0 | 77 / 6.9 | 77 / 5.2 |
+| find_straight_path | 1 / 0.3 | 16 / 0.8 | 33 / 1.1 | 33 / 0.8 | 33 / 0.8 | 33 / 0.8 |
+| query_polygons | 1 / 1.4 | 16 / 0.8 | 64 / 1.4 | 156 / 1.4 | 156 / 2.5 | 156 / 1.3 |
+| find_random_point | 1 / 0.1 | 16 / 0.3 | 64 / 0.9 | 156 / 2.2 | 156 / 1.5 | 156 / 1.5 |
+| polys_around_circle | 1 / 4.0 | 16 / 4.1 | 64 / 33.9 | 77 / 8.3 | 77 / 6.6 | 77 / 5.9 |
+| distance_to_wall | 1 / 2.1 | 5 / 5.0 | 5 / 1.6 | 5 / 1.6 | 5 / 1.5 | 5 / 1.5 |
+| local_neighbourhood | 1 / 2.4 | 16 / 12.7 | 64 / 76.5 | 64 / 66.5 | 64 / 58.3 | 64 / 73.2 |
+| move_along_surface | 1 / 1.4 | 16 / 8.5 | 61 / 7.1 | 61 / 7.3 | 61 / 5.4 | 61 / 3.4 |
+| raycast | 1 / 0.5 | 8 / 0.8 | 8 / 0.4 | 8 / 0.3 | 8 / 0.3 | 8 / 0.3 |
+
+On `dungeon_tiled` the unlimited worst cases are 172 units for `find_path`, 183 for
+`query_polygons`, 89 for `polys_around_circle` and 11 for `raycast`. The searches are bounded by
+the query's node pool (`max_nodes`) and the local ones by their 64-node pool, so the budget
+matters most for large pools and long raycasts. The crowd tick is not resumable (its phases
+depend on each other): `update_budgeted` leaves the crowd untouched when the budget cannot cover
+the up-front charge, and otherwise reports `Exhausted` with the caveat of `LimitExceeded` from
+`update` (earlier phases applied; discard the tick).
+
+## Global off-mesh links
+
+`NavMesh::set_global_off_mesh_links(true)` lets a connection resolve its far endpoint in any
+loaded tile. `tests/detour.rs` covers the minimal repro (tile size 1, quads in tiles (0,0) and
+(10,0), a bidirectional connection between their centres): no path without the option, a path
+with it, in either order of loading, and after removing and re-adding either tile; enabling and
+disabling after loading relinks and unlinks. The default is unchanged because the extension only
+adds links for pairs of tiles that upstream does not resolve.
+
 ## Not covered yet
 
 - Compressed codecs beyond raw storage are supplied by applications and are not
   compared.
-- Only x86-64 Linux with glibc has been compared with upstream. Other platforms can differ in the
-  last bit where upstream calls `cos`/`sin`; the `libm` feature has not been compared with the
-  driver.
+- Only x86-64 Linux with glibc has been compared with upstream, and only with the default
+  `std` feature. Other platforms can differ in the last bit where upstream calls `cos`/`sin`;
+  the `libm` feature is held to the cross-platform contract above, not to the driver.
+- The determinism check covers the cases whose meshes are downloaded; the procedural meshes need
+  the oracle's generator and are not in the golden file. AArch64 is verified by CI only.
 - Queries on invalid refs where upstream copies uninitialised data (the hit normal of the plain
   `raycast`) are not in the query set.
 - Tile state save and restore (`storeTileState` / `restoreTileState`) and big-endian tile data

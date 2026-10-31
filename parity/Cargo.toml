@@ -15,6 +15,8 @@ default = ["polyref64"]
 # Build the port with 64-bit poly refs (off: 32-bit, to compare with the 32-bit oracle).
 polyref64 = ["navmesh-rs/polyref64"]
 parallel = ["navmesh-rs/parallel", "dep:rayon"]
+# Floating-point functions from the `libm` crate on every target (cross-platform determinism).
+libm = ["navmesh-rs/libm"]
 
 [dependencies]
 navmesh-rs = { path = "..", default-features = false, features = ["std", "recast", "detour", "crowd", "tilecache"] }

@@ -44,3 +44,56 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - run: cargo check --locked -p navmesh-rs --lib
+  # Cross-platform determinism with the `libm` feature: the record digests of the
+  # public corpus must equal reference/determinism.golden on every target.
+  determinism:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: x86-64 Linux
+            os: ubuntu-24.04
+          - name: AArch64 Linux
+            os: ubuntu-24.04-arm
+    name: determinism, ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    env:
+      NAV_CORPUS_DIR: ${{ github.workspace }}/../nav-corpus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash reference/corpus/fetch.sh --public-only
+      - run: reference/determinism.sh
+  determinism-wasm32:
+    name: determinism, wasm32 (wasmtime)
+    runs-on: ubuntu-24.04
+    env:
+      NAV_CORPUS_DIR: ${{ github.workspace }}/../nav-corpus
+      WASMTIME_VERSION: v50.0.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - name: install wasmtime
+        run: |
+          curl -fsSL "https://github.com/bytecodealliance/wasmtime/releases/download/${WASMTIME_VERSION}/wasmtime-${WASMTIME_VERSION}-x86_64-linux.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasmtime-${WASMTIME_VERSION}-x86_64-linux" >> "$GITHUB_PATH"
+      - run: bash reference/corpus/fetch.sh --public-only
+      - name: wasm32 digests equal the golden file
+        run: |
+          NAV_TARGET=wasm32-wasip1 \
+          NAV_RUNNER="wasmtime run --dir $PWD --dir $NAV_CORPUS_DIR --env NAV_CORPUS_DIR=$NAV_CORPUS_DIR" \
+          reference/determinism.sh
+  # Budgeted and resumable queries over the corpus: equal to the plain calls when the
+  # budget suffices, never over budget.
+  budgets:
+    runs-on: ubuntu-24.04
+    env:
+      NAV_CORPUS_DIR: ${{ github.workspace }}/../nav-corpus
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash reference/corpus/fetch.sh --public-only
+      - run: cargo run --locked --release -p navmesh-parity --bin nav-port -- budget reference/cases/nav_test_solo.case
+      - run: cargo run --locked --release -p navmesh-parity --bin nav-port -- budget reference/cases/dungeon_tiled.case
