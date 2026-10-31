@@ -2,7 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use navmesh_rs::crowd::{AgentId, AgentParams, Crowd};
 use navmesh_rs::detour::{NavMesh, NavMeshCreateParams, create_nav_mesh_data};
-use navmesh_rs::{Limits, Workspace};
+use navmesh_rs::{Budget, Budgeted, Limits, Workspace};
 fuzz_target!(|data: &[u8]| {
     let n = 0xffff;
     let Ok(tile) = create_nav_mesh_data(&NavMeshCreateParams {
@@ -42,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
             ))
         });
         let id = AgentId((chunk[12] % 8) as usize);
-        match chunk[13] % 6 {
+        match chunk[13] % 7 {
             0 => {
                 let _ = crowd.add_agent(&mut ws, &nav, v, AgentParams::default());
             }
@@ -59,8 +59,19 @@ fuzz_target!(|data: &[u8]| {
             4 => {
                 let _ = crowd.reset_move_target(id);
             }
-            _ => {
+            5 => {
                 let _ = crowd.update(&mut ws, &nav, v[0]);
+            }
+            _ => {
+                // A tick under a budget taken from the two tail bytes: 0 and 1 refuse
+                // the up-front charge; larger values reach later phases.
+                let t = u64::from(u16::from_le_bytes([chunk[14], chunk[15]]));
+                let mut budget = Budget::new(if t < 4 { t } else { t * 256 });
+                let r = crowd.update_budgeted(&mut ws, &nav, v[0], &mut budget);
+                assert!(budget.used() <= budget.limit(), "budget overspent");
+                if matches!(r, Ok(Budgeted::Exhausted(()))) {
+                    assert!(budget.is_exhausted(), "exhausted without a refusal");
+                }
             }
         }
         let _ = crowd.update(&mut ws, &nav, 1. / 30.);

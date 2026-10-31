@@ -63,3 +63,10 @@ test = false
 doc = false
 bench = false
 required-features = ["parallel"]
+
+[[bin]]
+name = "budgeted_query"
+path = "fuzz_targets/budgeted_query.rs"
+test = false
+doc = false
+bench = false
