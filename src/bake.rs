@@ -124,6 +124,8 @@ pub struct BakeConfig {
     /// may be counted twice, including empty tiles. Excludes allocator metadata,
     /// thread stacks and rayon-owned storage. Failure has no tile location.
     pub max_total_bytes: usize,
+    /// Reject incomplete ear clipping (not in recastnavigation). Defaults to false.
+    pub strict_triangulation: bool,
 }
 
 impl Default for BakeConfig {
@@ -155,6 +157,7 @@ impl Default for BakeConfig {
             walkable_climb: 0.9,
             tile_limits: Limits::default(),
             max_total_bytes: usize::MAX,
+            strict_triangulation: false,
         }
     }
 }
@@ -192,6 +195,8 @@ pub struct Tile {
     pub y: i32,
     /// Original DNAV bytes, or `None` when the tile contains no polygons.
     pub data: Option<Vec<u8>>,
+    /// Partial ear-clipping counts (not in recastnavigation).
+    pub triangulation: recast::TriangulationReport,
 }
 
 /// Ordered tiles and their Detour layout; not in recastnavigation.
@@ -519,7 +524,7 @@ fn build_tile(
     volume_bucket: &[usize],
     x: i32,
     y: i32,
-) -> Result<Option<Vec<u8>>, Error> {
+) -> TileResult {
     let mut tw = TileWorkspace {
         ws: Workspace::new(),
         limits: c.tile_limits,
@@ -538,7 +543,7 @@ fn build_tile_in_workspace(
     x: i32,
     y: i32,
     tw: &mut TileWorkspace,
-) -> Result<Option<Vec<u8>>, Error> {
+) -> TileResult {
     let (tris, mut areas) = tw.stage(|ws| {
         work(ws, bucket.len())?;
         let mut tris =
@@ -640,7 +645,14 @@ fn build_tile_in_workspace(
             recast::CONTOUR_TESS_WALL_EDGES,
         )
     })?;
-    let mut mesh = tw.stage(|ws| PolyMesh::build(ws, &contours, cfg.max_verts_per_poly))?;
+    let (mut mesh, report) = tw.stage(|ws| {
+        PolyMesh::build_with_report(
+            ws,
+            &contours,
+            cfg.max_verts_per_poly,
+            c.strict_triangulation,
+        )
+    })?;
     tw.stage(|ws| {
         work(ws, mesh.areas.len())?;
         for (a, f) in mesh.areas.iter_mut().zip(&mut mesh.flags) {
@@ -672,7 +684,7 @@ fn build_tile_in_workspace(
         )
     })?;
     if mesh.npolys == 0 {
-        return Ok(None);
+        return Ok((None, report));
     }
     let params = NavMeshCreateParams {
         verts: &mesh.verts,
@@ -731,7 +743,7 @@ fn build_tile_in_workspace(
         }
         // Validate the produced tile against all caller-specified format limits.
         detour::check_bake_tile_limits(&data, &c.tile_limits)?;
-        Ok(Some(data))
+        Ok((Some(data), report))
     })
 }
 
@@ -781,13 +793,16 @@ fn bake(
     work(ws, p.configs.len())?;
     let mut output = ws.vec_with_capacity::<Tile>(p.configs.len())?;
     // Slots are allocated fallibly and byte-charged before rayon sees them.
-    let mut results = ws.vec(p.configs.len(), Ok(None))?;
+    let mut results = ws.vec(
+        p.configs.len(),
+        Ok((None, recast::TriangulationReport::default())),
+    )?;
     let columns = p.columns;
     let coord = |i: usize| -> Result<(i32, i32), Error> {
         let i = i32::try_from(i).map_err(|_| Error::SizeOverflow)?;
         Ok((i % columns, i / columns))
     };
-    let build = |i: usize| -> Result<Option<Vec<u8>>, Error> {
+    let build = |i: usize| -> TileResult {
         let (x, y) = coord(i)?;
         build_tile(
             input,
@@ -802,11 +817,16 @@ fn bake(
     fill_results(&mut results, parallel, build);
     for (i, result) in results.into_iter().enumerate() {
         let (x, y) = coord(i)?;
-        let data = result.map_err(|error| BakeError {
+        let (data, triangulation) = result.map_err(|error| BakeError {
             tile: Some([x, y]),
             error,
         })?;
-        output.push(Tile { x, y, data });
+        output.push(Tile {
+            x,
+            y,
+            data,
+            triangulation,
+        });
     }
     Ok(BakedTiles {
         params: p.params,
@@ -846,7 +866,7 @@ fn check_total_bytes(
     Ok(())
 }
 
-type TileResult = Result<Option<Vec<u8>>, Error>;
+type TileResult = Result<(Option<Vec<u8>>, recast::TriangulationReport), Error>;
 
 fn fill_results(
     results: &mut [TileResult],
@@ -1033,7 +1053,7 @@ mod tests {
                     &mut tw,
                 )
                 .unwrap();
-                assert!(data.is_some());
+                assert!(data.0.is_some());
                 work += tw.usage.work;
                 if n == 8 {
                     let all: Vec<_> = (0..volumes.len()).collect();
@@ -1092,7 +1112,8 @@ mod tests {
             .num_threads(4)
             .build()
             .unwrap();
-        let mut results = [Ok(None), Ok(None), Ok(None), Ok(None)];
+        let mut results =
+            core::array::from_fn::<_, 4, _>(|_| Ok((None, recast::TriangulationReport::default())));
         pool.install(|| {
             fill_results(&mut results, true, |i| {
                 if i == 1 {
@@ -1101,7 +1122,7 @@ mod tests {
                 } else if i == 3 {
                     Err(Error::Failed)
                 } else {
-                    Ok(None)
+                    Ok((None, recast::TriangulationReport::default()))
                 }
             })
         });

@@ -586,3 +586,160 @@ adds links for pairs of tiles that upstream does not resolve.
   are not ported.
 - The records were produced on one machine; a second machine and a CI job that rebuilds the
   driver are not set up.
+
+## Query and large-terrain optimization qualification
+
+The 200-pair `bench-paths` command in both drivers measures one nearest-polygon
+query, one path search, and one ordinary straight-path query per pair. The drivers
+use the same seeded random endpoints, node capacity (2,048), corridor capacity
+(256), filter and nearest-query extents. Query/filter initialization and endpoint
+generation precede the timed loop. Rust reuses its corridor and corner vectors.
+Each instruction sample subtracts a one-batch process from a 101-batch process,
+then divides by 20,000 pairs. This removes geometry loading, baking, assembly and
+endpoint generation from the instruction estimate. Results describe this query
+corpus, including partial paths when the 256-polygon capacity is insufficient;
+they do not predict the cost of arbitrary authored queries.
+
+The comparison uses release Rust and the pinned 64-bit C++ oracle, three
+interleaved rounds on one fixed CPU, with medians reported. Stage measurements
+use temporary instrumented source copies, per-thread Linux hardware instruction
+counters excluding kernel/hypervisor work, and wall clocks at matching pipeline
+boundaries. Stages include setup/marking, rasterization, filters, compact-field
+construction, erosion/marking, distance field, regions, contours, polygon mesh,
+detail mesh and tile creation. Per-stage counters exclude OBJ parsing, triangle
+bucketing and final navmesh assembly. Summed per-tile wall times describe worker
+work, not parallel elapsed time. End-to-end `bench-tiles --threads 16` includes
+validation, bucketing, all tile work and ordered insertion, excluding OBJ parsing
+and pool startup. Wall timings were collected on a shared machine and are not an
+isolated throughput guarantee.
+
+The first sparse node-reset candidate was discarded after inconsistent query
+results; the bulk reset remains. Polygon traversal streams candidates without a
+temporary Vec. Concrete filters specialize the path and nearest-polygon search;
+trait-object filters remain supported. Rasterization swaps distinct buffer
+references in the same order as upstream's pointer swaps. The default heuristic,
+filter arithmetic, tie breaks and clipping operations remain unchanged.
+
+Float import preserves the supplied base-vertex bits, including signed zero.
+Only optional BV bounds are quantized; there is no base-vertex grid round trip.
+The wide-extent regression retains a 0.0001-unit polygon beside a polygon at
+10,000 units. Dijkstra regression coverage includes a positive-cost direct route
+and a cheaper geometric detour through zero-cost off-mesh links. Triangulation
+regressions distinguish upstream-compatible partial output from strict typed
+failure; reports count incomplete contours and missing expected triangles.
+
+On the final source, all 21 cases compare exactly against the pinned C++ oracle
+in both reference widths: **76,018 records, zero mismatches**. All five tiled
+cases also retain serial-driver/serial-API/parallel-API identity at 1, 2, 4, 8 and
+16 threads in both widths. The unchanged golden file matches all **3,035** record
+digests. Default tests (99 unit/integration tests and 15 doctests), both-width
+and parallel feature checks, CI Clippy configurations with warnings denied,
+native no_std variants, wasm32, documentation, formatting, the public-text guard,
+and Rust 1.88 checks pass. Opt-in extension semantics are covered by Rust
+regressions; they have no C++ equivalent.
+
+An initial profiling attempt reused cached artifacts across temporary source
+copies and was rejected. Accepted stage copies were rebuilt and their binary
+identities checked. The final ordinary query binary is rebuilt after cleaning
+only the two packages' release artifacts in the dedicated measurement target.
+The public crate retains its unsafe-code prohibition; hardware-counter FFI exists
+only in temporary instrumented copies. Earlier failed validation and profiling
+attempts remain separate from the accepted measurements.
+
+### Measurements
+
+Measured on an AMD Ryzen 9 7945HX, Rust 1.98.1 and GCC 13.3.0. Each query
+row is the median of three instruction-difference samples. The equally weighted
+21-case mean fell from **39,107 to 36,998 instructions per
+route pipeline (5.4% fewer)**. C++ used **29,293**;
+the port remains **1.263x C++**, so the at-or-below-C++ query target
+was **not reached**. These are route-pipeline counts (nearest + path + funnel),
+not instructions for each individual helper in isolation.
+
+For 200 terrain routes, solo median timed-loop wall cost was 0.145 ms before,
+0.151 ms after, and 0.136 ms for C++; tiled cost was 0.112, 0.108 and 0.099 ms.
+The core solo bake used 32.21 billion instructions before and 31.56 billion after
+(C++: 26.21 billion); tiled used 45.48 and 44.56 billion (C++: 36.66 billion).
+Rasterization instruction counts fell 4.1% solo and 3.9% tiled; total core-bake
+counts fell about 2%. Validation remains a material part of Rust's stage cost.
+
+Uninstrumented end-to-end 16-thread tiled bake samples were 890.041, 1040.917,
+811.025 ms before and 999.106, 861.894, 934.004 ms after: medians **890.041 and
+934.004 ms**. A separately timed C++ 16-thread run had a **383.741 ms** median.
+These shared-machine runs establish an absolute measured tiled bake below one
+second at the median, but **do not establish a wall-time improvement** or an
+isolated Rust/C++ throughput ratio. The parallel stage table below is a separate
+single instrumented run; its summed worker milliseconds are not elapsed time.
+No consumer scene replay or production timeout acceptance is inferred.
+
+| 200-pair case | Before instructions/pair | After | C++ | After/C++ |
+|---|---:|---:|---:|---:|
+| corridors_solo | 9,404 | 9,016 | 7,462 | 1.208 |
+| degenerate_solo | 13,257 | 12,665 | 10,309 | 1.229 |
+| dungeon_solo | 46,573 | 44,503 | 36,106 | 1.233 |
+| dungeon_tilecache | 53,645 | 51,032 | 40,804 | 1.251 |
+| dungeon_tiled | 63,672 | 60,276 | 48,185 | 1.251 |
+| godot_level_solo | 27,869 | 26,073 | 20,702 | 1.259 |
+| islands_offmesh | 4,990 | 4,674 | 3,965 | 1.179 |
+| multilevel_solo | 18,190 | 17,310 | 14,162 | 1.222 |
+| multilevel_tilecache | 51,455 | 47,987 | 38,023 | 1.262 |
+| nav_test_areas | 41,504 | 38,881 | 31,008 | 1.254 |
+| nav_test_solo | 30,964 | 29,204 | 23,263 | 1.255 |
+| nav_test_tiled | 81,898 | 75,792 | 59,937 | 1.265 |
+| queued_tilecache | 51,455 | 47,987 | 38,023 | 1.262 |
+| seams_tilecache | 13,273 | 12,847 | 10,206 | 1.259 |
+| seams_tiled | 14,387 | 13,923 | 10,877 | 1.280 |
+| slopes_solo | 17,920 | 17,147 | 14,031 | 1.222 |
+| stairs_monotone | 21,476 | 20,468 | 16,838 | 1.216 |
+| terrain_large_solo | 12,008 | 11,391 | 9,364 | 1.217 |
+| terrain_large_tiled | 9,312 | 8,811 | 6,861 | 1.284 |
+| terrain_small_tiled | 185,757 | 175,894 | 138,076 | 1.274 |
+| undulating_crowd | 52,232 | 51,086 | 36,956 | 1.382 |
+
+terrain_large_solo: instruction millions / wall milliseconds per complete bake, summed across tiles.
+
+| Stage | Before | After | C++ |
+|---|---:|---:|---:|
+| setup | 372.28 / 62.20 | 372.28 / 58.48 | 141.26 / 71.36 |
+| raster | 15815.60 / 903.73 | 15166.73 / 946.91 | 14208.54 / 1018.17 |
+| filters | 2573.07 / 145.03 | 2573.07 / 176.59 | 2310.65 / 201.43 |
+| compact | 2114.95 / 204.43 | 2114.95 / 248.04 | 2370.82 / 224.64 |
+| erode | 2823.11 / 221.56 | 2823.11 / 261.02 | 1912.52 / 195.94 |
+| distance | 3456.49 / 299.16 | 3456.49 / 378.23 | 2427.25 / 227.67 |
+| regions | 2750.77 / 562.60 | 2750.77 / 566.92 | 2211.37 / 552.89 |
+| contours | 1426.66 / 121.45 | 1426.66 / 124.95 | 559.02 / 70.60 |
+| mesh | 32.07 / 2.23 | 32.10 / 2.31 | 26.59 / 2.65 |
+| detail | 837.65 / 63.28 | 837.65 / 66.14 | 31.33 / 4.06 |
+| tile | 6.95 / 15.04 | 7.02 / 15.64 | 6.95 / 14.69 |
+
+terrain_large_tiled: instruction millions / wall milliseconds per complete bake, summed across tiles.
+
+| Stage | Before | After | C++ |
+|---|---:|---:|---:|
+| setup | 550.93 / 58.14 | 550.93 / 57.67 | 209.93 / 43.31 |
+| raster | 23784.66 / 1134.86 | 22860.98 / 1086.42 | 21316.05 / 1261.49 |
+| filters | 3493.83 / 163.77 | 3493.83 / 162.31 | 3156.67 / 195.15 |
+| compact | 2839.91 / 231.21 | 2839.91 / 234.71 | 3168.35 / 198.44 |
+| erode | 3816.21 / 311.49 | 3816.21 / 310.24 | 2571.44 / 240.55 |
+| distance | 4668.50 / 353.93 | 4668.50 / 353.09 | 3257.76 / 294.35 |
+| regions | 2876.48 / 273.54 | 2876.48 / 273.60 | 1825.79 / 232.83 |
+| contours | 2050.49 / 150.83 | 2050.49 / 152.78 | 887.25 / 108.11 |
+| mesh | 111.86 / 14.91 | 112.23 / 14.92 | 80.64 / 14.66 |
+| detail | 1245.69 / 69.44 | 1245.69 / 69.17 | 164.80 / 22.65 |
+| tile | 39.73 / 32.53 | 40.36 / 32.38 | 23.44 / 6.64 |
+
+16-thread tiled stage profile: instruction millions / summed worker milliseconds (one instrumented run).
+
+| Stage | Before | After | C++ |
+|---|---:|---:|---:|
+| setup | 642.78 / 95.52 | 642.75 / 92.16 | 210.33 / 70.10 |
+| raster | 23785.98 / 1802.12 | 22862.26 / 1578.22 | 21316.20 / 2126.98 |
+| filters | 3493.03 / 246.41 | 3493.03 / 228.23 | 3156.81 / 323.79 |
+| compact | 2837.79 / 342.67 | 2837.79 / 334.95 | 3168.71 / 332.20 |
+| erode | 3813.54 / 423.48 | 3813.53 / 390.63 | 2571.70 / 377.65 |
+| distance | 4666.02 / 489.36 | 4666.02 / 447.85 | 3258.12 / 459.39 |
+| regions | 2882.01 / 381.69 | 2882.32 / 364.56 | 1829.84 / 355.60 |
+| contours | 2049.20 / 214.94 | 2049.16 / 205.41 | 889.14 / 159.32 |
+| mesh | 110.71 / 22.70 | 110.99 / 20.02 | 81.11 / 22.20 |
+| detail | 1244.40 / 118.69 | 1244.37 / 107.74 | 165.46 / 34.32 |
+| tile | 41.00 / 67.53 | 41.58 / 65.69 | 24.49 / 9.99 |

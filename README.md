@@ -270,3 +270,39 @@ the upstream licence is reproduced in [NOTICE](NOTICE).
 Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in
 this crate by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without
 any additional terms or conditions.
+
+### Float imports, heuristic control and build diagnostics
+
+These opt-in APIs are extensions not in recastnavigation. Existing entry points
+retain upstream defaults.
+
+`detour::create_nav_mesh_data_f32(&params, &world_vertices)` accepts existing
+world-space polygon vertices. Set `vert_count`, polygon indices and adjacency,
+flags, areas, bounds, and the other tile settings as for the quantized builder;
+`params.verts` is ignored. DNAV vertex coordinates preserve the supplied f32 bits.
+Bounds must contain every vertex. Only the optional BV tree bounds use a grid:
+choose `cs` so the extent on every axis divided by `cs` fits 65,535, or disable
+`build_bv_tree` for linear polygon scans. Import does not clip, weld, or infer
+adjacency. The polygon/index limits of DNAV still apply.
+
+`NavMeshQuery::find_path_with_heuristic_scale` takes the usual path arguments
+followed by a finite, nonnegative scale. Use `0.0` for Dijkstra when a filter has
+zero-cost links. For an admissible Euclidean heuristic, choose a scale no greater
+than the minimum traversal cost per world-space distance. The ordinary
+`find_path` keeps its upstream `0.999` scale. Path and nearest-polygon calls
+accept both concrete filters and `dyn QueryFilter`; concrete filters can be
+specialized by the compiler. For batches, reuse the query, filter, corridor Vec
+and straight-path Vec across calls so their storage is retained.
+
+`PolyMesh::build_with_report(workspace, contours, nvp, strict)` returns the mesh
+and a `TriangulationReport` counting incomplete contours and missing triangles.
+With `strict = true`, incomplete clipping returns `Error::PartialTriangulation`.
+The ordinary builder keeps upstream's partial-output behavior. The tile bake
+exposes the report on each `Tile::triangulation`; set
+`BakeConfig::strict_triangulation` to reject partial output, with the tile location
+carried by `BakeError`. Strict failures describe the first incomplete contour.
+
+For large terrain use `bake::tiles_parallel` inside a rayon pool with 16 threads;
+this includes triangle bucketing and ordered tile insertion when assembling the
+result. Performance measurements and qualification limits are recorded in
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md).

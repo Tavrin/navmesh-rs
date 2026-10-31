@@ -18,6 +18,16 @@ use crate::budget::spend_one;
 use crate::{Budget, Budgeted, Error};
 
 pub(crate) const H_SCALE: f32 = 0.999;
+
+#[inline]
+fn path_heuristic(a: &[f32; 3], b: &[f32; 3], scale: f32) -> f32 {
+    // Dijkstra must stay zero even when squared coordinate distances overflow.
+    if scale == 0.0 {
+        0.0
+    } else {
+        vdist(a, b) * scale
+    }
+}
 const DETAIL_MASK: u32 = 0x0ff_ffff;
 
 /// Polygon filter and traversal cost (`dtQueryFilter`).
@@ -504,11 +514,11 @@ impl<'a> NavMeshQuery<'a> {
     /// [`NavMeshQuery::query_polygons_with`] that stops as soon as `f` returns
     /// false. The scan covers only the resident tiles inside the box's tile range,
     /// so its cost is bounded by the navmesh, not by the box size.
-    fn query_polygons_until(
+    fn query_polygons_until<F: QueryFilter + ?Sized>(
         &self,
         center: &[f32; 3],
         half_extents: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
         f: &mut dyn FnMut(&MeshTile, usize, PolyRef) -> bool,
         budget: &mut Option<&mut Budget>,
     ) -> Result<(), Error> {
@@ -519,7 +529,6 @@ impl<'a> NavMeshQuery<'a> {
         let bmax = vadd(center, half_extents);
         let lo = self.nav.calc_tile_loc(&bmin);
         let hi = self.nav.calc_tile_loc(&bmax);
-        let mut buf = Vec::new();
         self.nav.for_tiles_in(lo, hi, &mut |ti| {
             let Some(tile) = self.nav.tile(ti) else {
                 return true;
@@ -528,20 +537,19 @@ impl<'a> NavMeshQuery<'a> {
                 return false;
             }
             let base = self.nav.base_ref(ti);
-            super::navmesh::query_polygons_in_tile(tile, &bmin, &bmax, &mut buf, usize::MAX);
-            for &ip in &buf {
+            super::navmesh::query_polygons_in_tile_with(tile, &bmin, &bmax, &mut |ip| {
                 if !spend_one(budget) {
                     return false;
                 }
                 let r = base | ip as PolyRef;
                 let Some(poly) = tile.polys.get(ip as usize) else {
-                    continue;
+                    return true;
                 };
                 if filter.pass_filter(r, tile, poly) && !f(tile, ip as usize, r) {
                     return false;
                 }
-            }
-            true
+                true
+            })
         });
         Ok(())
     }
@@ -620,11 +628,11 @@ impl<'a> NavMeshQuery<'a> {
     /// Nearest polygon to `center` within the box (`findNearestPoly`): ref (0 when
     /// none), nearest point (`center` copy semantics as upstream: only set when
     /// found) and whether `center` lies over the polygon.
-    pub fn find_nearest_poly(
+    pub fn find_nearest_poly<F: QueryFilter + ?Sized>(
         &self,
         center: &[f32; 3],
         half_extents: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
     ) -> Result<(PolyRef, [f32; 3], bool), Error> {
         self.find_nearest_poly_impl(center, half_extents, filter, &mut None)
     }
@@ -632,11 +640,11 @@ impl<'a> NavMeshQuery<'a> {
     /// [`NavMeshQuery::find_nearest_poly`] charged like
     /// [`NavMeshQuery::query_polygons_budgeted`] (not in recastnavigation). When
     /// the budget runs out the result is the nearest polygon among those tested.
-    pub fn find_nearest_poly_budgeted(
+    pub fn find_nearest_poly_budgeted<F: QueryFilter + ?Sized>(
         &self,
         center: &[f32; 3],
         half_extents: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
         budget: &mut Budget,
     ) -> Result<Budgeted<(PolyRef, [f32; 3], bool)>, Error> {
         let (r, exhausted) = budget
@@ -644,11 +652,11 @@ impl<'a> NavMeshQuery<'a> {
         Ok(Budgeted::of(r?, exhausted))
     }
 
-    fn find_nearest_poly_impl(
+    fn find_nearest_poly_impl<F: QueryFilter + ?Sized>(
         &self,
         center: &[f32; 3],
         half_extents: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
         budget: &mut Option<&mut Budget>,
     ) -> Result<(PolyRef, [f32; 3], bool), Error> {
         let mut nearest_d = f32::MAX;
@@ -737,18 +745,50 @@ impl<'a> NavMeshQuery<'a> {
     /// polygons. The status carries `PARTIAL_RESULT`, `OUT_OF_NODES` and
     /// `BUFFER_TOO_SMALL` like upstream.
     #[allow(clippy::too_many_arguments)]
-    pub fn find_path(
+    pub fn find_path<F: QueryFilter + ?Sized>(
         &mut self,
         start_ref: PolyRef,
         end_ref: PolyRef,
         start_pos: &[f32; 3],
         end_pos: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
         path: &mut Vec<PolyRef>,
         max_path: usize,
     ) -> Result<Status, Error> {
         self.find_path_impl(
-            start_ref, end_ref, start_pos, end_pos, filter, path, max_path, &mut None,
+            start_ref, end_ref, start_pos, end_pos, filter, path, max_path, H_SCALE, &mut None,
+        )
+    }
+
+    /// A* with a caller-selected Euclidean heuristic scale (not in recastnavigation).
+    /// The scale must be finite and nonnegative. Use 0 for Dijkstra, including
+    /// zero-cost links. For optimal search, the scale must lower-bound every
+    /// traversal cost per unit Euclidean distance. The default API uses 0.999.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_path_with_heuristic_scale<F: QueryFilter + ?Sized>(
+        &mut self,
+        start_ref: PolyRef,
+        end_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        filter: &F,
+        path: &mut Vec<PolyRef>,
+        max_path: usize,
+        heuristic_scale: f32,
+    ) -> Result<Status, Error> {
+        if !heuristic_scale.is_finite() || heuristic_scale < 0.0 {
+            return Err(Error::InvalidParameter("heuristic scale"));
+        }
+        self.find_path_impl(
+            start_ref,
+            end_ref,
+            start_pos,
+            end_pos,
+            filter,
+            path,
+            max_path,
+            heuristic_scale,
+            &mut None,
         )
     }
 
@@ -760,13 +800,13 @@ impl<'a> NavMeshQuery<'a> {
     /// [`find_path`](NavMeshQuery::find_path)'s result. For a search that continues
     /// across frames use the sliced forms, whose iteration count is their budget.
     #[allow(clippy::too_many_arguments)]
-    pub fn find_path_budgeted(
+    pub fn find_path_budgeted<F: QueryFilter + ?Sized>(
         &mut self,
         start_ref: PolyRef,
         end_ref: PolyRef,
         start_pos: &[f32; 3],
         end_pos: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
         path: &mut Vec<PolyRef>,
         max_path: usize,
         budget: &mut Budget,
@@ -780,6 +820,7 @@ impl<'a> NavMeshQuery<'a> {
                 filter,
                 path,
                 max_path,
+                H_SCALE,
                 &mut Some(b),
             )
         });
@@ -787,15 +828,16 @@ impl<'a> NavMeshQuery<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn find_path_impl(
+    fn find_path_impl<F: QueryFilter + ?Sized>(
         &mut self,
         start_ref: PolyRef,
         end_ref: PolyRef,
         start_pos: &[f32; 3],
         end_pos: &[f32; 3],
-        filter: &dyn QueryFilter,
+        filter: &F,
         path: &mut Vec<PolyRef>,
         max_path: usize,
+        heuristic_scale: f32,
         budget: &mut Option<&mut Budget>,
     ) -> Result<Status, Error> {
         path.clear();
@@ -822,7 +864,7 @@ impl<'a> NavMeshQuery<'a> {
             n.pos = *start_pos;
             n.pidx = 0;
             n.cost = 0.0;
-            n.total = vdist(start_pos, end_pos) * H_SCALE;
+            n.total = path_heuristic(start_pos, end_pos, heuristic_scale);
             n.id = start_ref;
             n.flags = NODE_OPEN;
         }
@@ -878,7 +920,7 @@ impl<'a> NavMeshQuery<'a> {
                     (bcost + cur + end, 0.0)
                 } else {
                     let cur = filter.cost(&bpos, &npos, parent, best, Some(nei));
-                    (bcost + cur, vdist(&npos, end_pos) * H_SCALE)
+                    (bcost + cur, path_heuristic(&npos, end_pos, heuristic_scale))
                 };
                 let total = cost + heuristic;
                 let n = &mut self.node_pool.nodes[nn];

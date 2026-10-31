@@ -265,6 +265,20 @@ pub(crate) fn query_polygons_in_tile(
     max: usize,
 ) {
     out.clear();
+    query_polygons_in_tile_with(tile, qmin, qmax, &mut |ip| {
+        if out.len() < max {
+            out.push(ip);
+        }
+        true
+    });
+}
+
+pub(crate) fn query_polygons_in_tile_with(
+    tile: &MeshTile,
+    qmin: &[f32],
+    qmax: &[f32],
+    visit: &mut impl FnMut(u32) -> bool,
+) -> bool {
     let h = &tile.header;
     if !tile.bv_tree.is_empty() {
         let tbmin = &h.bmin;
@@ -279,8 +293,8 @@ pub(crate) fn query_polygons_in_tile(
             let node = &tile.bv_tree[i];
             let overlap = overlap_quant_bounds(&bmin, &bmax, &node.bmin, &node.bmax);
             let leaf = node.i >= 0;
-            if leaf && overlap && out.len() < max {
-                out.push(node.i as u32);
+            if leaf && overlap && !visit(node.i as u32) {
+                return false;
             }
             if overlap || leaf {
                 i += 1;
@@ -301,11 +315,12 @@ pub(crate) fn query_polygons_in_tile(
                 vmin(&mut bmin, v);
                 vmax(&mut bmax, v);
             }
-            if overlap_bounds(qmin, qmax, &bmin, &bmax) && out.len() < max {
-                out.push(i as u32);
+            if overlap_bounds(qmin, qmax, &bmin, &bmax) && !visit(i as u32) {
+                return false;
             }
         }
     }
+    true
 }
 
 /// `findNearestPolyInTile`: nearest polygon index and point.

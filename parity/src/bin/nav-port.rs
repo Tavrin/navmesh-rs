@@ -1906,6 +1906,49 @@ fn bake_records(case: &Case, g: &Geometry, base: &str) -> (Vec<u8>, Result<(), S
     (bytes, res)
 }
 
+// The same 200-pair kernel is implemented in the C++ reference driver.
+fn bench_paths(c: &Case, g: &Geometry, repeat: usize) -> Result<(), String> {
+    let b = bake(c, g, &mut Sink { writer: None }).map_err(|e| e.to_string())?;
+    let nav = assemble(&b).map_err(|e| e.to_string())?;
+    let mut q = NavMeshQuery::new(&nav, 2048).map_err(|e| e.to_string())?;
+    let f = DefaultFilter::default();
+    let mut rng = Rng(if c.seed != 0 { c.seed } else { 1 });
+    let mut points = Vec::new();
+    for _ in 0..201 {
+        points.push(
+            q.find_random_point(&f, &mut || rng.frand())
+                .map_err(|e| e.to_string())?,
+        );
+    }
+    let mut path = Vec::with_capacity(256);
+    let mut straight = Vec::with_capacity(256);
+    let start = Instant::now();
+    for _ in 0..repeat {
+        for pair in points.windows(2) {
+            let (ra, a) = pair[0];
+            let (rb, b) = pair[1];
+            std::hint::black_box(
+                q.find_nearest_poly(&a, &[2.0, 4.0, 2.0], &f)
+                    .map_err(|e| e.to_string())?,
+            );
+            std::hint::black_box(
+                q.find_path(ra, rb, &a, &b, &f, &mut path, 256)
+                    .map_err(|e| e.to_string())?,
+            );
+            std::hint::black_box(
+                q.find_straight_path(&a, &b, &path, &mut straight, 256, 0)
+                    .map_err(|e| e.to_string())?,
+            );
+            std::hint::black_box(&straight);
+        }
+    }
+    println!(
+        "pairs=200 repeat={repeat} total_ms={:.6}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | bench <case> [--repeat N] | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
@@ -1954,6 +1997,10 @@ fn run() -> Result<(), String> {
             }
             println!("{name} * {} {whole:016x}", file.entries.len());
             Ok(())
+        }
+        "bench-paths" => {
+            let repeat = opt("--repeat").and_then(|v| v.parse().ok()).unwrap_or(1);
+            bench_paths(&case, &g, repeat)
         }
         "bench-queries" => {
             // One bake, then the plain query set `--repeat` times (no records).

@@ -6,6 +6,23 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- World-space float tile import with `create_nav_mesh_data_f32`; vertex floats are
+  preserved without a uniform-grid round trip.
+- `find_path_with_heuristic_scale`, including zero for Dijkstra searches with
+  zero-cost links or costs below one.
+- `PolyMesh::build_with_report`, typed partial-triangulation errors in strict
+  mode, and per-tile triangulation diagnostics in the bake results.
+- Matching 200-pair path/funnel/nearest-query benchmarks in both record drivers.
+
+### Changed
+
+- Specialize path and nearest-polygon queries for concrete filters while retaining
+  support for trait-object filters.
+- Stream polygon candidates to query callbacks without a temporary allocation.
+- Swap rasterization buffer references directly, preserving clipping order.
+
 ## [0.1.3] - 2026-10-31
 
 ### Added

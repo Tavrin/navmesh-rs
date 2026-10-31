@@ -37,7 +37,7 @@ pub use contour::{CONTOUR_TESS_AREA_EDGES, CONTOUR_TESS_WALL_EDGES, Contour, Con
 pub use detail::PolyMeshDetail;
 pub use heightfield::{Heightfield, Span};
 pub use layers::{HeightfieldLayer, HeightfieldLayerSet};
-pub use mesh::PolyMesh;
+pub use mesh::{PolyMesh, TriangulationReport};
 pub use region::{
     build_distance_field, build_layer_regions, build_regions, build_regions_monotone,
 };

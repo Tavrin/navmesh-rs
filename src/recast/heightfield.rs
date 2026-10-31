@@ -347,25 +347,24 @@ impl Heightfield {
         ws.work(((z1 - z0 + 1).max(0)) as u64)?;
 
         // Four polygon buffers whose roles (in, inRow, p1, p2) are permuted by
-        // index swaps, exactly like upstream's pointer swaps.
-        let mut bufs = [[0.0f32; 7 * 3]; 4];
-        bufs[0][0..3].copy_from_slice(v0);
-        bufs[0][3..6].copy_from_slice(v1);
-        bufs[0][6..9].copy_from_slice(v2);
-        let (mut i_in, mut i_row, mut i_p1, mut i_p2) = (0usize, 1usize, 2usize, 3usize);
+        // reference swaps, exactly like upstream's pointer swaps.
+        let mut a = [0.0f32; 7 * 3];
+        let mut b = [0.0f32; 7 * 3];
+        let mut c = [0.0f32; 7 * 3];
+        let mut d = [0.0f32; 7 * 3];
+        let (mut inp, mut row, mut p1, mut p2) = (&mut a, &mut b, &mut c, &mut d);
+        inp[0..3].copy_from_slice(v0);
+        inp[3..6].copy_from_slice(v1);
+        inp[6..9].copy_from_slice(v2);
         let mut nv_in = 3usize;
         for z in z0..=z1 {
             let cell_z = bmin[2] + z as f32 * cs;
-            let [inp, row, p1] = bufs
-                .get_disjoint_mut([i_in, i_row, i_p1])
-                .map_err(|_| Error::SizeOverflow)?;
             let (nv_row, nv_rest) = divide_poly(&inp[..], nv_in, row, p1, cell_z + cs, 2);
-            core::mem::swap(&mut i_in, &mut i_p1);
+            core::mem::swap(&mut inp, &mut p1);
             nv_in = nv_rest;
             if nv_row < 3 || z < 0 {
                 continue;
             }
-            let row = &bufs[i_row];
             let mut min_x = row[0];
             let mut max_x = row[0];
             for v in 1..nv_row {
@@ -387,16 +386,12 @@ impl Heightfield {
             let mut nv2 = nv_row;
             for x in x0..=x1 {
                 let cx = bmin[0] + x as f32 * cs;
-                let [row, p1, p2] = bufs
-                    .get_disjoint_mut([i_row, i_p1, i_p2])
-                    .map_err(|_| Error::SizeOverflow)?;
                 let (nv, rest) = divide_poly(&row[..], nv2, p1, p2, cx + cs, 0);
-                core::mem::swap(&mut i_row, &mut i_p2);
+                core::mem::swap(&mut row, &mut p2);
                 nv2 = rest;
                 if nv < 3 || x < 0 {
                     continue;
                 }
-                let p1 = &bufs[i_p1];
                 let mut smin = p1[1];
                 let mut smax = p1[1];
                 for v in 1..nv {
