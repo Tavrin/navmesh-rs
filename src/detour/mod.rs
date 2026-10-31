@@ -36,12 +36,17 @@ mod navmesh;
 mod node;
 pub(crate) mod query;
 mod query_local;
+mod resumable;
 mod tile;
 
 pub use builder::{NavMeshCreateParams, create_nav_mesh_data};
 pub use navmesh::{NavMesh, NavMeshParams};
 pub use query::{
     DefaultFilter, NavMeshQuery, QueryFilter, RaycastHit, SegmentWall, StraightPathPoint,
+};
+pub use resumable::{
+    DistanceToWallSearch, LocalNeighbourhoodSearch, PolysAroundSearch, RaycastSearch,
+    SurfaceMoveSearch,
 };
 pub use tile::{BvNode, Link, MeshHeader, MeshTile, OffMeshConnection, Poly, PolyDetail};
 

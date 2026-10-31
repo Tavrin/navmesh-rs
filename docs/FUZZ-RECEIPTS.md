@@ -246,3 +246,63 @@ Kept in local scratch storage and copied to network storage (`corpus/`, `seeds/`
 the sorted `path size` list (and of all file contents), source against copy: `corpus/parallel_bake`
 2,557 files, 1,257,428 bytes, list hash `002bb59214eb…`; `corpus/recast_input` 1,198 files,
 158,035,746 bytes, list hash `a2c2b6085b91…`; seeds and artifacts match likewise.
+
+## Budgeted queries, resumable searches, global off-mesh links, 2026-10-31
+
+Commit under test: `ff8debd` (`feat/determinism-budgets`) plus the fuzz-only changes that add this
+receipt. Toolchain: nightly, `cargo-fuzz` 0.13.2, one libFuzzer worker per target, 600-second
+chunks (`-max_total_time=600`) reusing one corpus directory per target, `-print_final_stats=1`.
+Rule as above: stop when a whole chunk adds no edge coverage, after at least 600 CPU-seconds and
+at most 7,200; no crash. CPU seconds are user plus system time of the whole `cargo fuzz run`
+command, so the first chunk of each target includes its incremental build.
+
+### `budgeted_query` (new)
+
+One flag byte, then up to 48 operations of 4 bytes (layout in the target source) on a row of six
+single-polygon tiles: add a tile with an optional off-mesh connection to another tile, remove a
+tile, toggle global off-mesh links, run every budgeted query under a budget of 0 to 199 (200 and
+above is unlimited in effect), or run each resumable search to the end in steps of the given
+budget after a zero-budget step. Properties asserted: a `Complete` outcome equals the unbudgeted
+call (result and output buffers); a large budget never exhausts; a budget is never overspent; a
+zero-budget step spends nothing; an `Exhausted` step has recorded a refusal; a resumed search,
+run to `Done`, equals the unbudgeted query (circle, shape, wall distance, local neighbourhood,
+surface move, raycast; results and status).
+
+Seeds: 21 files written by `seeds budget` (scripted tile loads with queries at budgets 0, 1, 2, 3,
+5, 9, 20 and 255, single-shot and resumed, with and without global links; one add, remove and
+toggle sequence; 16 random). `-max_len=200`. The seeds alone ran clean (22 executions).
+
+Reach before the long run, from `cargo fuzz coverage` over the 21 seeds, `llvm-cov` line coverage of
+the new code: `resumable.rs` 83 percent of lines; every `*_budgeted` method in `query.rs`,
+`PolysAroundSearch`, `DistanceToWallSearch`, `LocalNeighbourhoodSearch`, `SurfaceMoveSearch` and
+`RaycastSearch` `resume`/`begin_*` (except `begin_polys_around_shape`, which the seeds missed and
+which the target now also drives), and `set_global_off_mesh_links`, `connect_global_off_mesh_links`
+and `disconnect_global_pairs` in `navmesh.rs` all executed. On the final corpus (1,310 inputs):
+`resumable.rs` 89 percent of lines, `begin_polys_around_shape` reached, `src/budget.rs` 58 percent
+(the rest is `Budget` accessors and `Limits`-based constructors the target does not call).
+
+| Chunk | CPU s | Executions | Coverage start (cov / ft) | Coverage end | Crashes |
+|---|---|---|---|---|---|
+| 1 | 681 | 734,648 | 2514 / 10368 (21 seeds) | 2557 / 15803 | 0 |
+| 2 | 680 | 831,378 | 2557 / 15803 | 2557 / 15884 | 0 |
+| Total | 1,361 | 1,566,026 | cov 2514 | cov 2557 | 0 |
+
+Chunk 2 added no edge, so the run stopped there. Final corpus: 1,310 inputs, 5.3 MB. Peak RSS 461
+MB. No artifact files; slowest unit under 1 s.
+
+### `crowd_update` (extended)
+
+Operation 6 is now `Crowd::update_budgeted` with a budget from the two tail bytes of the record
+(0 to 3 as is, larger values times 256, so 0 and 1 refuse the up-front charge and values around
+128 to 1,000 reach later phases). It asserts the budget is not overspent and that `Exhausted`
+recorded a refusal. Seeds: 73 files from `seeds crowd`, which now also writes a mix with budgeted
+ticks. `-max_len=1024`.
+
+| Chunk | CPU s | Executions | Coverage start (cov / ft) | Coverage end | Crashes |
+|---|---|---|---|---|---|
+| 1 | 680 | 151,177 | 2083 / 8289 (73 seeds) | 2228 / 11672 | 0 |
+| 2 | 677 | 185,485 | 2228 / 11672 | 2228 / 11706 | 0 |
+| Total | 1,357 | 336,662 | cov 2083 | cov 2228 | 0 |
+
+Chunk 2 added no edge. Final corpus: 748 inputs, 3.0 MB. Peak RSS 437 MB. No crash, no artifact
+files.

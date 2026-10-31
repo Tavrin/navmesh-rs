@@ -6,6 +6,7 @@
 //! seeds crowd <out-dir>                     `crowd_update` inputs, 16-byte records
 //! seeds tilecache <out-dir>                 `tilecache_update` inputs (layout in the target)
 //! seeds parallel <out-dir>                  `parallel_bake` inputs (layout in the target)
+//! seeds budget <out-dir>                    `budgeted_query` inputs (layout in the target)
 //! seeds recast-grid <out-dir>               two `recast_input` meshes with 50,000 polygons
 //! ```
 use navmesh_fuzz::{RecastInput, demo_settings, run_recast};
@@ -246,6 +247,12 @@ fn crowd_input(rng: &mut Rng, n: usize, style: u8, tail: Tail) -> Vec<u8> {
                 2 => ([rng.range(-2.0, 2.0), 0.0, rng.range(-2.0, 2.0)], 1),
                 _ => (pos, 2),
             },
+            3 if k < 8 => (pos, 0),
+            3 => match k % 4 {
+                0 | 3 => (pos, 2),
+                1 => ([rng.range(0.02, 0.5), 0.0, 0.0], 6),
+                _ => ([rng.range(-2.0, 2.0), 0.0, rng.range(-2.0, 2.0)], 1),
+            },
             2 => match k % 5 {
                 0 | 1 => (pos, 0),
                 2 => (pos, 2),
@@ -262,6 +269,12 @@ fn crowd_input(rng: &mut Rng, n: usize, style: u8, tail: Tail) -> Vec<u8> {
             Tail::Ones => [0xff, 0xff],
             Tail::Counter => [k as u8, (k as u8).wrapping_mul(7)],
             Tail::Random => [rng.byte(), rng.byte()],
+        };
+        // A budgeted tick reads its budget from the tail: 0 to 3 as is, larger times 256.
+        let t = if op == 6 {
+            [0u16, 1, 2, 3, 40, 130, 300, 1000][k / 4 % 8].to_le_bytes()
+        } else {
+            t
         };
         out.extend_from_slice(&crowd_record(v, id, op, t));
     }
@@ -280,7 +293,12 @@ fn crowd_seeds(out: &Path) -> Result<usize, String> {
     };
     let mut rng = Rng(0x6372_6f77_6400_0001);
     for n in [1usize, 4, 8, 16, 32, 48] {
-        for (style, tail) in [(0, Tail::Random), (1, Tail::Zero), (2, Tail::Counter)] {
+        for (style, tail) in [
+            (0, Tail::Random),
+            (1, Tail::Zero),
+            (2, Tail::Counter),
+            (3, Tail::Zero),
+        ] {
             put(
                 format!("crowd-n{n}-s{style}"),
                 crowd_input(&mut rng, n, style, tail),
@@ -288,7 +306,7 @@ fn crowd_seeds(out: &Path) -> Result<usize, String> {
         }
     }
     for n in [62usize, 63, 64] {
-        for style in 0..3u8 {
+        for style in 0..4u8 {
             for (tn, tail) in [Tail::Zero, Tail::Ones, Tail::Counter, Tail::Random]
                 .into_iter()
                 .enumerate()
@@ -303,6 +321,70 @@ fn crowd_seeds(out: &Path) -> Result<usize, String> {
     let mut partial = crowd_input(&mut rng, 63, 0, Tail::Random);
     partial.extend((0..15).map(|_| rng.byte()));
     put("crowd-n63-partial-tail".to_string(), partial)?;
+    Ok(written)
+}
+
+/// `budgeted_query` inputs: a flag byte then 4-byte operations `[op, a, b, c]` (layout in the
+/// target). Scripted sequences load a row of tiles with off-mesh connections, run every
+/// query under budgets from 0 to large, and toggle global links around tile removal.
+fn budget_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    let mut put = |name: String, bytes: Vec<u8>| -> Result<(), String> {
+        std::fs::write(out.join(name), bytes).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+    // Add tiles 0..6; tile 0 links to 5 (bidirectional), 2 to 4 (one way).
+    let load: Vec<[u8; 4]> = vec![
+        [0, 0, 5, 3],
+        [0, 1, 0, 0],
+        [0, 2, 4, 1],
+        [0, 3, 0, 0],
+        [0, 4, 0, 0],
+        [0, 5, 0, 0],
+    ];
+    let budgets = [0u8, 1, 2, 3, 5, 9, 20, 255];
+    for flags in [0u8, 1] {
+        for (qop, name) in [(3u8, "single"), (4, "resume")] {
+            let mut v = vec![flags];
+            v.extend(load.iter().flatten());
+            for (i, &b) in budgets.iter().enumerate() {
+                let (s, e) = [(0u8, 5u8), (5, 0), (1, 3), (2, 4)][i % 4];
+                v.extend_from_slice(&[qop, s, e, b]);
+            }
+            put(format!("budget-{name}-f{flags}"), v)?;
+        }
+    }
+    // Toggle global links around removal and re-adding, querying between.
+    let mut v = vec![0u8];
+    v.extend(load.iter().flatten());
+    for step in [
+        [2u8, 1, 0, 0],
+        [3, 0, 5, 255],
+        [1, 5, 0, 0],
+        [3, 0, 5, 255],
+        [0, 5, 0, 0],
+        [4, 0, 5, 3],
+        [2, 0, 0, 0],
+        [3, 0, 5, 255],
+        [1, 0, 0, 0],
+        [0, 0, 3, 3],
+        [2, 1, 0, 0],
+        [4, 5, 0, 1],
+    ] {
+        v.extend_from_slice(&step);
+    }
+    put("budget-toggle".to_string(), v)?;
+    let mut rng = Rng(0x6275_6467_6574_0001);
+    for n in [8usize, 16, 32, 48] {
+        for k in 0..4 {
+            let mut v = vec![rng.byte()];
+            for _ in 0..n * 4 {
+                v.push(rng.byte());
+            }
+            put(format!("budget-random-n{n}-{k}"), v)?;
+        }
+    }
     Ok(written)
 }
 
@@ -562,11 +644,11 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let no_inputs = matches!(
         args.first().map(String::as_str),
-        Some("crowd" | "tilecache" | "parallel" | "recast-grid")
+        Some("crowd" | "budget" | "tilecache" | "parallel" | "recast-grid")
     );
     if args.len() < if no_inputs { 2 } else { 3 } {
         eprintln!(
-            "usage: seeds tiles|recast <out-dir> <input>... | seeds crowd|tilecache|parallel|recast-grid <out-dir>"
+            "usage: seeds tiles|recast <out-dir> <input>... | seeds crowd|budget|tilecache|parallel|recast-grid <out-dir>"
         );
         return ExitCode::from(2);
     }
@@ -580,6 +662,7 @@ fn main() -> ExitCode {
         "recast" => recast_seeds(out, &args[2..]),
         "recast-grid" => recast_grid_seeds(out),
         "crowd" => crowd_seeds(out),
+        "budget" => budget_seeds(out),
         "tilecache" => tilecache_seeds(out),
         "parallel" => parallel_seeds(out),
         other => Err(format!("unknown mode {other}")),

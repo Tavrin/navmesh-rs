@@ -14,7 +14,8 @@ use super::{
     STRAIGHTPATH_AREA_CROSSINGS, STRAIGHTPATH_END, STRAIGHTPATH_OFFMESH_CONNECTION,
     STRAIGHTPATH_START, Status, VERTS_PER_POLYGON,
 };
-use crate::Error;
+use crate::budget::spend_one;
+use crate::{Budget, Budgeted, Error};
 
 pub(crate) const H_SCALE: f32 = 0.999;
 const DETAIL_MASK: u32 = 0x0ff_ffff;
@@ -179,11 +180,46 @@ impl<'a> NavMeshQuery<'a> {
         filter: &dyn QueryFilter,
         frand: &mut dyn FnMut() -> f32,
     ) -> Result<(PolyRef, [f32; 3]), Error> {
+        self.find_random_point_impl(filter, frand, &mut None)
+    }
+
+    /// [`NavMeshQuery::find_random_point`] spending one unit of `budget` per
+    /// resident tile considered and per polygon of the chosen tile (not in
+    /// recastnavigation). The pick is a reservoir sample over every polygon, so a
+    /// partial scan has no meaningful result: when the budget runs out the outcome
+    /// is `Exhausted(None)`. With a sufficient budget it is `Complete(Some(..))` and
+    /// equals the unbudgeted call for the same `frand` sequence; a mesh with no
+    /// eligible polygon is [`Error::Failed`], as unbudgeted.
+    #[allow(clippy::type_complexity)]
+    pub fn find_random_point_budgeted(
+        &self,
+        filter: &dyn QueryFilter,
+        frand: &mut dyn FnMut() -> f32,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Option<(PolyRef, [f32; 3])>>, Error> {
+        let (r, exhausted) =
+            budget.scoped(|b| self.find_random_point_impl(filter, frand, &mut Some(b)));
+        match r {
+            Ok(v) => Ok(Budgeted::of(Some(v), exhausted)),
+            Err(Error::Failed) if exhausted => Ok(Budgeted::Exhausted(None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn find_random_point_impl(
+        &self,
+        filter: &dyn QueryFilter,
+        frand: &mut dyn FnMut() -> f32,
+        budget: &mut Option<&mut Budget>,
+    ) -> Result<(PolyRef, [f32; 3]), Error> {
         let mut tile: Option<usize> = None;
         let mut tsum = 0.0f32;
         for i in 0..self.nav.max_tiles() as usize {
             if self.nav.tile(i).is_none() {
                 continue;
+            }
+            if !spend_one(budget) {
+                return Err(Error::Failed);
             }
             let area = 1.0f32;
             tsum += area;
@@ -198,6 +234,9 @@ impl<'a> NavMeshQuery<'a> {
         let mut found: Option<(usize, PolyRef)> = None;
         let mut area_sum = 0.0f32;
         for (i, p) in t.polys.iter().enumerate() {
+            if !spend_one(budget) {
+                return Err(Error::Failed);
+            }
             if p.poly_type() != POLYTYPE_GROUND {
                 continue;
             }
@@ -245,6 +284,53 @@ impl<'a> NavMeshQuery<'a> {
         filter: &dyn QueryFilter,
         frand: &mut dyn FnMut() -> f32,
     ) -> Result<(PolyRef, [f32; 3], Status), Error> {
+        self.find_random_point_around_circle_impl(
+            start_ref, center, max_radius, filter, frand, &mut None,
+        )
+    }
+
+    /// [`NavMeshQuery::find_random_point_around_circle`] spending one unit of
+    /// `budget` per polygon expanded (not in recastnavigation). When the budget runs
+    /// out the point is drawn from the polygons expanded so far: still a valid point
+    /// within reach, uniform over that subset (`Exhausted(Some(..))`), or
+    /// `Exhausted(None)` if none was ground. With a sufficient budget the result
+    /// equals the unbudgeted call for the same `frand` sequence.
+    #[allow(clippy::type_complexity)]
+    pub fn find_random_point_around_circle_budgeted(
+        &mut self,
+        start_ref: PolyRef,
+        center: &[f32; 3],
+        max_radius: f32,
+        filter: &dyn QueryFilter,
+        frand: &mut dyn FnMut() -> f32,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Option<(PolyRef, [f32; 3], Status)>>, Error> {
+        let (r, exhausted) = budget.scoped(|b| {
+            self.find_random_point_around_circle_impl(
+                start_ref,
+                center,
+                max_radius,
+                filter,
+                frand,
+                &mut Some(b),
+            )
+        });
+        match r {
+            Ok(v) => Ok(Budgeted::of(Some(v), exhausted)),
+            Err(Error::Failed) if exhausted => Ok(Budgeted::Exhausted(None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn find_random_point_around_circle_impl(
+        &mut self,
+        start_ref: PolyRef,
+        center: &[f32; 3],
+        max_radius: f32,
+        filter: &dyn QueryFilter,
+        frand: &mut dyn FnMut() -> f32,
+        budget: &mut Option<&mut Budget>,
+    ) -> Result<(PolyRef, [f32; 3], Status), Error> {
         if !self.nav.is_valid_poly_ref(start_ref)
             || !visfinite(center)
             || max_radius < 0.0
@@ -277,6 +363,9 @@ impl<'a> NavMeshQuery<'a> {
         let mut area_sum = 0.0f32;
         let mut random: Option<Tp<'a>> = None;
         while !self.open_list.empty() {
+            if !spend_one(budget) {
+                break;
+            }
             let bn = self.open_list.pop(&self.node_pool.nodes);
             self.node_pool.nodes[bn].flags &= !NODE_OPEN;
             self.node_pool.nodes[bn].flags |= NODE_CLOSED;
@@ -400,10 +489,16 @@ impl<'a> NavMeshQuery<'a> {
         filter: &dyn QueryFilter,
         f: &mut dyn FnMut(&MeshTile, usize, PolyRef),
     ) -> Result<(), Error> {
-        self.query_polygons_until(center, half_extents, filter, &mut |t, ip, r| {
-            f(t, ip, r);
-            true
-        })
+        self.query_polygons_until(
+            center,
+            half_extents,
+            filter,
+            &mut |t, ip, r| {
+                f(t, ip, r);
+                true
+            },
+            &mut None,
+        )
     }
 
     /// [`NavMeshQuery::query_polygons_with`] that stops as soon as `f` returns
@@ -415,6 +510,7 @@ impl<'a> NavMeshQuery<'a> {
         half_extents: &[f32; 3],
         filter: &dyn QueryFilter,
         f: &mut dyn FnMut(&MeshTile, usize, PolyRef) -> bool,
+        budget: &mut Option<&mut Budget>,
     ) -> Result<(), Error> {
         if !visfinite(center) || !visfinite(half_extents) {
             return Err(Error::InvalidParameter("center or half extents"));
@@ -428,9 +524,15 @@ impl<'a> NavMeshQuery<'a> {
             let Some(tile) = self.nav.tile(ti) else {
                 return true;
             };
+            if !spend_one(budget) {
+                return false;
+            }
             let base = self.nav.base_ref(ti);
             super::navmesh::query_polygons_in_tile(tile, &bmin, &bmax, &mut buf, usize::MAX);
             for &ip in &buf {
+                if !spend_one(budget) {
+                    return false;
+                }
                 let r = base | ip as PolyRef;
                 let Some(poly) = tile.polys.get(ip as usize) else {
                     continue;
@@ -456,17 +558,55 @@ impl<'a> NavMeshQuery<'a> {
         out: &mut Vec<PolyRef>,
         max: usize,
     ) -> Result<Status, Error> {
+        self.query_polygons_impl(center, half_extents, filter, out, max, &mut None)
+    }
+
+    /// [`NavMeshQuery::query_polygons`] spending one unit of `budget` per tile
+    /// scanned and per candidate polygon tested (not in recastnavigation). A tile's
+    /// bounding-volume walk visits at most that tile's polygon count of nodes and is
+    /// charged as the one unit for the tile. When the budget runs out `out` holds the
+    /// polygons found so far.
+    pub fn query_polygons_budgeted(
+        &self,
+        center: &[f32; 3],
+        half_extents: &[f32; 3],
+        filter: &dyn QueryFilter,
+        out: &mut Vec<PolyRef>,
+        max: usize,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Status>, Error> {
+        let (r, exhausted) = budget.scoped(|b| {
+            self.query_polygons_impl(center, half_extents, filter, out, max, &mut Some(b))
+        });
+        Ok(Budgeted::of(r?, exhausted))
+    }
+
+    fn query_polygons_impl(
+        &self,
+        center: &[f32; 3],
+        half_extents: &[f32; 3],
+        filter: &dyn QueryFilter,
+        out: &mut Vec<PolyRef>,
+        max: usize,
+        budget: &mut Option<&mut Budget>,
+    ) -> Result<Status, Error> {
         out.clear();
         let mut overflow = false;
-        self.query_polygons_until(center, half_extents, filter, &mut |_, _, r| {
-            if out.len() < max {
-                out.push(r);
-                true
-            } else {
-                overflow = true;
-                false
-            }
-        })?;
+        self.query_polygons_until(
+            center,
+            half_extents,
+            filter,
+            &mut |_, _, r| {
+                if out.len() < max {
+                    out.push(r);
+                    true
+                } else {
+                    overflow = true;
+                    false
+                }
+            },
+            budget,
+        )?;
         Ok(Status(
             Status::SUCCESS
                 | if overflow {
@@ -486,22 +626,54 @@ impl<'a> NavMeshQuery<'a> {
         half_extents: &[f32; 3],
         filter: &dyn QueryFilter,
     ) -> Result<(PolyRef, [f32; 3], bool), Error> {
+        self.find_nearest_poly_impl(center, half_extents, filter, &mut None)
+    }
+
+    /// [`NavMeshQuery::find_nearest_poly`] charged like
+    /// [`NavMeshQuery::query_polygons_budgeted`] (not in recastnavigation). When
+    /// the budget runs out the result is the nearest polygon among those tested.
+    pub fn find_nearest_poly_budgeted(
+        &self,
+        center: &[f32; 3],
+        half_extents: &[f32; 3],
+        filter: &dyn QueryFilter,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<(PolyRef, [f32; 3], bool)>, Error> {
+        let (r, exhausted) = budget
+            .scoped(|b| self.find_nearest_poly_impl(center, half_extents, filter, &mut Some(b)));
+        Ok(Budgeted::of(r?, exhausted))
+    }
+
+    fn find_nearest_poly_impl(
+        &self,
+        center: &[f32; 3],
+        half_extents: &[f32; 3],
+        filter: &dyn QueryFilter,
+        budget: &mut Option<&mut Budget>,
+    ) -> Result<(PolyRef, [f32; 3], bool), Error> {
         let mut nearest_d = f32::MAX;
         let mut nearest: (PolyRef, [f32; 3], bool) = (0, [0.0; 3], false);
-        self.query_polygons_with(center, half_extents, filter, &mut |tile, ip, r| {
-            let (cp, over) = closest_point_on_poly_in_tile(tile, ip, center);
-            let diff = vsub(center, &cp);
-            let d = if over {
-                let d = diff[1].abs() - tile.header.walkable_climb;
-                if d > 0.0 { d * d } else { 0.0 }
-            } else {
-                vlen_sqr(&diff)
-            };
-            if d < nearest_d {
-                nearest_d = d;
-                nearest = (r, cp, over);
-            }
-        })?;
+        self.query_polygons_until(
+            center,
+            half_extents,
+            filter,
+            &mut |tile, ip, r| {
+                let (cp, over) = closest_point_on_poly_in_tile(tile, ip, center);
+                let diff = vsub(center, &cp);
+                let d = if over {
+                    let d = diff[1].abs() - tile.header.walkable_climb;
+                    if d > 0.0 { d * d } else { 0.0 }
+                } else {
+                    vlen_sqr(&diff)
+                };
+                if d < nearest_d {
+                    nearest_d = d;
+                    nearest = (r, cp, over);
+                }
+                true
+            },
+            budget,
+        )?;
         Ok(nearest)
     }
 
@@ -575,6 +747,57 @@ impl<'a> NavMeshQuery<'a> {
         path: &mut Vec<PolyRef>,
         max_path: usize,
     ) -> Result<Status, Error> {
+        self.find_path_impl(
+            start_ref, end_ref, start_pos, end_pos, filter, path, max_path, &mut None,
+        )
+    }
+
+    /// [`NavMeshQuery::find_path`] spending one unit of `budget` per polygon
+    /// expanded (not in recastnavigation). When the budget runs out the search
+    /// stops where it is: the path leads to the closest polygon found so far, as
+    /// for upstream's out-of-nodes case, with `PARTIAL_RESULT` set, and the outcome
+    /// is [`Budgeted::Exhausted`]. A budget that suffices gives
+    /// [`find_path`](NavMeshQuery::find_path)'s result. For a search that continues
+    /// across frames use the sliced forms, whose iteration count is their budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_path_budgeted(
+        &mut self,
+        start_ref: PolyRef,
+        end_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        filter: &dyn QueryFilter,
+        path: &mut Vec<PolyRef>,
+        max_path: usize,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Status>, Error> {
+        let (r, exhausted) = budget.scoped(|b| {
+            self.find_path_impl(
+                start_ref,
+                end_ref,
+                start_pos,
+                end_pos,
+                filter,
+                path,
+                max_path,
+                &mut Some(b),
+            )
+        });
+        Ok(Budgeted::of(r?, exhausted))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_path_impl(
+        &mut self,
+        start_ref: PolyRef,
+        end_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        filter: &dyn QueryFilter,
+        path: &mut Vec<PolyRef>,
+        max_path: usize,
+        budget: &mut Option<&mut Budget>,
+    ) -> Result<Status, Error> {
         path.clear();
         if !self.nav.is_valid_poly_ref(start_ref)
             || !self.nav.is_valid_poly_ref(end_ref)
@@ -608,6 +831,9 @@ impl<'a> NavMeshQuery<'a> {
         let mut last_best_cost = self.node_pool.nodes[sn].total;
         let mut out_of_nodes = false;
         while !self.open_list.empty() {
+            if !spend_one(budget) {
+                break;
+            }
             let bn = self.open_list.pop(&self.node_pool.nodes);
             self.node_pool.nodes[bn].flags &= !NODE_OPEN;
             self.node_pool.nodes[bn].flags |= NODE_CLOSED;
@@ -1097,6 +1323,41 @@ impl<'a> NavMeshQuery<'a> {
         max: usize,
         options: i32,
     ) -> Result<Status, Error> {
+        self.find_straight_path_impl(start_pos, end_pos, path, out, max, options, &mut None)
+    }
+
+    /// [`NavMeshQuery::find_straight_path`] spending one unit of `budget` per portal
+    /// examined by the funnel, restarts included (not in recastnavigation). When
+    /// the budget runs out `out` holds the corners found so far, without the end
+    /// vertex, and the status is `SUCCESS | PARTIAL_RESULT`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_straight_path_budgeted(
+        &self,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        path: &[PolyRef],
+        out: &mut Vec<StraightPathPoint>,
+        max: usize,
+        options: i32,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Status>, Error> {
+        let (r, exhausted) = budget.scoped(|b| {
+            self.find_straight_path_impl(start_pos, end_pos, path, out, max, options, &mut Some(b))
+        });
+        Ok(Budgeted::of(r?, exhausted))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn find_straight_path_impl(
+        &self,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        path: &[PolyRef],
+        out: &mut Vec<StraightPathPoint>,
+        max: usize,
+        options: i32,
+        budget: &mut Option<&mut Budget>,
+    ) -> Result<Status, Error> {
         out.clear();
         if !visfinite(start_pos)
             || !visfinite(end_pos)
@@ -1127,6 +1388,9 @@ impl<'a> NavMeshQuery<'a> {
             let (mut left_ref, mut right_ref) = (path[0], path[0]);
             let mut i = 0usize;
             while i < n {
+                if !spend_one(budget) {
+                    return Ok(Status(Status::SUCCESS | Status::PARTIAL_RESULT));
+                }
                 let (mut left, mut right);
                 let to_type;
                 if i + 1 < n {

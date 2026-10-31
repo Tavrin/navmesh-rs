@@ -14,6 +14,15 @@
 //! This bounds charged storage, excluding allocator metadata, stacks and the pool.
 //! Rayon owns its scheduler/pool allocation costs. Without `parallel`, this API
 //! supports `no_std` + `alloc`, including wasm.
+//!
+//! **Triangles that cross a tile's bounds** are not split by the baker: every tile
+//! whose bounds, widened by the border (`walkable_radius + 3` cells), overlap a
+//! triangle's xz bounds receives the whole triangle, in input order. Each tile then
+//! rasterises it with Recast's rasteriser, which clips it to that tile's heightfield
+//! (the tile plus its border); the parts outside are dropped. The walkable-slope
+//! test and the area mark use the triangle's own normal and are the same in every
+//! tile that receives it, so a surface crossing a seam is rasterised identically
+//! (up to the border) on both sides.
 
 use alloc::vec::Vec;
 use core::fmt;

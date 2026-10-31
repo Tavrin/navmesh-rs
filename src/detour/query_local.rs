@@ -12,7 +12,72 @@ use super::{
 };
 use crate::Error;
 
-enum Region<'s> {
+/// A surface move between steps (the locals of upstream's `moveAlongSurface` loop).
+pub(crate) struct SurfaceState {
+    pub(crate) stack: Vec<usize>,
+    pub(crate) best_pos: [f32; 3],
+    best_dist: f32,
+    pub(crate) best_node: Option<usize>,
+    end_pos: [f32; 3],
+    search_pos: [f32; 3],
+    search_rad_sqr: f32,
+    reached: bool,
+}
+
+impl SurfaceState {
+    /// No polygon left to expand, or the end position was reached.
+    pub(crate) fn finished(&self) -> bool {
+        self.stack.is_empty() || self.reached
+    }
+}
+
+/// A raycast between steps (the locals of upstream's `raycast` loop).
+pub(crate) struct RaycastState {
+    start_pos: [f32; 3],
+    end_pos: [f32; 3],
+    dir: [f32; 3],
+    options: u32,
+    max_path: usize,
+    pub(crate) hit: RaycastHit,
+    pub(crate) status: u32,
+    cur_pos: [f32; 3],
+    cur_ref: PolyRef,
+    prev_ref: PolyRef,
+    pub(crate) finished: bool,
+}
+
+/// A distance-to-wall search between steps.
+pub(crate) struct WallState {
+    radius_sqr: f32,
+    hit_pos: [f32; 3],
+    pub(crate) status: u32,
+}
+
+impl WallState {
+    pub(crate) fn new(max_radius: f32) -> Self {
+        WallState {
+            radius_sqr: sqr(max_radius),
+            hit_pos: [0.0; 3],
+            status: Status::SUCCESS,
+        }
+    }
+
+    /// Distance, hit point and normal as of now (the final ones once the search is
+    /// done).
+    pub(crate) fn result(&self, center: &[f32; 3]) -> (f32, [f32; 3], [f32; 3]) {
+        let mut normal = vsub(center, &self.hit_pos);
+        vnormalize(&mut normal);
+        (crate::common::sqrtf(self.radius_sqr), self.hit_pos, normal)
+    }
+}
+
+/// A local-neighbourhood search between steps.
+pub(crate) struct NeighbourhoodState {
+    pub(crate) stack: Vec<usize>,
+    pub(crate) status: u32,
+}
+
+pub(crate) enum Region<'s> {
     Circle([f32; 3], f32),
     Shape(&'s [f32], usize),
 }
@@ -31,6 +96,21 @@ impl<'a> NavMeshQuery<'a> {
         max_visited: usize,
     ) -> Result<([f32; 3], Status), Error> {
         visited.clear();
+        self.check_surface_move(start_ref, start_pos, end_pos, max_visited)?;
+        let mut st = self.surface_start(start_ref, start_pos, end_pos)?;
+        while !st.finished() {
+            self.surface_step(&mut st, filter);
+        }
+        Ok(self.surface_result(&st, &self.tiny_node_pool, max_visited, visited))
+    }
+
+    pub(crate) fn check_surface_move(
+        &self,
+        start_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        max_visited: usize,
+    ) -> Result<(), Error> {
         if !self.nav.is_valid_poly_ref(start_ref)
             || !visfinite(start_pos)
             || !visfinite(end_pos)
@@ -38,9 +118,17 @@ impl<'a> NavMeshQuery<'a> {
         {
             return Err(Error::InvalidParameter("ref, positions or max_visited"));
         }
-        let mut status = Status::SUCCESS;
-        const MAX_STACK: usize = 48;
-        let mut stack: Vec<usize> = Vec::with_capacity(MAX_STACK);
+        Ok(())
+    }
+
+    /// Seeds the tiny node pool (the caller's, or one swapped in) with the start
+    /// polygon.
+    pub(crate) fn surface_start(
+        &mut self,
+        start_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+    ) -> Result<SurfaceState, Error> {
         self.tiny_node_pool.clear();
         let sn = self
             .tiny_node_pool
@@ -54,108 +142,126 @@ impl<'a> NavMeshQuery<'a> {
             n.id = start_ref;
             n.flags = NODE_CLOSED;
         }
-        stack.push(sn);
-        let mut best_pos = *start_pos;
-        let mut best_dist = f32::MAX;
-        let mut best_node: Option<usize> = None;
-        let search_pos = vlerp(start_pos, end_pos, 0.5);
-        let search_rad_sqr = sqr(vdist(start_pos, end_pos) / 2.0 + 0.001);
+        Ok(SurfaceState {
+            stack: alloc::vec![sn],
+            best_pos: *start_pos,
+            best_dist: f32::MAX,
+            best_node: None,
+            end_pos: *end_pos,
+            search_pos: vlerp(start_pos, end_pos, 0.5),
+            search_rad_sqr: sqr(vdist(start_pos, end_pos) / 2.0 + 0.001),
+            reached: false,
+        })
+    }
+
+    /// Expands one polygon of a surface move: the body of upstream's loop.
+    pub(crate) fn surface_step(&mut self, st: &mut SurfaceState, filter: &dyn QueryFilter) {
+        const MAX_STACK: usize = 48;
+        let end_pos = &st.end_pos;
         let mut verts = [0.0f32; VERTS_PER_POLYGON * 3];
-        while !stack.is_empty() {
-            let cur = stack.remove(0);
-            let cur_ref = self.tiny_node_pool.nodes[cur].id;
-            let (_, tile, poly) = self.tp(cur_ref);
-            let nverts = poly.vert_count as usize;
-            for i in 0..nverts {
-                let v = poly.verts[i] as usize * 3;
-                verts[i * 3..i * 3 + 3].copy_from_slice(&tile.verts[v..v + 3]);
-            }
-            if point_in_polygon(end_pos, &verts, nverts) {
-                best_node = Some(cur);
-                best_pos = *end_pos;
-                break;
-            }
-            let base = self
-                .nav
-                .base_ref(self.nav.decode_poly_id_tile(cur_ref) as usize);
-            let mut j = nverts - 1;
-            for i in 0..nverts {
-                let mut neis: [PolyRef; 8] = [0; 8];
-                let mut nneis = 0;
-                if poly.neis[j] & EXT_LINK != 0 {
-                    let mut k = poly.first_link;
-                    while k != NULL_LINK {
-                        let link = &tile.links[k as usize];
-                        k = link.next;
-                        if link.edge as usize == j && link.r#ref != 0 {
-                            let nei = self.tp(link.r#ref);
-                            if filter.pass_filter(link.r#ref, nei.1, nei.2) && nneis < 8 {
-                                neis[nneis] = link.r#ref;
-                                nneis += 1;
-                            }
-                        }
-                    }
-                } else if poly.neis[j] != 0 {
-                    let idx = (poly.neis[j] - 1) as usize;
-                    let r = base | idx as PolyRef;
-                    if filter.pass_filter(r, tile, &tile.polys[idx]) {
-                        neis[nneis] = r;
-                        nneis += 1;
-                    }
-                }
-                let vj = &verts[j * 3..j * 3 + 3];
-                let vi = &verts[i * 3..i * 3 + 3];
-                if nneis == 0 {
-                    let (d, t) = distance_pt_seg_sqr_2d(end_pos, vj, vi);
-                    if d < best_dist {
-                        best_pos = vlerp(vj, vi, t);
-                        best_dist = d;
-                        best_node = Some(cur);
-                    }
-                } else {
-                    for &nr in &neis[..nneis] {
-                        let Some(nn) = self.tiny_node_pool.get_node(nr, 0) else {
-                            continue;
-                        };
-                        if self.tiny_node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
-                            continue;
-                        }
-                        let (d, _) = distance_pt_seg_sqr_2d(&search_pos, vj, vi);
-                        if d > search_rad_sqr {
-                            continue;
-                        }
-                        if stack.len() < MAX_STACK {
-                            let n = &mut self.tiny_node_pool.nodes[nn];
-                            n.pidx = NodePool::idx(cur);
-                            n.flags |= NODE_CLOSED;
-                            stack.push(nn);
-                        }
-                    }
-                }
-                j = i;
-            }
+        let cur = st.stack.remove(0);
+        let cur_ref = self.tiny_node_pool.nodes[cur].id;
+        let (_, tile, poly) = self.tp(cur_ref);
+        let nverts = poly.vert_count as usize;
+        for i in 0..nverts {
+            let v = poly.verts[i] as usize * 3;
+            verts[i * 3..i * 3 + 3].copy_from_slice(&tile.verts[v..v + 3]);
         }
-        if let Some(bn) = best_node {
-            let nodes = &mut self.tiny_node_pool.nodes;
-            let mut prev: Option<usize> = None;
+        if point_in_polygon(end_pos, &verts, nverts) {
+            st.best_node = Some(cur);
+            st.best_pos = *end_pos;
+            st.reached = true;
+            return;
+        }
+        let base = self
+            .nav
+            .base_ref(self.nav.decode_poly_id_tile(cur_ref) as usize);
+        let mut j = nverts - 1;
+        for i in 0..nverts {
+            let mut neis: [PolyRef; 8] = [0; 8];
+            let mut nneis = 0;
+            if poly.neis[j] & EXT_LINK != 0 {
+                let mut k = poly.first_link;
+                while k != NULL_LINK {
+                    let link = &tile.links[k as usize];
+                    k = link.next;
+                    if link.edge as usize == j && link.r#ref != 0 {
+                        let nei = self.tp(link.r#ref);
+                        if filter.pass_filter(link.r#ref, nei.1, nei.2) && nneis < 8 {
+                            neis[nneis] = link.r#ref;
+                            nneis += 1;
+                        }
+                    }
+                }
+            } else if poly.neis[j] != 0 {
+                let idx = (poly.neis[j] - 1) as usize;
+                let r = base | idx as PolyRef;
+                if filter.pass_filter(r, tile, &tile.polys[idx]) {
+                    neis[nneis] = r;
+                    nneis += 1;
+                }
+            }
+            let vj = &verts[j * 3..j * 3 + 3];
+            let vi = &verts[i * 3..i * 3 + 3];
+            if nneis == 0 {
+                let (d, t) = distance_pt_seg_sqr_2d(end_pos, vj, vi);
+                if d < st.best_dist {
+                    st.best_pos = vlerp(vj, vi, t);
+                    st.best_dist = d;
+                    st.best_node = Some(cur);
+                }
+            } else {
+                for &nr in &neis[..nneis] {
+                    let Some(nn) = self.tiny_node_pool.get_node(nr, 0) else {
+                        continue;
+                    };
+                    if self.tiny_node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
+                        continue;
+                    }
+                    let (d, _) = distance_pt_seg_sqr_2d(&st.search_pos, vj, vi);
+                    if d > st.search_rad_sqr {
+                        continue;
+                    }
+                    if st.stack.len() < MAX_STACK {
+                        let n = &mut self.tiny_node_pool.nodes[nn];
+                        n.pidx = NodePool::idx(cur);
+                        n.flags |= NODE_CLOSED;
+                        st.stack.push(nn);
+                    }
+                }
+            }
+            j = i;
+        }
+    }
+
+    /// The position and visited polygons of a surface move, as of now.
+    pub(crate) fn surface_result(
+        &self,
+        st: &SurfaceState,
+        pool: &NodePool,
+        max_visited: usize,
+        visited: &mut Vec<PolyRef>,
+    ) -> ([f32; 3], Status) {
+        let mut status = Status::SUCCESS;
+        visited.clear();
+        if let Some(bn) = st.best_node {
+            // Start-to-best order, read without disturbing the pool so a partial
+            // result can be taken and the search resumed.
+            let mut chain: Vec<usize> = Vec::new();
             let mut node = Some(bn);
             while let Some(n) = node {
-                let next = NodePool::at_idx(nodes[n].pidx);
-                nodes[n].pidx = prev.map_or(0, NodePool::idx);
-                prev = Some(n);
-                node = next;
+                chain.push(n);
+                node = NodePool::at_idx(pool.nodes[n].pidx);
             }
-            let mut node = prev;
-            while let Some(n) = node {
-                visited.push(nodes[n].id);
+            for &n in chain.iter().rev() {
+                visited.push(pool.nodes[n].id);
                 if visited.len() >= max_visited {
                     status |= Status::BUFFER_TOO_SMALL;
                     break;
                 }
-                node = NodePool::at_idx(nodes[n].pidx);
             }
         }
-        Ok((best_pos, Status(status)))
+        (st.best_pos, Status(status))
     }
 
     /// Raycast along the surface (`raycast` with `dtRaycastHit`), collecting at most
@@ -172,7 +278,23 @@ impl<'a> NavMeshQuery<'a> {
         max_path: usize,
         prev_ref: PolyRef,
     ) -> Result<(RaycastHit, Status), Error> {
-        let mut hit = RaycastHit::default();
+        let mut st =
+            self.raycast_start(start_ref, start_pos, end_pos, options, max_path, prev_ref)?;
+        while !st.finished {
+            self.raycast_step(&mut st, filter);
+        }
+        Ok((st.hit, Status(st.status)))
+    }
+
+    pub(crate) fn raycast_start(
+        &self,
+        start_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        options: u32,
+        max_path: usize,
+        prev_ref: PolyRef,
+    ) -> Result<RaycastState, Error> {
         if !self.nav.is_valid_poly_ref(start_ref)
             || !visfinite(start_pos)
             || !visfinite(end_pos)
@@ -180,116 +302,133 @@ impl<'a> NavMeshQuery<'a> {
         {
             return Err(Error::InvalidParameter("refs or positions"));
         }
-        let mut cur_pos = *start_pos;
-        let dir = vsub(end_pos, start_pos);
-        let mut status = Status::SUCCESS;
+        Ok(RaycastState {
+            start_pos: *start_pos,
+            end_pos: *end_pos,
+            dir: vsub(end_pos, start_pos),
+            options,
+            max_path,
+            hit: RaycastHit::default(),
+            status: Status::SUCCESS,
+            cur_pos: *start_pos,
+            cur_ref: start_ref,
+            prev_ref,
+            finished: false,
+        })
+    }
+
+    /// Crosses one polygon of a raycast: the body of upstream's loop. Sets
+    /// `st.finished` when the ray ends, hits a wall or fills the path buffer.
+    pub(crate) fn raycast_step(&self, st: &mut RaycastState, filter: &dyn QueryFilter) {
+        let (start_pos, end_pos, dir) = (&st.start_pos, &st.end_pos, &st.dir);
+        let options = st.options;
+        let hit = &mut st.hit;
         let mut verts = [0.0f32; VERTS_PER_POLYGON * 3 + 3];
-        let mut cur: Tp<'a> = self.tp(start_ref);
-        let mut prev: Option<Tp<'a>> = if prev_ref != 0 {
-            Some(self.tp(prev_ref))
+        let cur: Tp<'a> = self.tp(st.cur_ref);
+        let prev: Option<Tp<'a>> = if st.prev_ref != 0 {
+            Some(self.tp(st.prev_ref))
         } else {
             None
         };
-        loop {
-            let (cur_ref, tile, poly) = cur;
-            let nv = poly.vert_count as usize;
-            for i in 0..nv {
-                let v = poly.verts[i] as usize * 3;
-                verts[i * 3..i * 3 + 3].copy_from_slice(&tile.verts[v..v + 3]);
-            }
-            let Some((_, tmax, _, seg_max)) =
-                intersect_segment_poly_2d(start_pos, end_pos, &verts, nv)
-            else {
-                return Ok((hit, Status(status)));
-            };
-            hit.hit_edge_index = seg_max;
-            if tmax > hit.t {
-                hit.t = tmax;
-            }
-            if hit.path.len() < max_path {
-                hit.path.push(cur_ref);
-            } else {
-                status |= Status::BUFFER_TOO_SMALL;
-            }
-            if seg_max == -1 {
-                hit.t = f32::MAX;
-                if options & RAYCAST_USE_COSTS != 0 {
-                    hit.path_cost += filter.cost(&cur_pos, end_pos, prev, cur, Some(cur));
-                }
-                return Ok((hit, Status(status)));
-            }
-            let seg_max = seg_max as usize;
-            let mut next: Option<Tp<'a>> = None;
-            let mut k = poly.first_link;
-            while k != NULL_LINK {
-                let link = &tile.links[k as usize];
-                k = link.next;
-                if link.edge as usize != seg_max {
-                    continue;
-                }
-                let nt = self.tp(link.r#ref);
-                if nt.2.poly_type() == POLYTYPE_OFFMESH_CONNECTION
-                    || !filter.pass_filter(link.r#ref, nt.1, nt.2)
-                {
-                    continue;
-                }
-                if link.side == 0xff || (link.bmin == 0 && link.bmax == 255) {
-                    next = Some(nt);
-                    break;
-                }
-                let v0 = poly.verts[link.edge as usize] as usize * 3;
-                let v1 = poly.verts[(link.edge as usize + 1) % nv] as usize * 3;
-                let left = &tile.verts[v0..v0 + 3];
-                let right = &tile.verts[v1..v1 + 3];
-                let ax = match link.side {
-                    0 | 4 => 2,
-                    2 | 6 => 0,
-                    _ => continue,
-                };
-                let s = 1.0f32 / 255.0;
-                let mut lmin = left[ax] + (right[ax] - left[ax]) * (link.bmin as f32 * s);
-                let mut lmax = left[ax] + (right[ax] - left[ax]) * (link.bmax as f32 * s);
-                if lmin > lmax {
-                    core::mem::swap(&mut lmin, &mut lmax);
-                }
-                let c = start_pos[ax] + (end_pos[ax] - start_pos[ax]) * tmax;
-                if c >= lmin && c <= lmax {
-                    next = Some(nt);
-                    break;
-                }
-            }
+        let (cur_ref, tile, poly) = cur;
+        let nv = poly.vert_count as usize;
+        for i in 0..nv {
+            let v = poly.verts[i] as usize * 3;
+            verts[i * 3..i * 3 + 3].copy_from_slice(&tile.verts[v..v + 3]);
+        }
+        let Some((_, tmax, _, seg_max)) = intersect_segment_poly_2d(start_pos, end_pos, &verts, nv)
+        else {
+            st.finished = true;
+            return;
+        };
+        hit.hit_edge_index = seg_max;
+        if tmax > hit.t {
+            hit.t = tmax;
+        }
+        if hit.path.len() < st.max_path {
+            hit.path.push(cur_ref);
+        } else {
+            st.status |= Status::BUFFER_TOO_SMALL;
+        }
+        if seg_max == -1 {
+            hit.t = f32::MAX;
             if options & RAYCAST_USE_COSTS != 0 {
-                let last_pos = cur_pos;
-                cur_pos = vmad(start_pos, &dir, hit.t);
-                let e1 = &verts[seg_max * 3..seg_max * 3 + 3];
-                let e2 = &verts[((seg_max + 1) % nv) * 3..((seg_max + 1) % nv) * 3 + 3];
-                let e_dir = vsub(e2, e1);
-                let diff = vsub(&cur_pos, e1);
-                let s = if sqr(e_dir[0]) > sqr(e_dir[2]) {
-                    diff[0] / e_dir[0]
-                } else {
-                    diff[2] / e_dir[2]
-                };
-                cur_pos[1] = e1[1] + e_dir[1] * s;
-                hit.path_cost += filter.cost(&last_pos, &cur_pos, prev, cur, next);
+                hit.path_cost += filter.cost(&st.cur_pos, end_pos, prev, cur, Some(cur));
             }
-            let Some(nt) = next else {
-                let a = seg_max;
-                let b = if seg_max + 1 < nv { seg_max + 1 } else { 0 };
-                let dx = verts[b * 3] - verts[a * 3];
-                let dz = verts[b * 3 + 2] - verts[a * 3 + 2];
-                hit.hit_normal = [dz, 0.0, -dx];
-                vnormalize(&mut hit.hit_normal);
-                return Ok((hit, Status(status)));
+            st.finished = true;
+            return;
+        }
+        let seg_max = seg_max as usize;
+        let mut next: Option<Tp<'a>> = None;
+        let mut k = poly.first_link;
+        while k != NULL_LINK {
+            let link = &tile.links[k as usize];
+            k = link.next;
+            if link.edge as usize != seg_max {
+                continue;
+            }
+            let nt = self.tp(link.r#ref);
+            if nt.2.poly_type() == POLYTYPE_OFFMESH_CONNECTION
+                || !filter.pass_filter(link.r#ref, nt.1, nt.2)
+            {
+                continue;
+            }
+            if link.side == 0xff || (link.bmin == 0 && link.bmax == 255) {
+                next = Some(nt);
+                break;
+            }
+            let v0 = poly.verts[link.edge as usize] as usize * 3;
+            let v1 = poly.verts[(link.edge as usize + 1) % nv] as usize * 3;
+            let left = &tile.verts[v0..v0 + 3];
+            let right = &tile.verts[v1..v1 + 3];
+            let ax = match link.side {
+                0 | 4 => 2,
+                2 | 6 => 0,
+                _ => continue,
             };
-            prev = Some(cur);
-            cur = nt;
-            if status & Status::BUFFER_TOO_SMALL != 0 {
-                status |= Status::PARTIAL_RESULT;
+            let s = 1.0f32 / 255.0;
+            let mut lmin = left[ax] + (right[ax] - left[ax]) * (link.bmin as f32 * s);
+            let mut lmax = left[ax] + (right[ax] - left[ax]) * (link.bmax as f32 * s);
+            if lmin > lmax {
+                core::mem::swap(&mut lmin, &mut lmax);
+            }
+            let c = start_pos[ax] + (end_pos[ax] - start_pos[ax]) * tmax;
+            if c >= lmin && c <= lmax {
+                next = Some(nt);
                 break;
             }
         }
-        Ok((hit, Status(status)))
+        if options & RAYCAST_USE_COSTS != 0 {
+            let last_pos = st.cur_pos;
+            st.cur_pos = vmad(start_pos, dir, hit.t);
+            let e1 = &verts[seg_max * 3..seg_max * 3 + 3];
+            let e2 = &verts[((seg_max + 1) % nv) * 3..((seg_max + 1) % nv) * 3 + 3];
+            let e_dir = vsub(e2, e1);
+            let diff = vsub(&st.cur_pos, e1);
+            let s = if sqr(e_dir[0]) > sqr(e_dir[2]) {
+                diff[0] / e_dir[0]
+            } else {
+                diff[2] / e_dir[2]
+            };
+            st.cur_pos[1] = e1[1] + e_dir[1] * s;
+            hit.path_cost += filter.cost(&last_pos, &st.cur_pos, prev, cur, next);
+        }
+        let Some(nt) = next else {
+            let a = seg_max;
+            let b = if seg_max + 1 < nv { seg_max + 1 } else { 0 };
+            let dx = verts[b * 3] - verts[a * 3];
+            let dz = verts[b * 3 + 2] - verts[a * 3 + 2];
+            hit.hit_normal = [dz, 0.0, -dx];
+            vnormalize(&mut hit.hit_normal);
+            st.finished = true;
+            return;
+        };
+        st.prev_ref = cur_ref;
+        st.cur_ref = nt.0;
+        if st.status & Status::BUFFER_TOO_SMALL != 0 {
+            st.status |= Status::PARTIAL_RESULT;
+            st.finished = true;
+        }
     }
 
     /// The first upstream `raycast` form: `t`, hit normal, visited polygons.
@@ -314,6 +453,21 @@ impl<'a> NavMeshQuery<'a> {
         out: &mut Vec<(PolyRef, PolyRef, f32)>,
         max: usize,
     ) -> Result<Status, Error> {
+        self.dijkstra_start(start_ref, &center)?;
+        let mut status = Status::SUCCESS;
+        while !self.open_list.empty() {
+            self.polys_around_step(&region, filter, out, max, &mut status);
+        }
+        Ok(Status(status))
+    }
+
+    /// Seeds the node pool and open list (the query's, or ones swapped in) with the
+    /// start polygon of a Dijkstra search at `pos`.
+    pub(crate) fn dijkstra_start(
+        &mut self,
+        start_ref: PolyRef,
+        pos: &[f32; 3],
+    ) -> Result<(), Error> {
         self.node_pool.clear();
         self.open_list.clear();
         let sn = self
@@ -322,7 +476,7 @@ impl<'a> NavMeshQuery<'a> {
             .ok_or(Error::AllocationFailed)?;
         {
             let n = &mut self.node_pool.nodes[sn];
-            n.pos = center;
+            n.pos = *pos;
             n.pidx = 0;
             n.cost = 0.0;
             n.total = 0.0;
@@ -330,80 +484,88 @@ impl<'a> NavMeshQuery<'a> {
             n.flags = NODE_OPEN;
         }
         self.open_list.push(sn, &self.node_pool.nodes);
-        let mut status = Status::SUCCESS;
-        while !self.open_list.empty() {
-            let bn = self.open_list.pop(&self.node_pool.nodes);
-            self.node_pool.nodes[bn].flags &= !NODE_OPEN;
-            self.node_pool.nodes[bn].flags |= NODE_CLOSED;
-            let best = self.tp(self.node_pool.nodes[bn].id);
-            let parent = NodePool::at_idx(self.node_pool.nodes[bn].pidx)
-                .map(|i| self.node_pool.nodes[i].id)
-                .filter(|&r| r != 0)
-                .map(|r| self.tp(r));
-            let parent_ref = parent.map_or(0, |p| p.0);
-            if out.len() < max {
-                out.push((best.0, parent_ref, self.node_pool.nodes[bn].total));
-            } else {
-                status |= Status::BUFFER_TOO_SMALL;
+        Ok(())
+    }
+
+    /// Pops and expands one polygon of `findPolysAroundCircle` / `...Shape`.
+    pub(crate) fn polys_around_step(
+        &mut self,
+        region: &Region,
+        filter: &dyn QueryFilter,
+        out: &mut Vec<(PolyRef, PolyRef, f32)>,
+        max: usize,
+        status: &mut u32,
+    ) {
+        let bn = self.open_list.pop(&self.node_pool.nodes);
+        self.node_pool.nodes[bn].flags &= !NODE_OPEN;
+        self.node_pool.nodes[bn].flags |= NODE_CLOSED;
+        let best = self.tp(self.node_pool.nodes[bn].id);
+        let parent = NodePool::at_idx(self.node_pool.nodes[bn].pidx)
+            .map(|i| self.node_pool.nodes[i].id)
+            .filter(|&r| r != 0)
+            .map(|r| self.tp(r));
+        let parent_ref = parent.map_or(0, |p| p.0);
+        if out.len() < max {
+            out.push((best.0, parent_ref, self.node_pool.nodes[bn].total));
+        } else {
+            *status |= Status::BUFFER_TOO_SMALL;
+        }
+        let mut li = best.2.first_link;
+        while li != NULL_LINK {
+            let link = best.1.links[li as usize];
+            li = link.next;
+            let nref = link.r#ref;
+            if nref == 0 || nref == parent_ref {
+                continue;
             }
-            let mut li = best.2.first_link;
-            while li != NULL_LINK {
-                let link = best.1.links[li as usize];
-                li = link.next;
-                let nref = link.r#ref;
-                if nref == 0 || nref == parent_ref {
-                    continue;
-                }
-                let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
-                    continue;
-                }
-                let Some((va, vb)) = self.portal_points_tp(best, nei) else {
-                    continue;
-                };
-                match region {
-                    Region::Circle(c, r2) => {
-                        if distance_pt_seg_sqr_2d(&c, &va, &vb).0 > r2 {
-                            continue;
-                        }
-                    }
-                    Region::Shape(verts, nverts) => {
-                        match intersect_segment_poly_2d(&va, &vb, verts, nverts) {
-                            Some((tmin, tmax, _, _)) if !(tmin > 1.0 || tmax < 0.0) => {}
-                            _ => continue,
-                        }
+            let nei = self.tp(nref);
+            if !filter.pass_filter(nref, nei.1, nei.2) {
+                continue;
+            }
+            let Some((va, vb)) = self.portal_points_tp(best, nei) else {
+                continue;
+            };
+            match *region {
+                Region::Circle(c, r2) => {
+                    if distance_pt_seg_sqr_2d(&c, &va, &vb).0 > r2 {
+                        continue;
                     }
                 }
-                let Some(nn) = self.node_pool.get_node(nref, 0) else {
-                    status |= Status::OUT_OF_NODES;
-                    continue;
-                };
-                if self.node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
-                    continue;
+                Region::Shape(verts, nverts) => {
+                    match intersect_segment_poly_2d(&va, &vb, verts, nverts) {
+                        Some((tmin, tmax, _, _)) if !(tmin > 1.0 || tmax < 0.0) => {}
+                        _ => continue,
+                    }
                 }
-                if self.node_pool.nodes[nn].flags == 0 {
-                    self.node_pool.nodes[nn].pos = vlerp(&va, &vb, 0.5);
-                }
-                let bpos = self.node_pool.nodes[bn].pos;
-                let npos = self.node_pool.nodes[nn].pos;
-                let cost = filter.cost(&bpos, &npos, parent, best, Some(nei));
-                let total = self.node_pool.nodes[bn].total + cost;
-                let n = &mut self.node_pool.nodes[nn];
-                if n.flags & NODE_OPEN != 0 && no_better(total, n.total) {
-                    continue;
-                }
-                n.id = nref;
-                n.pidx = NodePool::idx(bn);
-                n.total = total;
-                if n.flags & NODE_OPEN != 0 {
-                    self.open_list.modify(nn, &self.node_pool.nodes);
-                } else {
-                    n.flags = NODE_OPEN;
-                    self.open_list.push(nn, &self.node_pool.nodes);
-                }
+            }
+            let Some(nn) = self.node_pool.get_node(nref, 0) else {
+                *status |= Status::OUT_OF_NODES;
+                continue;
+            };
+            if self.node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
+                continue;
+            }
+            if self.node_pool.nodes[nn].flags == 0 {
+                self.node_pool.nodes[nn].pos = vlerp(&va, &vb, 0.5);
+            }
+            let bpos = self.node_pool.nodes[bn].pos;
+            let npos = self.node_pool.nodes[nn].pos;
+            let cost = filter.cost(&bpos, &npos, parent, best, Some(nei));
+            let total = self.node_pool.nodes[bn].total + cost;
+            let n = &mut self.node_pool.nodes[nn];
+            if n.flags & NODE_OPEN != 0 && no_better(total, n.total) {
+                continue;
+            }
+            n.id = nref;
+            n.pidx = NodePool::idx(bn);
+            n.total = total;
+            if n.flags & NODE_OPEN != 0 {
+                self.open_list.modify(nn, &self.node_pool.nodes);
+            } else {
+                n.flags = NODE_OPEN;
+                self.open_list.push(nn, &self.node_pool.nodes);
             }
         }
-        Ok(Status(status))
     }
 
     /// Polygons reachable from `start_ref` whose portals touch the circle
@@ -469,16 +631,27 @@ impl<'a> NavMeshQuery<'a> {
         path: &mut Vec<PolyRef>,
         max_path: usize,
     ) -> Result<Status, Error> {
+        self.path_from_pool(&self.node_pool, end_ref, path, max_path)
+    }
+
+    /// [`NavMeshQuery::path_from_dijkstra_search`] over the nodes of any search.
+    pub(crate) fn path_from_pool(
+        &self,
+        pool: &NodePool,
+        end_ref: PolyRef,
+        path: &mut Vec<PolyRef>,
+        max_path: usize,
+    ) -> Result<Status, Error> {
         path.clear();
         if !self.nav.is_valid_poly_ref(end_ref) {
             return Err(Error::InvalidParameter("end_ref"));
         }
         let mut found = Vec::new();
-        self.node_pool.find_nodes(end_ref, &mut found, 1);
+        pool.find_nodes(end_ref, &mut found, 1);
         match found.first() {
-            Some(&n) if self.node_pool.nodes[n].flags & NODE_CLOSED != 0 => {
+            Some(&n) if pool.nodes[n].flags & NODE_CLOSED != 0 => {
                 // Same walk as findPath's getPathToNode.
-                let nodes = &self.node_pool.nodes;
+                let nodes = &pool.nodes;
                 let mut length = 0usize;
                 let mut cur = Some(n);
                 while let Some(c) = cur {
@@ -522,6 +695,22 @@ impl<'a> NavMeshQuery<'a> {
         max: usize,
     ) -> Result<Status, Error> {
         out.clear();
+        self.check_circle(start_ref, center, radius)?;
+        let mut st = self.neighbourhood_start(start_ref, out, max)?;
+        let radius_sqr = sqr(radius);
+        while !st.stack.is_empty() {
+            self.neighbourhood_step(&mut st, center, radius_sqr, filter, out, max);
+        }
+        Ok(Status(st.status))
+    }
+
+    /// The argument checks shared by the circle queries.
+    pub(crate) fn check_circle(
+        &self,
+        start_ref: PolyRef,
+        center: &[f32; 3],
+        radius: f32,
+    ) -> Result<(), Error> {
         if !self.nav.is_valid_poly_ref(start_ref)
             || !visfinite(center)
             || radius < 0.0
@@ -529,8 +718,16 @@ impl<'a> NavMeshQuery<'a> {
         {
             return Err(Error::InvalidParameter("ref, center or radius"));
         }
-        const MAX_STACK: usize = 48;
-        let mut stack: Vec<usize> = Vec::with_capacity(MAX_STACK);
+        Ok(())
+    }
+
+    /// Seeds the tiny node pool with the start polygon and puts it in `out`.
+    pub(crate) fn neighbourhood_start(
+        &mut self,
+        start_ref: PolyRef,
+        out: &mut Vec<(PolyRef, PolyRef)>,
+        max: usize,
+    ) -> Result<NeighbourhoodState, Error> {
         self.tiny_node_pool.clear();
         let sn = self
             .tiny_node_pool
@@ -542,95 +739,107 @@ impl<'a> NavMeshQuery<'a> {
             n.id = start_ref;
             n.flags = NODE_CLOSED;
         }
-        stack.push(sn);
-        let radius_sqr = sqr(radius);
-        let mut pa = [0.0f32; VERTS_PER_POLYGON * 3];
-        let mut pb = [0.0f32; VERTS_PER_POLYGON * 3];
         let mut status = Status::SUCCESS;
         if max > 0 {
             out.push((start_ref, 0));
         } else {
             status |= Status::BUFFER_TOO_SMALL;
         }
-        while !stack.is_empty() {
-            let cur = stack.remove(0);
-            let cur_tp = self.tp(self.tiny_node_pool.nodes[cur].id);
-            let (cur_ref, ctile, cpoly) = cur_tp;
-            let mut li = cpoly.first_link;
-            while li != NULL_LINK {
-                let link = ctile.links[li as usize];
-                li = link.next;
-                let nref = link.r#ref;
-                if nref == 0 {
-                    continue;
-                }
-                let Some(nn) = self.tiny_node_pool.get_node(nref, 0) else {
-                    continue;
-                };
-                if self.tiny_node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
-                    continue;
-                }
-                let nei = self.tp(nref);
-                if nei.2.poly_type() == POLYTYPE_OFFMESH_CONNECTION
-                    || !filter.pass_filter(nref, nei.1, nei.2)
-                {
-                    continue;
-                }
-                let Some((va, vb)) = self.portal_points_tp(cur_tp, nei) else {
-                    continue;
-                };
-                if distance_pt_seg_sqr_2d(center, &va, &vb).0 > radius_sqr {
-                    continue;
-                }
-                {
-                    let n = &mut self.tiny_node_pool.nodes[nn];
-                    n.flags |= NODE_CLOSED;
-                    n.pidx = NodePool::idx(cur);
-                }
-                let npa = nei.2.vert_count as usize;
-                for k in 0..npa {
-                    let v = nei.2.verts[k] as usize * 3;
-                    pa[k * 3..k * 3 + 3].copy_from_slice(&nei.1.verts[v..v + 3]);
-                }
-                let mut overlap = false;
-                for &(past_ref, _) in out.iter() {
-                    let mut connected = false;
-                    let mut k = cpoly.first_link;
-                    while k != NULL_LINK {
-                        if ctile.links[k as usize].r#ref == past_ref {
-                            connected = true;
-                            break;
-                        }
-                        k = ctile.links[k as usize].next;
-                    }
-                    if connected {
-                        continue;
-                    }
-                    let (_, pt, pp) = self.tp(past_ref);
-                    let npb = pp.vert_count as usize;
-                    for k in 0..npb {
-                        let v = pp.verts[k] as usize * 3;
-                        pb[k * 3..k * 3 + 3].copy_from_slice(&pt.verts[v..v + 3]);
-                    }
-                    if overlap_poly_poly_2d(&pa, npa, &pb, npb) {
-                        overlap = true;
+        Ok(NeighbourhoodState {
+            stack: alloc::vec![sn],
+            status,
+        })
+    }
+
+    /// Expands one polygon of `findLocalNeighbourhood`.
+    pub(crate) fn neighbourhood_step(
+        &mut self,
+        st: &mut NeighbourhoodState,
+        center: &[f32; 3],
+        radius_sqr: f32,
+        filter: &dyn QueryFilter,
+        out: &mut Vec<(PolyRef, PolyRef)>,
+        max: usize,
+    ) {
+        const MAX_STACK: usize = 48;
+        let mut pa = [0.0f32; VERTS_PER_POLYGON * 3];
+        let mut pb = [0.0f32; VERTS_PER_POLYGON * 3];
+        let cur = st.stack.remove(0);
+        let cur_tp = self.tp(self.tiny_node_pool.nodes[cur].id);
+        let (cur_ref, ctile, cpoly) = cur_tp;
+        let mut li = cpoly.first_link;
+        while li != NULL_LINK {
+            let link = ctile.links[li as usize];
+            li = link.next;
+            let nref = link.r#ref;
+            if nref == 0 {
+                continue;
+            }
+            let Some(nn) = self.tiny_node_pool.get_node(nref, 0) else {
+                continue;
+            };
+            if self.tiny_node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
+                continue;
+            }
+            let nei = self.tp(nref);
+            if nei.2.poly_type() == POLYTYPE_OFFMESH_CONNECTION
+                || !filter.pass_filter(nref, nei.1, nei.2)
+            {
+                continue;
+            }
+            let Some((va, vb)) = self.portal_points_tp(cur_tp, nei) else {
+                continue;
+            };
+            if distance_pt_seg_sqr_2d(center, &va, &vb).0 > radius_sqr {
+                continue;
+            }
+            {
+                let n = &mut self.tiny_node_pool.nodes[nn];
+                n.flags |= NODE_CLOSED;
+                n.pidx = NodePool::idx(cur);
+            }
+            let npa = nei.2.vert_count as usize;
+            for k in 0..npa {
+                let v = nei.2.verts[k] as usize * 3;
+                pa[k * 3..k * 3 + 3].copy_from_slice(&nei.1.verts[v..v + 3]);
+            }
+            let mut overlap = false;
+            for &(past_ref, _) in out.iter() {
+                let mut connected = false;
+                let mut k = cpoly.first_link;
+                while k != NULL_LINK {
+                    if ctile.links[k as usize].r#ref == past_ref {
+                        connected = true;
                         break;
                     }
+                    k = ctile.links[k as usize].next;
                 }
-                if overlap {
+                if connected {
                     continue;
                 }
-                if out.len() < max {
-                    out.push((nref, cur_ref));
-                } else {
-                    status |= Status::BUFFER_TOO_SMALL;
+                let (_, pt, pp) = self.tp(past_ref);
+                let npb = pp.vert_count as usize;
+                for k in 0..npb {
+                    let v = pp.verts[k] as usize * 3;
+                    pb[k * 3..k * 3 + 3].copy_from_slice(&pt.verts[v..v + 3]);
                 }
-                if stack.len() < MAX_STACK {
-                    stack.push(nn);
+                if overlap_poly_poly_2d(&pa, npa, &pb, npb) {
+                    overlap = true;
+                    break;
                 }
             }
+            if overlap {
+                continue;
+            }
+            if out.len() < max {
+                out.push((nref, cur_ref));
+            } else {
+                st.status |= Status::BUFFER_TOO_SMALL;
+            }
+            if st.stack.len() < MAX_STACK {
+                st.stack.push(nn);
+            }
         }
-        Ok(Status(status))
     }
 
     /// Wall and (optionally) portal segments of a polygon (`getPolyWallSegments`),
@@ -749,145 +958,126 @@ impl<'a> NavMeshQuery<'a> {
         max_radius: f32,
         filter: &dyn QueryFilter,
     ) -> Result<(f32, [f32; 3], [f32; 3], Status), Error> {
-        if !self.nav.is_valid_poly_ref(start_ref)
-            || !visfinite(center)
-            || max_radius < 0.0
-            || !max_radius.is_finite()
-        {
-            return Err(Error::InvalidParameter("ref, center or radius"));
-        }
-        self.node_pool.clear();
-        self.open_list.clear();
-        let sn = self
-            .node_pool
-            .get_node(start_ref, 0)
-            .ok_or(Error::AllocationFailed)?;
-        {
-            let n = &mut self.node_pool.nodes[sn];
-            n.pos = *center;
-            n.pidx = 0;
-            n.cost = 0.0;
-            n.total = 0.0;
-            n.id = start_ref;
-            n.flags = NODE_OPEN;
-        }
-        self.open_list.push(sn, &self.node_pool.nodes);
-        let mut radius_sqr = sqr(max_radius);
-        let mut hit_pos = [0.0f32; 3];
-        let mut status = Status::SUCCESS;
+        self.check_circle(start_ref, center, max_radius)?;
+        self.dijkstra_start(start_ref, center)?;
+        let mut st = WallState::new(max_radius);
         while !self.open_list.empty() {
-            let bn = self.open_list.pop(&self.node_pool.nodes);
-            self.node_pool.nodes[bn].flags &= !NODE_OPEN;
-            self.node_pool.nodes[bn].flags |= NODE_CLOSED;
-            let best = self.tp(self.node_pool.nodes[bn].id);
-            let (best_ref, btile, bpoly) = best;
-            let parent_ref = NodePool::at_idx(self.node_pool.nodes[bn].pidx)
-                .map_or(0, |i| self.node_pool.nodes[i].id);
-            let base = self
-                .nav
-                .base_ref(self.nav.decode_poly_id_tile(best_ref) as usize);
-            let nv = bpoly.vert_count as usize;
-            let mut j = nv - 1;
-            for i in 0..nv {
-                let jj = j;
-                j = i;
-                if bpoly.neis[jj] & EXT_LINK != 0 {
-                    let mut solid = true;
-                    let mut k = bpoly.first_link;
-                    while k != NULL_LINK {
-                        let link = &btile.links[k as usize];
-                        k = link.next;
-                        if link.edge as usize == jj {
-                            if link.r#ref != 0 {
-                                let nt = self.tp(link.r#ref);
-                                if filter.pass_filter(link.r#ref, nt.1, nt.2) {
-                                    solid = false;
-                                }
+            self.wall_step(&mut st, center, filter);
+        }
+        let (dist, hit_pos, normal) = st.result(center);
+        Ok((dist, hit_pos, normal, Status(st.status)))
+    }
+
+    /// Pops and expands one polygon of `findDistanceToWall`.
+    pub(crate) fn wall_step(
+        &mut self,
+        st: &mut WallState,
+        center: &[f32; 3],
+        filter: &dyn QueryFilter,
+    ) {
+        let bn = self.open_list.pop(&self.node_pool.nodes);
+        self.node_pool.nodes[bn].flags &= !NODE_OPEN;
+        self.node_pool.nodes[bn].flags |= NODE_CLOSED;
+        let best = self.tp(self.node_pool.nodes[bn].id);
+        let (best_ref, btile, bpoly) = best;
+        let parent_ref = NodePool::at_idx(self.node_pool.nodes[bn].pidx)
+            .map_or(0, |i| self.node_pool.nodes[i].id);
+        let base = self
+            .nav
+            .base_ref(self.nav.decode_poly_id_tile(best_ref) as usize);
+        let nv = bpoly.vert_count as usize;
+        let mut j = nv - 1;
+        for i in 0..nv {
+            let jj = j;
+            j = i;
+            if bpoly.neis[jj] & EXT_LINK != 0 {
+                let mut solid = true;
+                let mut k = bpoly.first_link;
+                while k != NULL_LINK {
+                    let link = &btile.links[k as usize];
+                    k = link.next;
+                    if link.edge as usize == jj {
+                        if link.r#ref != 0 {
+                            let nt = self.tp(link.r#ref);
+                            if filter.pass_filter(link.r#ref, nt.1, nt.2) {
+                                solid = false;
                             }
-                            break;
                         }
-                    }
-                    if !solid {
-                        continue;
-                    }
-                } else if bpoly.neis[jj] != 0 {
-                    let idx = (bpoly.neis[jj] - 1) as usize;
-                    if filter.pass_filter(base | idx as PolyRef, btile, &btile.polys[idx]) {
-                        continue;
+                        break;
                     }
                 }
-                let vj = &btile.verts[bpoly.verts[jj] as usize * 3..];
-                let vi = &btile.verts[bpoly.verts[i] as usize * 3..];
-                let (d, tseg) = distance_pt_seg_sqr_2d(center, vj, vi);
-                if d > radius_sqr {
+                if !solid {
                     continue;
                 }
-                radius_sqr = d;
-                hit_pos = [
-                    vj[0] + (vi[0] - vj[0]) * tseg,
-                    vj[1] + (vi[1] - vj[1]) * tseg,
-                    vj[2] + (vi[2] - vj[2]) * tseg,
-                ];
+            } else if bpoly.neis[jj] != 0 {
+                let idx = (bpoly.neis[jj] - 1) as usize;
+                if filter.pass_filter(base | idx as PolyRef, btile, &btile.polys[idx]) {
+                    continue;
+                }
             }
-            let mut li = bpoly.first_link;
-            while li != NULL_LINK {
-                let link = btile.links[li as usize];
-                li = link.next;
-                let nref = link.r#ref;
-                if nref == 0 || nref == parent_ref {
-                    continue;
+            let vj = &btile.verts[bpoly.verts[jj] as usize * 3..];
+            let vi = &btile.verts[bpoly.verts[i] as usize * 3..];
+            let (d, tseg) = distance_pt_seg_sqr_2d(center, vj, vi);
+            if d > st.radius_sqr {
+                continue;
+            }
+            st.radius_sqr = d;
+            st.hit_pos = [
+                vj[0] + (vi[0] - vj[0]) * tseg,
+                vj[1] + (vi[1] - vj[1]) * tseg,
+                vj[2] + (vi[2] - vj[2]) * tseg,
+            ];
+        }
+        let mut li = bpoly.first_link;
+        while li != NULL_LINK {
+            let link = btile.links[li as usize];
+            li = link.next;
+            let nref = link.r#ref;
+            if nref == 0 || nref == parent_ref {
+                continue;
+            }
+            let nei = self.tp(nref);
+            if nei.2.poly_type() == POLYTYPE_OFFMESH_CONNECTION {
+                continue;
+            }
+            let va = &btile.verts[bpoly.verts[link.edge as usize] as usize * 3..];
+            let vb = &btile.verts[bpoly.verts[(link.edge as usize + 1) % nv] as usize * 3..];
+            if distance_pt_seg_sqr_2d(center, va, vb).0 > st.radius_sqr {
+                continue;
+            }
+            if !filter.pass_filter(nref, nei.1, nei.2) {
+                continue;
+            }
+            let Some(nn) = self.node_pool.get_node(nref, 0) else {
+                st.status |= Status::OUT_OF_NODES;
+                continue;
+            };
+            if self.node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
+                continue;
+            }
+            if self.node_pool.nodes[nn].flags == 0 {
+                if let Some(mid) = self.edge_mid_point_tp(best, nei) {
+                    self.node_pool.nodes[nn].pos = mid;
                 }
-                let nei = self.tp(nref);
-                if nei.2.poly_type() == POLYTYPE_OFFMESH_CONNECTION {
-                    continue;
-                }
-                let va = &btile.verts[bpoly.verts[link.edge as usize] as usize * 3..];
-                let vb = &btile.verts[bpoly.verts[(link.edge as usize + 1) % nv] as usize * 3..];
-                if distance_pt_seg_sqr_2d(center, va, vb).0 > radius_sqr {
-                    continue;
-                }
-                if !filter.pass_filter(nref, nei.1, nei.2) {
-                    continue;
-                }
-                let Some(nn) = self.node_pool.get_node(nref, 0) else {
-                    status |= Status::OUT_OF_NODES;
-                    continue;
-                };
-                if self.node_pool.nodes[nn].flags & NODE_CLOSED != 0 {
-                    continue;
-                }
-                if self.node_pool.nodes[nn].flags == 0 {
-                    if let Some(mid) = self.edge_mid_point_tp(best, nei) {
-                        self.node_pool.nodes[nn].pos = mid;
-                    }
-                }
-                let bpos = self.node_pool.nodes[bn].pos;
-                let total =
-                    self.node_pool.nodes[bn].total + vdist(&bpos, &self.node_pool.nodes[nn].pos);
-                let n = &mut self.node_pool.nodes[nn];
-                if n.flags & NODE_OPEN != 0 && no_better(total, n.total) {
-                    continue;
-                }
-                n.id = nref;
-                n.flags &= !NODE_CLOSED;
-                n.pidx = NodePool::idx(bn);
-                n.total = total;
-                if n.flags & NODE_OPEN != 0 {
-                    self.open_list.modify(nn, &self.node_pool.nodes);
-                } else {
-                    n.flags |= NODE_OPEN;
-                    self.open_list.push(nn, &self.node_pool.nodes);
-                }
+            }
+            let bpos = self.node_pool.nodes[bn].pos;
+            let total =
+                self.node_pool.nodes[bn].total + vdist(&bpos, &self.node_pool.nodes[nn].pos);
+            let n = &mut self.node_pool.nodes[nn];
+            if n.flags & NODE_OPEN != 0 && no_better(total, n.total) {
+                continue;
+            }
+            n.id = nref;
+            n.flags &= !NODE_CLOSED;
+            n.pidx = NodePool::idx(bn);
+            n.total = total;
+            if n.flags & NODE_OPEN != 0 {
+                self.open_list.modify(nn, &self.node_pool.nodes);
+            } else {
+                n.flags |= NODE_OPEN;
+                self.open_list.push(nn, &self.node_pool.nodes);
             }
         }
-        let mut normal = vsub(center, &hit_pos);
-        vnormalize(&mut normal);
-        Ok((
-            crate::common::sqrtf(radius_sqr),
-            hit_pos,
-            normal,
-            Status(status),
-        ))
     }
 
     /// Whether a ref is valid and passes the filter (`isValidPolyRef`).

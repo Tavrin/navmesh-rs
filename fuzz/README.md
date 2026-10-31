@@ -32,7 +32,23 @@ layer. It is decoded, run through region/contour/poly building under limits, and
 the cache beside a fixed flat layer; the operations add cylinder, box and oriented-box
 obstacles, remove them, and update or drain the rebuild queue.
 
-Both have seed writers:
+Operation 6 of `crowd_update` is `Crowd::update_budgeted` with a budget read from the two tail
+bytes (0 to 3 as is, larger values times 256); it asserts the budget is never overspent.
+
+`budgeted_query` takes one flag byte (bit 0: global off-mesh links on from the start) and up to 48
+operations of 4 bytes `[op, a, b, c]` on a row of six single-polygon tiles: add a tile (optionally
+with an off-mesh connection to another tile), remove a tile, toggle global off-mesh links, run
+every budgeted query under a budget of 0 to 199 (200 and above is effectively unlimited), or run
+the resumable searches in steps of `c` (after a zero-budget step) to the end. Properties: a
+`Complete` outcome equals the unbudgeted call, a large budget always completes, a resumed search
+equals the unbudgeted query, and a budget is never overspent. Seed writer and run:
+
+```sh
+cargo run --release --bin seeds -- budget corpus/budgeted_query
+cargo +nightly fuzz run budgeted_query corpus/budgeted_query -- -max_len=200
+```
+
+`crowd_update` and `tilecache_update` have seed writers:
 
 ```sh
 cargo run --release --bin seeds -- crowd corpus/crowd_update

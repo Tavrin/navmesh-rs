@@ -13,7 +13,7 @@ use crate::detour::{
     DefaultFilter, NavMesh, NavMeshQuery, PolyRef, QueryFilter, STRAIGHTPATH_END,
     STRAIGHTPATH_OFFMESH_CONNECTION, Status, StraightPathPoint,
 };
-use crate::{Error, Workspace};
+use crate::{Budget, Budgeted, Error, Limits, Workspace};
 use alloc::vec::Vec;
 mod avoidance;
 mod boundary;

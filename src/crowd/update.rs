@@ -226,6 +226,49 @@ impl Crowd {
         }
         Ok(())
     }
+    /// [`Crowd::update`] under a work budget (not in recastnavigation): the workspace's
+    /// work limit for the tick becomes the smaller of its own and what `budget` has
+    /// left, and the work the tick charged is spent from `budget`.
+    ///
+    /// A tick is not resumable: its phases run in upstream's order and each sees the
+    /// previous one's result. If `budget` cannot cover the up-front charge of
+    /// `4096` units per agent (`Workspace::usage` after any tick shows the real
+    /// cost) the outcome is [`Budgeted::Exhausted`] and the crowd is untouched. If
+    /// it runs out later the outcome is also `Exhausted`, with the same caveat as a
+    /// [`Error::LimitExceeded`] from `update`: earlier phases were applied, so the
+    /// caller should discard that tick (and give the next one a larger budget or
+    /// fewer agents). Within the budget the result equals `update`'s.
+    pub fn update_budgeted(
+        &mut self,
+        ws: &mut Workspace,
+        nav: &NavMesh,
+        dt: f32,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<()>, Error> {
+        let saved = ws.limits();
+        let allowed = saved.max_work.min(budget.remaining());
+        ws.set_limits(Limits {
+            max_work: allowed,
+            ..saved
+        });
+        let result = self.update(ws, nav, dt);
+        ws.set_limits(saved);
+        let used = ws.usage().work;
+        match result {
+            Ok(()) => {
+                budget.spend(used);
+                Ok(Budgeted::Complete(()))
+            }
+            // The work counter went over the allowance: the budget (not the byte
+            // limit) stopped the tick.
+            Err(Error::LimitExceeded) if used > allowed => {
+                budget.exhaust();
+                Ok(Budgeted::Exhausted(()))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Advances the crowd in upstream phase order. `dt` must be finite and
     /// nonnegative. Workspace limits bound allocation and charged simulation work.
     /// An error can leave earlier phases applied; discard that tick's result.

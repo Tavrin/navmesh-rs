@@ -91,6 +91,16 @@ impl NodePool {
         self.count = 0;
     }
 
+    /// A new empty pool with this pool's node and hash sizes.
+    pub fn same_shape(&self) -> Result<NodePool, Error> {
+        NodePool::new(self.max_nodes, self.first.len())
+    }
+
+    /// The node capacity.
+    pub fn max_nodes(&self) -> usize {
+        self.max_nodes
+    }
+
     #[inline]
     fn bucket(&self, id: PolyRef) -> usize {
         (hash_ref(id) as usize) & (self.first.len() - 1)

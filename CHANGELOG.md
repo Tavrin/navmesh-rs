@@ -6,6 +6,26 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-31
+
+### Added
+
+- Opt-in global off-mesh links (`NavMesh::set_global_off_mesh_links`, not in recastnavigation):
+  a connection resolves its far endpoint in any loaded tile, relinked on tile removal and
+  re-addition in either order. Default behaviour is unchanged.
+
+- Work budgets on every query (not in recastnavigation): `Budget`, `Budgeted` and `Progress`;
+  `find_path_budgeted`, `find_straight_path_budgeted`, `query_polygons_budgeted`,
+  `find_nearest_poly_budgeted`, `find_random_point_budgeted`,
+  `find_random_point_around_circle_budgeted` and `Crowd::update_budgeted`; resumable
+  `begin_polys_around_circle`/`_shape`, `begin_distance_to_wall`, `begin_local_neighbourhood`,
+  `begin_move_along_surface` and `begin_raycast`. Unbudgeted calls are unchanged and share the
+  per-polygon code with the budgeted ones.
+- Cross-platform determinism contract with the `libm` feature: every recorded output is identical
+  on x86-64 Linux, AArch64 Linux and wasm32. `reference/determinism.golden` and
+  `reference/determinism.sh` check it; CI runs the check on all three targets.
+- `nav-port digest` and `nav-port budget` in the parity crate; `fetch.sh --public-only`.
+
 ## [0.1.2] - 2026-10-31
 
 - Reject grids with exactly one zero dimension with a typed error instead of
@@ -23,6 +43,10 @@ All notable changes to this project are documented in this file. The format foll
 ## [0.1.1] - 2026-10-30
 
 ### Added
+
+- Opt-in global off-mesh links (`NavMesh::set_global_off_mesh_links`, not in recastnavigation):
+  a connection resolves its far endpoint in any loaded tile, relinked on tile removal and
+  re-addition in either order. Default behaviour is unchanged.
 
 - Crowd simulation: corridor maintenance, steering, separation, local avoidance,
   path queues and off-mesh animation.
@@ -58,6 +82,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Opt-in global off-mesh links (`NavMesh::set_global_off_mesh_links`, not in recastnavigation):
+  a connection resolves its far endpoint in any loaded tile, relinked on tile removal and
+  re-addition in either order. Default behaviour is unchanged.
+
 - Recast navmesh generation, including all three partitions, area volumes and
   heightfield layers.
 - Detour tile creation, tiled navmeshes, off-mesh connections and navmesh queries
@@ -65,7 +93,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/Tavrin/navmesh-rs/releases/tag/v0.1.0

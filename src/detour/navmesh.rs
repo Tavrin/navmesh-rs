@@ -62,6 +62,8 @@ pub struct NavMesh {
     /// Tile-grid bounds (min x, min y, max x, max y) covering every resident tile
     /// (grown on add, reset when the navmesh empties).
     occupied: Option<[i32; 4]>,
+    /// Whether off-mesh connections resolve their far endpoint in any tile.
+    global_off_mesh: bool,
 }
 
 /// Where [`NavMesh::insert_tile`] puts a tile.
@@ -409,6 +411,7 @@ impl NavMesh {
             limits,
             resident: 0,
             occupied: None,
+            global_off_mesh: false,
         })
     }
 
@@ -894,6 +897,9 @@ impl NavMesh {
                 self.connect_ext_off_mesh_links(j, ti, opposite_tile(i));
             }
         }
+        if self.global_off_mesh {
+            self.connect_global_pairs(ti);
+        }
         Ok(self.tile_ref(ti))
     }
 
@@ -945,6 +951,9 @@ impl NavMesh {
             for j in self.neighbour_tiles_at(x, y, i) {
                 self.unconnect_links(j, ti);
             }
+        }
+        if self.global_off_mesh {
+            self.disconnect_global_pairs(ti);
         }
         let tile = self.slots[ti].tile.take();
         let mask = ((1u64 << self.salt_bits) - 1) as u32;
@@ -1137,6 +1146,27 @@ impl NavMesh {
     }
 
     fn connect_ext_off_mesh_links(&mut self, ti: usize, target: usize, side: i32) {
+        self.link_off_mesh(ti, target, side, false);
+    }
+
+    /// Links the off-mesh connections of `target` whose far endpoint lies outside its
+    /// bounds to the polygons of `ti`, wherever `ti` is in the grid (global links,
+    /// not in recastnavigation). Pairs upstream already resolves are left to it.
+    fn connect_global_off_mesh_links(&mut self, ti: usize, target: usize) {
+        self.link_off_mesh(ti, target, -1, true);
+    }
+
+    /// Whether upstream resolves the far endpoint of a connection of `owner` with
+    /// `con_side` in tile `landing`: the neighbour tile in direction `con_side`.
+    fn upstream_resolves(&self, owner: usize, con_side: u8, landing: usize) -> bool {
+        let Some(t) = self.slots[owner].tile.as_ref() else {
+            return false;
+        };
+        self.neighbour_tiles_at(t.header.x, t.header.y, i32::from(con_side))
+            .contains(&landing)
+    }
+
+    fn link_off_mesh(&mut self, ti: usize, target: usize, side: i32, global: bool) {
         let opposite = if side == -1 {
             0xff
         } else {
@@ -1151,7 +1181,12 @@ impl NavMesh {
         for i in 0..ncons {
             let tt = self.tile_unchecked(target as u32);
             let con = tt.off_mesh_cons[i];
-            if con.side != opposite {
+            if global {
+                if con.side == 0xff || ti == target || self.upstream_resolves(target, con.side, ti)
+                {
+                    continue;
+                }
+            } else if con.side != opposite {
                 continue;
             }
             let cp = con.poly as usize;
@@ -1177,7 +1212,7 @@ impl NavMesh {
                 let l = &mut tt.links[idx as usize];
                 l.r#ref = tile_base | ip as PolyRef;
                 l.edge = 1;
-                l.side = opposite;
+                l.side = if global { 0xff } else { opposite };
                 l.bmin = 0;
                 l.bmax = 0;
                 l.next = first;
@@ -1192,13 +1227,130 @@ impl NavMesh {
                     let l = &mut tile.links[tidx as usize];
                     l.r#ref = target_base | con.poly as PolyRef;
                     l.edge = 0xff;
-                    l.side = if side == -1 { 0xff } else { side as u8 };
+                    l.side = if global || side == -1 {
+                        0xff
+                    } else {
+                        side as u8
+                    };
                     l.bmin = 0;
                     l.bmax = 0;
                     l.next = first;
                     tile.polys[land].first_link = tidx;
                 }
             }
+        }
+    }
+
+    fn has_off_mesh_cons(&self, ti: usize) -> bool {
+        self.slots[ti]
+            .tile
+            .as_ref()
+            .is_some_and(|t| !t.off_mesh_cons.is_empty())
+    }
+
+    /// Global links of a tile that was just added, in both roles.
+    fn connect_global_pairs(&mut self, ti: usize) {
+        let mine = self.has_off_mesh_cons(ti);
+        for j in 0..self.slots.len() {
+            if j == ti || self.slots[j].tile.is_none() {
+                continue;
+            }
+            if self.has_off_mesh_cons(j) {
+                self.connect_global_off_mesh_links(ti, j);
+            }
+            if mine {
+                self.connect_global_off_mesh_links(j, ti);
+            }
+        }
+    }
+
+    /// Removes the global links between `ti` and every other tile, in both roles.
+    fn disconnect_global_pairs(&mut self, ti: usize) {
+        for j in 0..self.slots.len() {
+            if j != ti && self.slots[j].tile.is_some() {
+                self.disconnect_global_pair(j, ti);
+                self.disconnect_global_pair(ti, j);
+            }
+        }
+    }
+
+    /// Removes the global links of `owner`'s connections into `landing`: the links
+    /// from the connection polygons and the return links of bidirectional ones.
+    fn disconnect_global_pair(&mut self, owner: usize, landing: usize) {
+        let owner_base = self.base_ref(owner);
+        let landing_num = landing as u32;
+        let (pb, tb) = (self.poly_bits, self.tile_bits);
+        let decode_tile = move |r: PolyRef| ((r >> pb) & (((1u64 << tb) - 1) as PolyRef)) as u32;
+        let cons: Vec<(u8, u16)> = self.slots[owner].tile.as_ref().map_or(Vec::new(), |t| {
+            t.off_mesh_cons.iter().map(|c| (c.side, c.poly)).collect()
+        });
+        for (con_side, poly) in cons {
+            if con_side == 0xff || self.upstream_resolves(owner, con_side, landing) {
+                continue;
+            }
+            let con_ref = owner_base | PolyRef::from(poly);
+            let tile = self.tile_mut(owner);
+            remove_links_where(tile, Some(poly as usize), |r| decode_tile(r) == landing_num);
+            let tile = self.tile_mut(landing);
+            remove_links_where(tile, None, |r| r == con_ref);
+        }
+    }
+
+    /// Whether off-mesh connections resolve their far endpoint in any loaded tile
+    /// (see [`NavMesh::set_global_off_mesh_links`]).
+    pub fn global_off_mesh_links(&self) -> bool {
+        self.global_off_mesh
+    }
+
+    /// Opt-in extension (not in recastnavigation): lets an off-mesh connection
+    /// resolve its far endpoint in **any** loaded tile.
+    ///
+    /// Upstream links a connection whose far endpoint lies outside its tile only into
+    /// the neighbour tile in the direction of that endpoint, so a connection spanning
+    /// several tiles (a teleporter, an elevator) never gets a landing polygon. With
+    /// this on, such a connection is also resolved in every other tile, in whatever
+    /// order the tiles are loaded: adding a tile links it to the connections of all
+    /// resident tiles and the connections it owns to all resident tiles, and removing
+    /// a tile drops exactly those links, so removing and re-adding either tile
+    /// restores the path. Connections whose far endpoint lies inside their own tile
+    /// and the pairs upstream resolves are untouched, so the default (off) and every
+    /// pair upstream handles are identical to upstream.
+    ///
+    /// Endpoint snapping is upstream's: the far endpoint is moved to the nearest point
+    /// on the nearest polygon of the candidate tile, which is found within the
+    /// connection radius horizontally (a circle test on the distance to the snapped
+    /// point) and the tile's walkable climb vertically (the search box is
+    /// `[radius, walkable_climb, radius]` around the authored endpoint), both measured
+    /// from the endpoint as authored. Turning this on or off relinks the resident
+    /// tiles; cost is proportional to the tiles with off-mesh connections times the
+    /// resident tiles.
+    pub fn set_global_off_mesh_links(&mut self, enabled: bool) {
+        if enabled == self.global_off_mesh {
+            return;
+        }
+        let resident: Vec<usize> = (0..self.slots.len())
+            .filter(|&i| self.slots[i].tile.is_some())
+            .collect();
+        if enabled {
+            self.global_off_mesh = true;
+            for &owner in &resident {
+                if self.has_off_mesh_cons(owner) {
+                    for &landing in &resident {
+                        if landing != owner {
+                            self.connect_global_off_mesh_links(landing, owner);
+                        }
+                    }
+                }
+            }
+        } else {
+            for &owner in &resident {
+                for &landing in &resident {
+                    if landing != owner {
+                        self.disconnect_global_pair(owner, landing);
+                    }
+                }
+            }
+            self.global_off_mesh = false;
         }
     }
 
@@ -1224,6 +1376,35 @@ impl NavMesh {
                     pj = j;
                     j = tile.links[j as usize].next;
                 }
+            }
+        }
+    }
+}
+
+/// Frees the links of `tile`'s polygons (only `poly` when given) whose target
+/// satisfies `drop`.
+fn remove_links_where(tile: &mut MeshTile, poly: Option<usize>, drop: impl Fn(PolyRef) -> bool) {
+    let range = match poly {
+        Some(p) if p < tile.polys.len() => p..p + 1,
+        Some(_) => return,
+        None => 0..tile.polys.len(),
+    };
+    for i in range {
+        let mut j = tile.polys[i].first_link;
+        let mut pj = NULL_LINK;
+        while j != NULL_LINK {
+            if drop(tile.links[j as usize].r#ref) {
+                let nj = tile.links[j as usize].next;
+                if pj == NULL_LINK {
+                    tile.polys[i].first_link = nj;
+                } else {
+                    tile.links[pj as usize].next = nj;
+                }
+                free_link(tile, j);
+                j = nj;
+            } else {
+                pj = j;
+                j = tile.links[j as usize].next;
             }
         }
     }

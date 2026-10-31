@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! nav-port bake  <case-file> --records FILE
+//! nav-port digest <case-file>              # record digests, for the determinism check
 //! nav-port bench <case-file> [--repeat N]
 //! nav-port verify-parallel <case-file>       # requires parallel feature
 //! nav-port bench-tiles <case-file> --threads N [--repeat N]
@@ -1531,9 +1532,383 @@ fn bench_extension(c: &Case, g: &Geometry, threads: usize, repeat: usize) -> Res
     Ok(())
 }
 
+/// Checks the budgeted query forms over a case's query set and prints the cost table.
+///
+/// For every budgeted or resumable query: the result under a sufficient budget (and,
+/// for resumable ones, when stepped eight units at a time) equals the unbudgeted
+/// call, and no call or step spends more than its budget. Prints a markdown table of
+/// the worst work and wall time per call at several budgets.
+fn budget_check(c: &Case, g: &Geometry) -> Result<(), String> {
+    use navmesh_rs::{Budget, Budgeted, Progress};
+    let b = bake(c, g, &mut Sink { writer: None }).map_err(|e| format!("bake failed: {e}"))?;
+    let nav = assemble(&b).map_err(|e| format!("navmesh: {e}"))?;
+    let mut q = NavMeshQuery::new(&nav, 2048).map_err(|e| e.to_string())?;
+    let f = DefaultFilter::default();
+    let seed = if c.seed != 0 { c.seed } else { 1 };
+    let mut rng = Rng(seed);
+    let (mut refs, mut pts) = (Vec::new(), Vec::new());
+    for _ in 0..c.queries.max(2) {
+        if let Ok((r, p)) = q.find_random_point(&f, &mut || rng.frand()) {
+            refs.push(r);
+            pts.push(p);
+        }
+    }
+    if refs.len() < 2 {
+        return Err("no random points on the navmesh".into());
+    }
+    let pairs = refs.len() - 1;
+    const MAXP: usize = 256;
+    const HUGE: u64 = u64::MAX / 2;
+    const STEP: u64 = 8;
+    let budgets = [1u64, 16, 64, 256, 1024, HUGE];
+    let ext = [2.0f32, 4.0, 2.0];
+    let mut rows: Vec<(&str, u64, u64, f64)> = Vec::new();
+    let mut fail: Vec<String> = Vec::new();
+    macro_rules! same {
+        ($name:expr, $a:expr, $b:expr, $i:expr) => {
+            if $a != $b {
+                fail.push(format!("{} differs on query {}", $name, $i));
+            }
+        };
+    }
+    // Worst work and wall time of `$call` (an expression using `bud`) per budget.
+    macro_rules! measure {
+        ($name:expr, |$i:ident, $bud:ident| $call:expr) => {
+            for &limit in &budgets {
+                let (mut work, mut micros) = (0u64, 0f64);
+                for $i in 0..pairs {
+                    let _ = &$i;
+                    let mut $bud = Budget::new(limit);
+                    let t0 = Instant::now();
+                    let _ = $call;
+                    micros = micros.max(t0.elapsed().as_secs_f64() * 1e6);
+                    if $bud.used() > limit {
+                        fail.push(format!("{} spent {} of {limit}", $name, $bud.used()));
+                    }
+                    work = work.max($bud.used());
+                }
+                rows.push(($name, limit, work, micros));
+            }
+        };
+    }
+    let mut path = Vec::new();
+    let mut path2 = Vec::new();
+    for i in 0..pairs {
+        let (s, e, sp, ep) = (refs[i], refs[i + 1], pts[i], pts[i + 1]);
+        let probe = [sp[0] + 0.37, sp[1] + 1.0, sp[2] - 0.21];
+        // find_path
+        let st = q.find_path(s, e, &sp, &ep, &f, &mut path, MAXP);
+        let mut bud = Budget::new(HUGE);
+        let bs = q.find_path_budgeted(s, e, &sp, &ep, &f, &mut path2, MAXP, &mut bud);
+        same!(
+            "find_path",
+            st.as_ref().ok().copied(),
+            bs.as_ref().ok().map(|x| *x.value()),
+            i
+        );
+        same!("find_path", &path, &path2, i);
+        if !bs.is_ok_and(|x| x.is_complete()) {
+            fail.push(format!("find_path not complete on query {i}"));
+        }
+        // find_straight_path
+        let mut sp1 = Vec::new();
+        let mut sp2 = Vec::new();
+        let a = q.find_straight_path(&sp, &ep, &path, &mut sp1, MAXP, 0);
+        let mut bud = Budget::new(HUGE);
+        let bb = q.find_straight_path_budgeted(&sp, &ep, &path, &mut sp2, MAXP, 0, &mut bud);
+        same!(
+            "find_straight_path",
+            a.as_ref().ok().copied(),
+            bb.as_ref().ok().map(|x| *x.value()),
+            i
+        );
+        same!("find_straight_path", &sp1, &sp2, i);
+        // nearest poly and box query
+        let a = q.find_nearest_poly(&probe, &ext, &f).ok();
+        let mut bud = Budget::new(HUGE);
+        let bb = q
+            .find_nearest_poly_budgeted(&probe, &ext, &f, &mut bud)
+            .ok();
+        same!("find_nearest_poly", a, bb.map(Budgeted::into_value), i);
+        let (mut p1, mut p2) = (Vec::new(), Vec::new());
+        let a = q.query_polygons(&probe, &ext, &f, &mut p1, 64).ok();
+        let bb = q
+            .query_polygons_budgeted(&probe, &ext, &f, &mut p2, 64, &mut Budget::new(HUGE))
+            .ok();
+        same!("query_polygons", a, bb.map(Budgeted::into_value), i);
+        same!("query_polygons", &p1, &p2, i);
+        // random points: identical frand sequences
+        let (mut r1, mut r2) = (Rng(seed ^ i as u32), Rng(seed ^ i as u32));
+        let a = q.find_random_point(&f, &mut || r1.frand()).ok();
+        let bb = q
+            .find_random_point_budgeted(&f, &mut || r2.frand(), &mut Budget::new(HUGE))
+            .ok()
+            .and_then(Budgeted::into_value);
+        same!("find_random_point", a, bb, i);
+        let (mut r1, mut r2) = (Rng(seed ^ i as u32), Rng(seed ^ i as u32));
+        let a = q
+            .find_random_point_around_circle(s, &sp, 15.0, &f, &mut || r1.frand())
+            .ok();
+        let bb = q
+            .find_random_point_around_circle_budgeted(
+                s,
+                &sp,
+                15.0,
+                &f,
+                &mut || r2.frand(),
+                &mut Budget::new(HUGE),
+            )
+            .ok()
+            .and_then(Budgeted::into_value);
+        same!("find_random_point_around_circle", a, bb, i);
+        // Dijkstra searches, stepped STEP units at a time against the plain call.
+        macro_rules! stepped {
+            ($search:expr, |$sr:ident| $get:expr) => {{
+                let mut $sr = $search.map_err(|e| e.to_string())?;
+                let mut steps = 0;
+                loop {
+                    let mut bud = Budget::new(STEP);
+                    let p = $sr
+                        .resume(&mut q, &f, &mut bud)
+                        .map_err(|e| e.to_string())?;
+                    if bud.used() > STEP {
+                        fail.push(format!("step spent {} of {STEP}", bud.used()));
+                    }
+                    steps += 1;
+                    if p == Progress::Done || steps > 1_000_000 {
+                        break;
+                    }
+                }
+                $get
+            }};
+        }
+        let mut out1 = Vec::new();
+        let sa = q.find_polys_around_circle(s, &sp, 15.0, &f, &mut out1, MAXP);
+        let last = out1.last().map(|r| r.0);
+        let mut pa = Vec::new();
+        let ra = last.map(|l| q.path_from_dijkstra_search(l, &mut pa, MAXP));
+        let (rb, sb, pb) = stepped!(q.begin_polys_around_circle(s, &sp, 15.0, MAXP), |sr| {
+            let mut pb = Vec::new();
+            let r = last.map(|l| sr.path_to(&q, l, &mut pb, MAXP));
+            (sr.results().to_vec(), sr.status(), (r, pb))
+        });
+        same!("polys_around_circle", &out1, &rb, i);
+        same!("polys_around_circle", sa.ok(), Some(sb), i);
+        same!(
+            "path_to",
+            (ra.and_then(|r| r.ok()), &pa),
+            (pb.0.and_then(|r| r.ok()), &pb.1),
+            i
+        );
+        let sq = [
+            sp[0] - 8.0,
+            sp[1],
+            sp[2] - 8.0,
+            sp[0] - 8.0,
+            sp[1],
+            sp[2] + 8.0,
+            sp[0] + 8.0,
+            sp[1],
+            sp[2] + 8.0,
+            sp[0] + 8.0,
+            sp[1],
+            sp[2] - 8.0,
+        ];
+        let sa = q.find_polys_around_shape(s, &sq, &f, &mut out1, MAXP);
+        let (rb, sb, _) = stepped!(q.begin_polys_around_shape(s, &sq, MAXP), |sr| {
+            (sr.results().to_vec(), sr.status(), ())
+        });
+        same!("polys_around_shape", &out1, &rb, i);
+        same!("polys_around_shape", sa.ok(), Some(sb), i);
+        let a = q.find_distance_to_wall(s, &sp, 15.0, &f).ok();
+        let b = stepped!(q.begin_distance_to_wall(s, &sp, 15.0), |sr| {
+            let (d, h, n) = sr.result();
+            (d, h, n, sr.status())
+        });
+        same!("distance_to_wall", a, Some(b), i);
+        let mut n1 = Vec::new();
+        let sa = q.find_local_neighbourhood(s, &sp, 15.0, &f, &mut n1, MAXP);
+        let (nb, sb) = stepped!(q.begin_local_neighbourhood(s, &sp, 15.0, MAXP), |sr| {
+            (sr.results().to_vec(), sr.status())
+        });
+        same!("local_neighbourhood", &n1, &nb, i);
+        same!("local_neighbourhood", sa.ok(), Some(sb), i);
+        let mut v1 = Vec::new();
+        let a = q.move_along_surface(s, &sp, &ep, &f, &mut v1, MAXP).ok();
+        let (vb, ab) = stepped!(q.begin_move_along_surface(s, &sp, &ep, MAXP), |sr| {
+            let mut v = Vec::new();
+            let r = sr.result(&q, &mut v);
+            (v, r)
+        });
+        same!("move_along_surface", a, Some(ab), i);
+        same!("move_along_surface", &v1, &vb, i);
+        // raycast
+        let opts = detour::RAYCAST_USE_COSTS;
+        let a = q.raycast_with(s, &sp, &ep, &f, opts, MAXP, 0).ok();
+        let mut sr = q
+            .begin_raycast(s, &sp, &ep, opts, MAXP, 0)
+            .map_err(|e| e.to_string())?;
+        loop {
+            let mut bud = Budget::new(STEP);
+            let p = sr.resume(&q, &f, &mut bud).map_err(|e| e.to_string())?;
+            if bud.used() > STEP {
+                fail.push(format!("raycast step spent {} of {STEP}", bud.used()));
+            }
+            if p == Progress::Done {
+                break;
+            }
+        }
+        let (hit, hs) = sr.result();
+        same!("raycast", a, Some((hit.clone(), hs)), i);
+    }
+    // Cost per call at each budget.
+    measure!("find_path", |i, bud| q.find_path_budgeted(
+        refs[i],
+        refs[i + 1],
+        &pts[i],
+        &pts[i + 1],
+        &f,
+        &mut path,
+        MAXP,
+        &mut bud
+    ));
+    let mut corners: Vec<detour::StraightPathPoint> = Vec::new();
+    let mut paths: Vec<Vec<PolyRef>> = Vec::new();
+    for i in 0..pairs {
+        let mut p = Vec::new();
+        let _ = q.find_path(refs[i], refs[i + 1], &pts[i], &pts[i + 1], &f, &mut p, MAXP);
+        paths.push(p);
+    }
+    measure!("find_straight_path", |i, bud| q
+        .find_straight_path_budgeted(
+            &pts[i],
+            &pts[i + 1],
+            &paths[i],
+            &mut corners,
+            MAXP,
+            0,
+            &mut bud
+        ));
+    measure!("query_polygons", |i, bud| q.query_polygons_budgeted(
+        &pts[i],
+        &[40.0, 40.0, 40.0],
+        &f,
+        &mut path,
+        MAXP,
+        &mut bud
+    ));
+    measure!("find_random_point", |i, bud| q.find_random_point_budgeted(
+        &f,
+        &mut || 0.5,
+        &mut bud
+    ));
+    measure!("polys_around_circle", |i, bud| {
+        let mut sr = q
+            .begin_polys_around_circle(refs[i], &pts[i], 40.0, MAXP)
+            .map_err(|e| e.to_string())?;
+        sr.resume(&mut q, &f, &mut bud)
+    });
+    measure!("distance_to_wall", |i, bud| {
+        let mut sr = q
+            .begin_distance_to_wall(refs[i], &pts[i], 40.0)
+            .map_err(|e| e.to_string())?;
+        sr.resume(&mut q, &f, &mut bud)
+    });
+    measure!("local_neighbourhood", |i, bud| {
+        let mut sr = q
+            .begin_local_neighbourhood(refs[i], &pts[i], 40.0, MAXP)
+            .map_err(|e| e.to_string())?;
+        sr.resume(&mut q, &f, &mut bud)
+    });
+    measure!("move_along_surface", |i, bud| {
+        let mut sr = q
+            .begin_move_along_surface(refs[i], &pts[i], &pts[i + 1], MAXP)
+            .map_err(|e| e.to_string())?;
+        sr.resume(&mut q, &f, &mut bud)
+    });
+    measure!("raycast", |i, bud| {
+        let mut sr = q
+            .begin_raycast(refs[i], &pts[i], &pts[i + 1], 0, usize::MAX, 0)
+            .map_err(|e| e.to_string())?;
+        sr.resume(&q, &f, &mut bud)
+    });
+    println!("| query | budget | worst work | worst wall (us) |");
+    println!("|---|---:|---:|---:|");
+    for (name, limit, work, micros) in &rows {
+        let b = if *limit == HUGE {
+            "unlimited".to_string()
+        } else {
+            limit.to_string()
+        };
+        println!("| {name} | {b} | {work} | {micros:.1} |");
+    }
+    if fail.is_empty() {
+        println!(
+            "budget check: {pairs} query pairs, all budgeted forms equal the plain calls and stay within budget"
+        );
+        Ok(())
+    } else {
+        fail.sort();
+        fail.dedup();
+        Err(format!("budget check failed:\n{}", fail.join("\n")))
+    }
+}
+
+/// Bakes a case and returns the record file bytes (also when a stage failed, so a
+/// partial file can be inspected) with the stage result.
+fn bake_records(case: &Case, g: &Geometry, base: &str) -> (Vec<u8>, Result<(), String>) {
+    let mut writer = RecordFileWriter::new(&[
+        ("producer", "nav_port"),
+        ("upstream", UPSTREAM),
+        ("case", base),
+        (
+            "polyref_bits",
+            if detour::POLYREF_BITS == 64 {
+                "64"
+            } else {
+                "32"
+            },
+        ),
+    ]);
+    {
+        let mut p = Payload::new();
+        p.u32((g.verts.len() / 3) as u32);
+        for &v in &g.verts {
+            p.f32(v);
+        }
+        p.u32((g.tris.len() / 3) as u32);
+        for &t in &g.tris {
+            p.i32(t);
+        }
+        writer.record("geometry", p.as_bytes());
+    }
+    let mut sink = Sink {
+        writer: Some(writer),
+    };
+    let res = bake(case, g, &mut sink).map_err(|e| format!("bake failed: {e}"));
+    let res = res.and_then(|mut b| {
+        record_navmesh(&b, &mut sink);
+        if b.tiles.is_empty() {
+            return Ok(());
+        }
+        let mut nav = assemble(&b).map_err(|e| format!("navmesh: {e}"))?;
+        let costs = cost_filter();
+        record_queries(case, &nav, &DefaultFilter::default(), "", &mut sink)
+            .and_then(|()| record_queries(case, &nav, &costs, "filtered.", &mut sink))
+            .map_err(|e| format!("queries: {e}"))?;
+        record_malformed(&b, &nav, &mut sink);
+        record_crowds(case, &b, &mut sink).map_err(|e| format!("crowd: {e}"))?;
+        tilecache_records::record_obstacles(case, &mut b, &mut nav, &mut sink)
+            .map_err(|e| format!("obstacles: {e}"))?;
+        Ok(())
+    });
+    let bytes = sink.writer.take().map(|w| w.finish()).unwrap_or_default();
+    (bytes, res)
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: nav-port bake <case> --records FILE | bench <case> [--repeat N] | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
+    let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | bench <case> [--repeat N] | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
     let (cmd, case_path) = match (args.first(), args.get(1)) {
         (Some(a), Some(b)) => (a.as_str(), b.as_str()),
         _ => return Err(usage.into()),
@@ -1559,54 +1934,26 @@ fn run() -> Result<(), String> {
         }
         "bake" => {
             let out = opt("--records").ok_or(usage)?;
-            let mut writer = RecordFileWriter::new(&[
-                ("producer", "nav_port"),
-                ("upstream", UPSTREAM),
-                ("case", base.as_str()),
-                (
-                    "polyref_bits",
-                    if detour::POLYREF_BITS == 64 {
-                        "64"
-                    } else {
-                        "32"
-                    },
-                ),
-            ]);
-            {
-                let mut p = Payload::new();
-                p.u32((g.verts.len() / 3) as u32);
-                for &v in &g.verts {
-                    p.f32(v);
-                }
-                p.u32((g.tris.len() / 3) as u32);
-                for &t in &g.tris {
-                    p.i32(t);
-                }
-                writer.record("geometry", p.as_bytes());
-            }
-            let mut sink = Sink {
-                writer: Some(writer),
-            };
-            let res = bake(&case, &g, &mut sink).map_err(|e| format!("bake failed: {e}"));
-            let res = res.and_then(|mut b| {
-                record_navmesh(&b, &mut sink);
-                if b.tiles.is_empty() {
-                    return Ok(());
-                }
-                let mut nav = assemble(&b).map_err(|e| format!("navmesh: {e}"))?;
-                let costs = cost_filter();
-                record_queries(&case, &nav, &DefaultFilter::default(), "", &mut sink)
-                    .and_then(|()| record_queries(&case, &nav, &costs, "filtered.", &mut sink))
-                    .map_err(|e| format!("queries: {e}"))?;
-                record_malformed(&b, &nav, &mut sink);
-                record_crowds(&case, &b, &mut sink).map_err(|e| format!("crowd: {e}"))?;
-                tilecache_records::record_obstacles(&case, &mut b, &mut nav, &mut sink)
-                    .map_err(|e| format!("obstacles: {e}"))?;
-                Ok(())
-            });
-            let bytes = sink.writer.take().map(|w| w.finish()).unwrap_or_default();
+            let (bytes, res) = bake_records(&case, &g, &base);
             std::fs::write(out, bytes).map_err(|e| format!("writing {out}: {e}"))?;
             res
+        }
+        "budget" => budget_check(&case, &g),
+        "digest" => {
+            // One line per record (`case record length digest`) and one for the whole
+            // stream: the cross-platform determinism check compares these lines with
+            // `reference/determinism.golden`.
+            let (bytes, res) = bake_records(&case, &g, &base);
+            res?;
+            let name = base.trim_end_matches(".case");
+            let whole = navmesh_parity::fnv1a64(&bytes);
+            let file = navmesh_parity::RecordFile::from_bytes(name, bytes)
+                .map_err(|e| format!("records: {e}"))?;
+            for e in &file.entries {
+                println!("{name} {} {} {:016x}", e.name, e.len, e.digest);
+            }
+            println!("{name} * {} {whole:016x}", file.entries.len());
+            Ok(())
         }
         "bench-queries" => {
             // One bake, then the plain query set `--repeat` times (no records).

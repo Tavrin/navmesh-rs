@@ -190,12 +190,18 @@ added it follows the meshoptimizer-rs rule (scalar canonical bytes, documented s
    thread count (tiles are assembled in a fixed order).
 2. Default features on x86-64 Linux: bit-identical to the C++ oracle built as `RECORDS.md`
    specifies, for every record.
-3. Across platforms (x86-64, AArch64, wasm32): generation, tile bytes and queries are identical
-   except where the walkable-slope `cos` or an oriented-box obstacle `cos/sin` lands on a different
-   last bit; the crowd may diverge after the first avoidance `sin/cos` difference. With the
-   `libm` feature, all records are identical across platforms (the C++ oracle comparison then
-   carries the tolerance in `RECORDS.md` for crowd records). The slope threshold can also be given
-   directly as a cosine to remove that site.
+3. Across platforms (x86-64, AArch64, wasm32): with the `libm` feature every recorded
+   output (Recast stages, tile bytes, query results, crowd trajectories, tile-cache layers and
+   rebuilt tiles) is identical on all three targets. `reference/determinism.golden` holds the
+   record digests of the public corpus; CI rebuilds them on x86-64 Linux, AArch64 Linux and
+   wasm32 and compares (`reference/determinism.sh`). Without `libm` (the default `std` build)
+   the platform libm supplies `cos`/`sin`, and results can differ in the last bit where the
+   walkable-slope `cos` or an oriented-box obstacle `cos/sin` lands on a different last bit;
+   the crowd may diverge after the first avoidance `sin/cos` difference. The slope threshold
+   can also be given directly as a cosine to remove that site. The `libm` build is not
+   bit-identical to the C++ oracle on x86-64 glibc; the default build is.
+   Pointer-width dependent byte accounting (`Usage::bytes`, `Limits::max_bytes`) differs
+   between 32-bit and 64-bit targets; outputs do not.
 4. Sorting uses stable sorts with upstream comparators, which reproduces glibc's merge-sort
    `qsort`. Where upstream ties make output libc-dependent we follow glibc and document it.
 5. No FMA contraction (Rust guarantees it) and no `mul_add`.
@@ -243,8 +249,8 @@ navmesh linking. None is required by the current tiled API.
 | # | Extension | Value | Cost | How it is measured |
 |---|---|---|---|---|
 | 1 | Parallel and incremental tile baking (section 7) | high: bake time is the main wait in authoring tools; 7.3× on the large terrain with the naive driver | low-medium, 3-5 days | wall time at 1/4/8/16 threads on `terrain_large_tiled`; identical bytes at every count; incremental rebake of k dirty tiles costs ~k/N of a full bake |
-| 2 | Budgeted queries everywhere | high: frame-time safety for games; upstream budgets only the sliced A* | medium, 4-6 days | every query takes `Limits.max_work`; resumable forms for Dijkstra searches and long raycasts; measured as worst-case work and wall time per call on the query corpus, with results equal to the unbudgeted call when the budget suffices |
-| 3 | Cross-platform determinism | high for lockstep and replays; the C++ library cannot offer it (qsort, FMA, libm) | low, 2-3 days (mostly CI) | all records identical on x86-64 Linux, AArch64 and wasm32 with `libm`; one CI job per target |
+| 2 | Budgeted queries everywhere (implemented, unreleased: `Budget`, `*_budgeted`, resumable searches) | high: frame-time safety for games; upstream budgets only the sliced A* | medium, 4-6 days | every query takes `Limits.max_work`; resumable forms for Dijkstra searches and long raycasts; measured as worst-case work and wall time per call on the query corpus, with results equal to the unbudgeted call when the budget suffices |
+| 3 | Cross-platform determinism (implemented, unreleased: golden digests, CI on three targets) | high for lockstep and replays; the C++ library cannot offer it (qsort, FMA, libm) | low, 2-3 days (mostly CI) | all records identical on x86-64 Linux, AArch64 and wasm32 with `libm`; one CI job per target |
 | 4 | Hierarchical path finding for large worlds | medium-high: long paths on 1 km+ worlds expand many nodes | high, 2-3 weeks | nodes expanded, wall time and path-length ratio versus flat A* on long pairs over `terrain_large`; target ≤ 5% longer paths |
 | 5 | ORCA (RVO2-style) local avoidance as an alternative to the sampled velocity planner | medium: smoother crowds, fewer oscillations | medium, 1-2 weeks | overlaps per agent-second, time to goal, deadlocks on standard scenarios (corridor swap, circle crossing, doorway), cost per agent-tick against the 1.8-3.1 µs baseline |
 | 6 | Navmesh streaming | medium: Detour already supports add/remove; the gap is an API that loads, validates and links off the main thread and keeps refs stable | medium, 1 week | hitch per tile add/remove, memory per resident tile |

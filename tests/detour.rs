@@ -465,3 +465,105 @@ fn accessors_return_none_or_errors_on_bad_indices_and_refs() {
     assert!(nav.off_mesh_connection_poly_end_points(0, bogus).is_err());
     assert!(nav.tile_by_ref(!0).is_none());
 }
+
+/// A unit quad in tile (x, 0) of a 1 x 1 grid; the tile at x = 0 owns a bidirectional
+/// off-mesh connection from (0.5, 0, 0.5) to (10.5, 0, 0.5), ten tiles away.
+fn far_link_tile(x: i32) -> Vec<u8> {
+    const N: u16 = 0xffff;
+    let con = [0.5, 0.0, 0.5, 10.5, 0.0, 0.5];
+    let owner = x == 0;
+    detour::create_nav_mesh_data(&NavMeshCreateParams {
+        verts: &[0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0],
+        vert_count: 4,
+        polys: &[0, 1, 2, 3, N, N, N, N],
+        poly_flags: &[1],
+        poly_areas: &[0],
+        poly_count: 1,
+        nvp: 4,
+        off_mesh_con_verts: if owner { &con } else { &[] },
+        off_mesh_con_rad: if owner { &[0.6] } else { &[] },
+        off_mesh_con_flags: if owner { &[1] } else { &[] },
+        off_mesh_con_areas: if owner { &[0] } else { &[] },
+        off_mesh_con_dir: if owner { &[1] } else { &[] },
+        off_mesh_con_count: i32::from(owner),
+        tile_x: x,
+        tile_y: 0,
+        bmin: [x as f32, 0.0, 0.0],
+        bmax: [x as f32 + 1.0, 1.0, 1.0],
+        walkable_height: 2.0,
+        walkable_radius: 0.5,
+        walkable_climb: 0.5,
+        cs: 1.0,
+        ch: 1.0,
+        build_bv_tree: true,
+        ..Default::default()
+    })
+    .unwrap()
+}
+
+/// Whether a complete path leads from the quad at x = `from` to the one at x = `to`.
+fn far_path_found(nav: &NavMesh, from: f32, to: f32) -> bool {
+    let mut q = NavMeshQuery::new(nav, 64).unwrap();
+    let f = DefaultFilter::default();
+    let ext = [0.4, 1.0, 0.4];
+    let (pa, pb) = ([from + 0.5, 0.0, 0.5], [to + 0.5, 0.0, 0.5]);
+    let ra = q.find_nearest_poly(&pa, &ext, &f).unwrap().0;
+    let rb = q.find_nearest_poly(&pb, &ext, &f).unwrap().0;
+    let mut path = Vec::new();
+    if ra == 0 || rb == 0 || q.find_path(ra, rb, &pa, &pb, &f, &mut path, 16).is_err() {
+        return false;
+    }
+    path.last() == Some(&rb) && path.len() == 3 // quad, off-mesh connection, quad
+}
+
+fn remove_at(nav: &mut NavMesh, x: i32) {
+    let r = nav.tile_ref(nav.tiles_at(x, 0, 1)[0]);
+    nav.remove_tile(r).unwrap();
+}
+
+#[test]
+fn global_off_mesh_links_resolve_in_any_tile_and_survive_remove_and_re_add() {
+    let params = NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: 1.0,
+        tile_height: 1.0,
+        max_tiles: 8,
+        max_polys: 8,
+    };
+    // Upstream looks for the far endpoint only in the adjacent tile.
+    let mut plain = NavMesh::new(&params).unwrap();
+    plain.add_tile(far_link_tile(0)).unwrap();
+    plain.add_tile(far_link_tile(10)).unwrap();
+    assert!(!far_path_found(&plain, 0.0, 10.0));
+
+    // Opt-in before loading, in either order of loading; either tile removed and
+    // added back.
+    for order in [[0, 10], [10, 0]] {
+        for removed in [0, 10] {
+            let mut nav = NavMesh::new(&params).unwrap();
+            nav.set_global_off_mesh_links(true);
+            for x in order {
+                nav.add_tile(far_link_tile(x)).unwrap();
+            }
+            assert!(far_path_found(&nav, 0.0, 10.0) && far_path_found(&nav, 10.0, 0.0));
+            remove_at(&mut nav, removed);
+            nav.add_tile(far_link_tile(removed)).unwrap();
+            assert!(
+                far_path_found(&nav, 0.0, 10.0) && far_path_found(&nav, 10.0, 0.0),
+                "order {order:?}, tile {removed} re-added"
+            );
+            // The links to a removed tile are gone, not left dangling.
+            remove_at(&mut nav, 10);
+            assert!(!far_path_found(&nav, 0.0, 10.0));
+        }
+    }
+
+    // Opt-in after loading relinks the resident tiles; opt-out unlinks them.
+    let mut nav = NavMesh::new(&params).unwrap();
+    nav.add_tile(far_link_tile(0)).unwrap();
+    nav.add_tile(far_link_tile(10)).unwrap();
+    nav.set_global_off_mesh_links(true);
+    assert!(far_path_found(&nav, 0.0, 10.0));
+    nav.set_global_off_mesh_links(false);
+    assert!(!far_path_found(&nav, 0.0, 10.0));
+}

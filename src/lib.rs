@@ -150,7 +150,9 @@ extern crate std;
 #[cfg(not(any(feature = "std", feature = "libm")))]
 compile_error!("navmesh-rs needs the `std` or the `libm` feature for floating-point functions");
 
+mod budget;
 mod common;
+pub use budget::{Budget, Budgeted, Progress};
 pub use common::{Error, Limits, TileDataError, Usage, Workspace};
 
 #[cfg(feature = "recast")]

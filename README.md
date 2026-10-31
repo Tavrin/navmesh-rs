@@ -207,6 +207,26 @@ resource use; they write into the cache's budgeted output slices.
 - Per-call limits on memory and work (`Limits`, `Workspace`); a call that exceeds them returns
   an error. Upstream asserts and crash paths become errors as well; the library does not panic
   on bad input and contains no `unsafe` code.
+- Work budgets on every query (not in recastnavigation): a `Budget` bounds one call or one
+  frame's worth of calls, budgeted forms return a typed `Budgeted::Exhausted` with the partial
+  result, and the Dijkstra-style searches and the raycast can be resumed over several frames.
+  Calls without a budget behave as upstream.
+- With the `libm` feature, every recorded output (Recast stages, tile bytes, query results,
+  crowd trajectories, tile-cache layers) is identical on x86-64 Linux, AArch64 Linux and wasm32;
+  upstream cannot offer this (platform libm, `qsort` order, FMA contraction).
+- Global off-mesh links (opt-in, `NavMesh::set_global_off_mesh_links`): an off-mesh connection
+  can resolve its far endpoint in any loaded tile, not only the owner tile, its same-coordinate
+  layers and its eight neighbours as upstream does. Tiles can be loaded in any order and
+  removed and re-added; the links follow. Off by default, and then identical to upstream.
+  Endpoints are snapped with upstream's rule: the candidate polygons are those whose bounds
+  overlap a box of half extents (connection radius, walkable climb of the connection's owner
+  tile, connection radius) around the authored endpoint; the nearest one wins, and the link is
+  made only if the horizontal distance from the authored endpoint to the snapped point is at
+  most the connection radius. There is no further vertical test; the polygon's height replaces
+  the endpoint's.
+- At bake time (`bake::tiles`) a triangle crossing a tile's bounds is given whole to every tile
+  whose bounds plus border overlap it, and Recast's rasteriser clips it to that tile and its
+  border.
 - 64-bit poly refs by default (upstream defaults to 32-bit), for large tiled worlds. Turn off
   the `polyref64` feature for upstream's 32-bit tile format.
 
@@ -219,7 +239,7 @@ resource use; they write into the cache's budgeted output slices.
 | `tilecache` | yes | Cached layers, dynamic obstacles and incremental rebuilds; implies `recast` and `detour`. |
 | `crowd` | yes | Agent simulation, corridors, avoidance and path queue; implies `detour`. |
 | `std` | yes | floating-point functions from the platform libm |
-| `libm` | no | floating-point functions from the `libm` crate; required without `std` |
+| `libm` | no | floating-point functions from the `libm` crate (identical on every target); required without `std` |
 | `parallel` | no | rayon tile workers; serial bake API remains available without it |
 | `polyref64` | yes | 64-bit poly refs; off gives upstream's 32-bit refs |
 
@@ -230,9 +250,11 @@ resource use; they write into the cache's budgeted output slices.
 - Ported: Recast, Detour, DetourCrowd and DetourTileCache.
 - Not ported yet: merging and copying polygon meshes, and big-endian tile data.
 - Stage functions follow upstream; the `bake` extension provides serial and parallel tiled builds.
-- Bit-exactness with the C++ library is checked on x86-64 Linux with glibc. On other
-  platforms the results can differ in the last bit where upstream calls `cos`/`sin`
-  (the walkable-slope threshold and avoidance sampling).
+- Bit-exactness with the C++ library is checked on x86-64 Linux with glibc, with the default
+  `std` feature. On other platforms the default build can differ in the last bit where upstream
+  calls `cos`/`sin` (the walkable-slope threshold and avoidance sampling). With `libm` the
+  results are identical on x86-64 Linux, AArch64 Linux and wasm32, but not bit-identical to
+  the C++ library built on glibc. `docs/VERIFICATION.md` states the contract exactly.
 - Speed: the query set and the Recast stages take about 1.1 to 1.35 times the instructions of
   the C++ library on the test corpus; no optimisation work has been done yet.
 
