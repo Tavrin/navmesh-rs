@@ -32,6 +32,43 @@ pub(crate) fn check_chf(ws: &mut Workspace, chf: &CompactHeightfield) -> Result<
     {
         return Err(Error::InvalidInput("inconsistent compact heightfield"));
     }
+    // A dense single-layer grid has no per-link layer lookup: every link is
+    // either layer zero or disconnected. Verify the layout before taking this
+    // path; public fields may have been edited by callers. Keep finite-budget
+    // traversal on the generic path to retain its exact charging order.
+    if chf.width > 0
+        && ws.limits().max_work == u64::MAX
+        && chf.spans.len() == chf.cells.len()
+        && chf.cells.iter().enumerate().fold(true, |valid, (i, c)| {
+            valid & (c.count == 1) & (c.index as usize == i)
+        })
+    {
+        ws.work(chf.height as u64)?;
+        // Within each six-bit field, all adjacent bits must agree. Thus the
+        // only permitted layer values are zero and NOT_CONNECTED (63).
+        let invalid = chf
+            .spans
+            .iter()
+            .fold(0, |bits, s| bits | ((s.con ^ (s.con >> 1)) & 0x007d_f7df));
+        let w = chf.width as usize;
+        let h = chf.height as usize;
+        let mut boundary_valid = true;
+        for row in chf.spans.chunks_exact(w) {
+            boundary_valid &= row[0].con(0) == NOT_CONNECTED;
+            boundary_valid &= row[w - 1].con(2) == NOT_CONNECTED;
+        }
+        for s in &chf.spans[..w] {
+            boundary_valid &= s.con(3) == NOT_CONNECTED;
+        }
+        for s in &chf.spans[(h - 1) * w..] {
+            boundary_valid &= s.con(1) == NOT_CONNECTED;
+        }
+        return if invalid == 0 && boundary_valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidInput("compact span connection out of range"))
+        };
+    }
     for z in 0..chf.height {
         ws.work(1)?;
         for x in 0..chf.width {
@@ -468,4 +505,77 @@ pub fn offset_poly(
         }
     }
     count
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use crate::recast::{CompactCell, CompactSpan};
+
+    #[test]
+    fn dense_connections_match_generic_validation() {
+        let mut chf = CompactHeightfield {
+            width: 3,
+            height: 3,
+            span_count: 9,
+            cells: (0..9).map(|i| CompactCell { index: i, count: 1 }).collect(),
+            spans: alloc::vec![CompactSpan { con: 0xffffff, ..CompactSpan::default() }; 9],
+            areas: alloc::vec![63; 9],
+            ..CompactHeightfield::default()
+        };
+        for i in 0..9 {
+            for dir in 0..4 {
+                for layer in 0..64 {
+                    chf.spans[i].set_con(dir, layer);
+                    let mut fast = Workspace::new();
+                    let mut generic = Workspace::with_limits(crate::Limits {
+                        max_work: 1000,
+                        ..crate::Limits::default()
+                    });
+                    assert_eq!(check_chf(&mut fast, &chf), check_chf(&mut generic, &chf));
+                    chf.spans[i].set_con(dir, NOT_CONNECTED);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn checks_every_direction_and_layer_without_rejecting_disconnected_edges() {
+        let mut chf = CompactHeightfield {
+            width: 3,
+            height: 3,
+            span_count: 18,
+            cells: (0..9)
+                .map(|i| CompactCell {
+                    index: i * 2,
+                    count: 2,
+                })
+                .collect(),
+            spans: alloc::vec![CompactSpan { con: 0xffffff, ..CompactSpan::default() }; 18],
+            areas: alloc::vec![63; 18],
+            ..CompactHeightfield::default()
+        };
+        let mut ws = Workspace::new();
+        assert_eq!(check_chf(&mut ws, &chf), Ok(()));
+        for z in 0..3 {
+            for x in 0..3 {
+                let i = (z * 3 + x) as usize * 2;
+                for dir in 0..4 {
+                    let nx = x + dir_offset_x(dir);
+                    let nz = z + dir_offset_y(dir);
+                    let interior = (0..3).contains(&nx) && (0..3).contains(&nz);
+                    for layer in [0, 1, 2, 62, 63] {
+                        chf.spans[i + 1].set_con(dir, layer);
+                        assert_eq!(
+                            check_chf(&mut ws, &chf).is_ok(),
+                            layer == 63 || (interior && layer < 2)
+                        );
+                    }
+                    chf.spans[i + 1].set_con(dir, NOT_CONNECTED);
+                }
+            }
+        }
+        chf.cells[4].index = 18;
+        assert!(check_chf(&mut ws, &chf).is_err());
+    }
 }

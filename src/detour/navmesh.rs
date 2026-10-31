@@ -190,7 +190,11 @@ pub(crate) fn closest_point_on_detail_edges(
         if only_boundary && (tris[3] & ANY_BOUNDARY_EDGE) == 0 {
             continue;
         }
-        let v = [0, 1, 2].map(|j| detail_vert(tile, poly, pd.vert_base, tris[j]));
+        let v = [
+            detail_vert(tile, poly, pd.vert_base, tris[0]),
+            detail_vert(tile, poly, pd.vert_base, tris[1]),
+            detail_vert(tile, poly, pd.vert_base, tris[2]),
+        ];
         let mut j = 2;
         for k in 0..3 {
             let flags = (tris[3] >> (j * 2)) & 0x3;
@@ -230,7 +234,11 @@ pub(crate) fn poly_height(tile: &MeshTile, ip: usize, pos: &[f32]) -> Option<f32
     for j in 0..pd.tri_count as usize {
         let t = (pd.tri_base as usize + j) * 4;
         let tr = &tile.detail_tris[t..t + 4];
-        let v = [0, 1, 2].map(|k| detail_vert(tile, poly, pd.vert_base, tr[k]));
+        let v = [
+            detail_vert(tile, poly, pd.vert_base, tr[0]),
+            detail_vert(tile, poly, pd.vert_base, tr[1]),
+            detail_vert(tile, poly, pd.vert_base, tr[2]),
+        ];
         if let Some(h) = closest_height_point_triangle(pos, v[0], v[1], v[2]) {
             return Some(h);
         }

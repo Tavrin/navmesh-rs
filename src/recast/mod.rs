@@ -172,6 +172,17 @@ pub(crate) fn validate_mesh(verts: &[f32], tris: &[i32], areas_len: usize) -> Re
         ));
     }
     let nv = verts.len() / 3;
+    // Dense meshes reuse most vertices across triangles. A contiguous finite
+    // scan plus an index-only scan avoids repeatedly gathering coordinates.
+    // For sparse tile subsets keep the referenced-only path below. If unused
+    // vertices are non-finite, fall back so their presence remains permitted.
+    if tris.len() >= verts.len() && verts.iter().all(|v| v.is_finite()) {
+        return if tris.iter().all(|&i| i >= 0 && (i as usize) < nv) {
+            Ok(nt)
+        } else {
+            Err(Error::InvalidInput("triangle index out of range"))
+        };
+    }
     // Only the referenced vertices are checked, so a tile that uses a few
     // triangles of a large shared vertex array pays for its triangles only.
     for &i in tris {
@@ -237,4 +248,22 @@ pub fn clear_unwalkable_triangles(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod mesh_validation_tests {
+    use super::*;
+
+    #[test]
+    fn dense_validation_retains_referenced_vertex_rules() {
+        let mut verts = [0.0; 9];
+        let tris = [0, 1, 0, 1, 0, 1, 0, 1, 0];
+        assert_eq!(validate_mesh(&verts, &tris, 3), Ok(3));
+        verts[8] = f32::NAN; // Unused vertices remain allowed in the dense path.
+        assert_eq!(validate_mesh(&verts, &tris, 3), Ok(3));
+        verts[0] = f32::INFINITY;
+        assert!(validate_mesh(&verts, &tris, 3).is_err());
+        assert!(validate_mesh(&[0.0; 9], &[0, 1, 3, 0, 1, 0, 0, 1, 0], 3).is_err());
+        assert!(validate_mesh(&[0.0; 9], &[0, 1, -1, 0, 1, 0, 0, 1, 0], 3).is_err());
+    }
 }

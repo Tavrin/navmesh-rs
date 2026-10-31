@@ -22,6 +22,11 @@ All notable changes to this project are documented in this file. The format foll
   support for trait-object filters.
 - Stream polygon candidates to query callbacks without a temporary allocation.
 - Swap rasterization buffer references directly, preserving clipping order.
+- Validate dense triangle meshes with contiguous coordinate and index scans;
+  preserve referenced-only validation for sparse tile subsets.
+- Validate dense single-layer compact fields with bit-field scans, retaining
+  generic validation and finite work-budget traversal.
+- Resolve detail-triangle corners directly in nearest-polygon height queries.
 
 ## [0.1.3] - 2026-10-31
 

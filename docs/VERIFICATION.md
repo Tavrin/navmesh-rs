@@ -743,3 +743,98 @@ terrain_large_tiled: instruction millions / wall milliseconds per complete bake,
 | mesh | 110.71 / 22.70 | 110.99 / 20.02 | 81.11 / 22.20 |
 | detail | 1244.40 / 118.69 | 1244.37 / 107.74 | 165.46 / 34.32 |
 | tile | 41.00 / 67.53 | 41.58 / 65.69 | 24.49 / 9.99 |
+
+
+## Follow-up speed measurements (2026-10-31)
+
+The follow-up reduces dense triangle validation gathers and detail-triangle
+corner lookup overhead. Compact-field validation has a verified dense
+single-layer specialization; sparse and multilayer fields retain the generic
+checks, as do finite work budgets. No validation is cached across caller edits.
+
+All **76,018 parity records** (38,009 per reference width) and **3,035 determinism
+digests** remain unchanged. Formatting, all CI clippy feature sets, tests,
+doctests, parallel identity checks, no_std, wasm32, documentation and MSRV
+checks returned zero. The public-text guard initially rejected a bit-field
+comment; the corrected text passed the final check.
+
+The equally weighted query mean fell from **36,998 to 35,829 instructions**
+(**3.2%**), versus **29,293** for C++ (**1.223x**). The goal of at most 1.1x
+C++ for every stage and queries was **not reached**. Solo setup improved 27.9%;
+the large detail/contour gaps remain. Full compact-field validation still visits
+the whole grid for each public stage call; the dense specialization did not
+materially reduce that cost on the large terrain. Region expansion,
+clipping, erosion and distance propagation remain substantial costs in the
+retained Rust and C++ instruction profiles and annotations.
+
+The same release toolchains and corpus as above were used. Query entries are
+medians of three paired differences, `(instructions(repeat=101) -
+instructions(repeat=1)) / 20,000`, pinning each process to CPU 6. Stages use
+per-thread hardware instruction counters, summed across tiles, with the same
+stage boundaries as above. Before and C++ stages were interleaved; final after
+stages were collected separately after rejecting an earlier validation rewrite
+that increased instructions. Initial scratch builds that reused stale artifacts
+were also rejected; accepted builds forced recompilation of each source copy.
+These stage wall times are shared-machine observations, not a causal speedup.
+The counter FFI exists only in temporary profiling copies.
+
+Uninstrumented 16-thread tiled bake samples (milliseconds) were
+380.270, 385.445, 378.523 before and 411.163, 441.524, 387.951 after;
+medians **380.270 and 411.163**. C++ also ran with **16 threads**, with a
+**398.977 ms** median. These samples do **not establish a wall-time improvement**.
+
+| 200-pair case | Before instructions/pair | After | C++ | After/C++ |
+|---|---:|---:|---:|---:|
+| corridors_solo | 9,016 | 8,578 | 7,462 | 1.150 |
+| degenerate_solo | 12,665 | 12,041 | 10,309 | 1.168 |
+| dungeon_solo | 44,503 | 43,684 | 36,106 | 1.210 |
+| dungeon_tilecache | 51,031 | 50,406 | 40,804 | 1.235 |
+| dungeon_tiled | 60,276 | 59,370 | 48,185 | 1.232 |
+| godot_level_solo | 26,073 | 23,293 | 20,701 | 1.125 |
+| islands_offmesh | 4,674 | 4,531 | 3,965 | 1.143 |
+| multilevel_solo | 17,310 | 16,512 | 14,162 | 1.166 |
+| multilevel_tilecache | 47,987 | 47,495 | 38,023 | 1.249 |
+| nav_test_areas | 38,881 | 37,691 | 31,008 | 1.216 |
+| nav_test_solo | 29,204 | 28,079 | 23,263 | 1.207 |
+| nav_test_tiled | 75,792 | 74,802 | 59,937 | 1.248 |
+| queued_tilecache | 47,987 | 47,495 | 38,023 | 1.249 |
+| seams_tilecache | 12,847 | 12,507 | 10,206 | 1.225 |
+| seams_tiled | 13,923 | 13,351 | 10,877 | 1.227 |
+| slopes_solo | 17,147 | 16,605 | 14,031 | 1.183 |
+| stairs_monotone | 20,468 | 19,956 | 16,838 | 1.185 |
+| terrain_large_solo | 11,391 | 10,584 | 9,364 | 1.130 |
+| terrain_large_tiled | 8,811 | 8,328 | 6,861 | 1.214 |
+| terrain_small_tiled | 175,894 | 172,131 | 138,076 | 1.247 |
+| undulating_crowd | 51,086 | 44,975 | 36,956 | 1.217 |
+
+terrain_large_solo: instruction millions / wall milliseconds per complete bake, summed across tiles.
+
+| Stage | Before | After | C++ |
+|---|---:|---:|---:|
+| setup | 372.28 / 58.63 | 268.52 / 65.70 | 141.26 / 67.03 |
+| raster | 15166.73 / 829.68 | 15065.06 / 1192.82 | 14208.54 / 900.47 |
+| filters | 2573.07 / 165.09 | 2573.07 / 250.95 | 2310.65 / 188.59 |
+| compact | 2114.95 / 219.53 | 2114.95 / 297.75 | 2370.82 / 212.12 |
+| erode | 2823.11 / 248.08 | 2811.47 / 283.95 | 1912.52 / 164.47 |
+| distance | 3456.49 / 311.41 | 3444.85 / 396.42 | 2427.25 / 281.32 |
+| regions | 2750.77 / 541.32 | 2739.12 / 779.32 | 2211.37 / 556.69 |
+| contours | 1426.66 / 122.75 | 1415.01 / 134.00 | 559.02 / 75.09 |
+| mesh | 32.10 / 2.12 | 32.10 / 3.57 | 26.59 / 2.50 |
+| detail | 837.65 / 62.59 | 826.00 / 71.40 | 31.33 / 4.23 |
+| tile | 7.02 / 13.75 | 7.02 / 20.56 | 6.95 / 13.66 |
+
+terrain_large_tiled: instruction millions / wall milliseconds per complete bake, summed across tiles.
+
+| Stage | Before | After | C++ |
+|---|---:|---:|---:|
+| setup | 550.93 / 64.91 | 541.77 / 75.49 | 209.93 / 46.23 |
+| raster | 22860.98 / 1193.45 | 22864.04 / 1632.28 | 21316.05 / 1373.75 |
+| filters | 3493.83 / 178.69 | 3493.83 / 243.15 | 3156.67 / 211.98 |
+| compact | 2839.91 / 258.63 | 2839.91 / 332.27 | 3168.35 / 214.52 |
+| erode | 3816.21 / 338.85 | 3800.48 / 401.26 | 2571.44 / 258.70 |
+| distance | 4668.50 / 386.63 | 4652.77 / 462.70 | 3257.76 / 316.63 |
+| regions | 2876.48 / 300.73 | 2860.75 / 359.43 | 1825.79 / 248.83 |
+| contours | 2050.49 / 168.63 | 2034.76 / 205.86 | 887.25 / 115.79 |
+| mesh | 112.23 / 16.73 | 112.23 / 20.08 | 80.64 / 15.07 |
+| detail | 1245.69 / 78.92 | 1229.96 / 97.69 | 164.80 / 24.17 |
+| tile | 40.36 / 38.68 | 40.36 / 48.62 | 23.44 / 7.12 |

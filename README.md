@@ -304,5 +304,7 @@ carried by `BakeError`. Strict failures describe the first incomplete contour.
 
 For large terrain use `bake::tiles_parallel` inside a rayon pool with 16 threads;
 this includes triangle bucketing and ordered tile insertion when assembling the
-result. Performance measurements and qualification limits are recorded in
+result. A follow-up query corpus run reduced the mean from 36,998 to 35,829
+instructions per route pipeline; C++ used 29,293. The per-stage 1.1x C++ goal
+remains unmet. Performance measurements and qualification limits are recorded in
 [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
