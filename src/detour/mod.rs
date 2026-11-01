@@ -39,7 +39,7 @@ mod query_local;
 mod resumable;
 mod tile;
 
-pub use builder::{NavMeshCreateParams, create_nav_mesh_data};
+pub use builder::{NavMeshCreateParams, create_nav_mesh_data, create_nav_mesh_data_f32};
 pub use navmesh::{NavMesh, NavMeshParams};
 pub use query::{
     DefaultFilter, NavMeshQuery, QueryFilter, RaycastHit, SegmentWall, StraightPathPoint,

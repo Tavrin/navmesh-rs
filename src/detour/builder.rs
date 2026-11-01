@@ -160,6 +160,7 @@ fn create_bv_tree(
     ws: &mut Workspace,
     p: &NavMeshCreateParams,
     nodes: &mut [BvItem],
+    world: Option<&[f32]>,
 ) -> Result<usize, Error> {
     let qf = 1.0 / p.cs;
     let nvp = p.nvp as usize;
@@ -178,6 +179,21 @@ fn create_bv_tree(
             BvItem {
                 bmin: [0, 1, 2].map(|k| quant(bmin[k], p.bmin[k], qf)),
                 bmax: [0, 1, 2].map(|k| quant(bmax[k], p.bmin[k], qf)),
+                i: i as i32,
+            }
+        } else if let Some(world) = world {
+            let pv = &p.polys[i * nvp * 2..];
+            let v = usize::from(pv[0]) * 3;
+            let mut lo = [world[v], world[v + 1], world[v + 2]];
+            let mut hi = lo;
+            for &idx in pv.iter().take(nvp).take_while(|&&v| v != MESH_NULL_IDX) {
+                let v = usize::from(idx) * 3;
+                vmin(&mut lo, &world[v..]);
+                vmax(&mut hi, &world[v..]);
+            }
+            BvItem {
+                bmin: [0, 1, 2].map(|k| quant(lo[k], p.bmin[k], qf)),
+                bmax: [0, 1, 2].map(|k| quant(hi[k], p.bmin[k], qf)),
                 i: i as i32,
             }
         } else {
@@ -299,6 +315,92 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
     create_with_limits(p, &Limits::UNLIMITED)
 }
 
+/// Imports world-space float vertices without quantizing them (not in recastnavigation).
+/// `verts` must contain exactly `vert_count * 3` finite coordinates within the
+/// finite ordered tile bounds. `params.verts` is ignored; all other parameters
+/// retain their usual meaning. DNAV stores vertex floats verbatim. BV bounds
+/// alone are quantized using `cs`; choose cs so every bound fits 0..=65535.
+/// This API does not weld, clip, or infer polygon adjacency.
+pub fn create_nav_mesh_data_f32(p: &NavMeshCreateParams, verts: &[f32]) -> Result<Vec<u8>, Error> {
+    if !(p.cs > 0.0)
+        || !p.cs.is_finite()
+        || !(1.0 / p.cs).is_finite()
+        || !(p.ch > 0.0)
+        || !p.ch.is_finite()
+    {
+        return Err(Error::InvalidParameter("float import cell size"));
+    }
+    if p.off_mesh_con_count < 0 || p.detail_verts_count < 0 || p.detail_tri_count < 0 {
+        return Err(Error::InvalidParameter("negative import count"));
+    }
+    // Conservatively bound encoding/output arithmetic on narrow targets before
+    // the shared encoder computes fixed-stride section offsets.
+    [
+        p.vert_count,
+        p.poly_count,
+        p.off_mesh_con_count,
+        p.detail_verts_count,
+        p.detail_tri_count,
+    ]
+    .into_iter()
+    .try_fold(0usize, |sum, n| {
+        let n = usize::try_from(n).map_err(|_| Error::InvalidParameter("import count"))?;
+        sum.checked_add(n.checked_mul(1024).ok_or(Error::SizeOverflow)?)
+            .ok_or(Error::SizeOverflow)
+    })?;
+    if !p.off_mesh_con_user_id.is_empty() {
+        check_len(
+            p.off_mesh_con_user_id,
+            usize::try_from(p.off_mesh_con_count).map_err(|_| Error::SizeOverflow)?,
+        )?;
+    }
+    if p.poly_areas
+        .iter()
+        .chain(p.off_mesh_con_areas)
+        .any(|&a| a > 63)
+        || p.detail_verts
+            .iter()
+            .chain(p.off_mesh_con_verts)
+            .any(|v| !v.is_finite())
+        || p.off_mesh_con_rad
+            .iter()
+            .any(|v| !v.is_finite() || *v < 0.0)
+    {
+        return Err(Error::InvalidInput(
+            "float import area, coordinate or radius",
+        ));
+    }
+    let n = usize::try_from(p.vert_count)
+        .map_err(|_| Error::InvalidParameter("vert_count"))?
+        .checked_mul(3)
+        .ok_or(Error::SizeOverflow)?;
+    if verts.len() != n
+        || p.bmin.iter().chain(&p.bmax).any(|v| !v.is_finite())
+        || (0..3).any(|k| {
+            p.bmin[k] > p.bmax[k]
+                || !(p.bmax[k] - p.bmin[k]).is_finite()
+                || (p.build_bv_tree && (p.bmax[k] - p.bmin[k]) * (1.0 / p.cs) > 65535.0)
+        })
+    {
+        return Err(Error::InvalidInput("float vertices or bounds"));
+    }
+    for v in verts.as_chunks::<3>().0 {
+        for k in 0..3 {
+            if !v[k].is_finite()
+                || v[k] < p.bmin[k]
+                || v[k] > p.bmax[k]
+                || (p.build_bv_tree && (v[k] - p.bmin[k]) / p.cs > 65535.0)
+            {
+                return Err(Error::InvalidInput("float vertex outside tile or BV range"));
+            }
+        }
+    }
+    let data =
+        create_with_workspace_impl(p, &Limits::UNLIMITED, &mut Workspace::new(), Some(verts))?;
+    // Validate all serialized indices, detail sections and connection fields too.
+    super::MeshTile::parse(data).map(|tile| tile.data)
+}
+
 // Calculate exact output size/counts before allocating any builder storage.
 pub(crate) fn create_with_limits(
     p: &NavMeshCreateParams,
@@ -311,6 +413,15 @@ fn create_with_workspace(
     p: &NavMeshCreateParams,
     limits: &Limits,
     ws: &mut Workspace,
+) -> Result<Vec<u8>, Error> {
+    create_with_workspace_impl(p, limits, ws, None)
+}
+
+fn create_with_workspace_impl(
+    p: &NavMeshCreateParams,
+    limits: &Limits,
+    ws: &mut Workspace,
+    world: Option<&[f32]>,
 ) -> Result<Vec<u8>, Error> {
     if p.nvp as usize > VERTS_PER_POLYGON || p.nvp < 3 {
         return Err(Error::InvalidParameter("nvp"));
@@ -328,7 +439,9 @@ fn create_with_workspace(
     let npolys = p.poly_count as usize;
     let nverts = p.vert_count as usize;
     let noff = p.off_mesh_con_count.max(0) as usize;
-    check_len(p.verts, nverts * 3)?;
+    if world.is_none() {
+        check_len(p.verts, nverts * 3)?;
+    }
     check_len(p.polys, npolys * nvp * 2)?;
     check_len(p.poly_flags, npolys)?;
     check_len(p.poly_areas, npolys)?;
@@ -371,7 +484,10 @@ fn create_with_workspace(
             }
         } else {
             for i in 0..nverts {
-                let h = p.bmin[1] + p.verts[i * 3 + 1] as f32 * p.ch;
+                let h = world.map_or_else(
+                    || p.bmin[1] + p.verts[i * 3 + 1] as f32 * p.ch,
+                    |v| v[i * 3 + 1],
+                );
                 hmin = super::math::fmin(hmin, h);
                 hmax = super::math::fmax(hmax, h);
             }
@@ -522,10 +638,16 @@ fn create_with_workspace(
     {
         let mut c = w.at(verts_at);
         for i in 0..nverts {
-            let iv = &p.verts[i * 3..];
-            c.f32(p.bmin[0] + iv[0] as f32 * p.cs)
-                .f32(p.bmin[1] + iv[1] as f32 * p.ch)
-                .f32(p.bmin[2] + iv[2] as f32 * p.cs);
+            if let Some(world) = world {
+                for &v in &world[i * 3..i * 3 + 3] {
+                    c.f32(v);
+                }
+            } else {
+                let iv = &p.verts[i * 3..];
+                c.f32(p.bmin[0] + iv[0] as f32 * p.cs)
+                    .f32(p.bmin[1] + iv[1] as f32 * p.ch)
+                    .f32(p.bmin[2] + iv[2] as f32 * p.cs);
+            }
         }
         for i in 0..noff {
             if class[i * 2] == 0xff {
@@ -648,7 +770,7 @@ fn create_with_workspace(
                 i: 0,
             },
         )?;
-        let n = create_bv_tree(ws, p, &mut nodes)?;
+        let n = create_bv_tree(ws, p, &mut nodes, world)?;
         let mut c = w.at(bv_at);
         for it in &nodes[..n] {
             for v in it.bmin.iter().chain(it.bmax.iter()) {

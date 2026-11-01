@@ -394,3 +394,25 @@ fn empty_span_rows_consume_work() {
         Err(Error::LimitExceeded)
     ));
 }
+
+#[test]
+fn incomplete_contour_has_report_and_strict_error() {
+    let mut cset = navmesh_rs::recast::ContourSet::default();
+    // Opposite winding has no valid ears in the expected contour orientation.
+    cset.conts.push(navmesh_rs::recast::Contour {
+        verts: vec![0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 0],
+        ..Default::default()
+    });
+    let mut ws = Workspace::new();
+    let (_, report) = PolyMesh::build_with_report(&mut ws, &cset, 6, false).unwrap();
+    assert_eq!(report.failed_contours, 1);
+    assert!(report.missing_triangles > 0);
+    assert!(matches!(
+        PolyMesh::build_with_report(&mut ws, &cset, 6, true),
+        Err(Error::PartialTriangulation {
+            failed_contours: 1,
+            ..
+        })
+    ));
+    assert!(PolyMesh::build(&mut ws, &cset, 6).is_ok());
+}

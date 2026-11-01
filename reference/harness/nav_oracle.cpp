@@ -1773,6 +1773,30 @@ int main(int argc, char** argv) {
         if (!closeRecordsFile()) { fprintf(stderr, "writing %s failed\n", recordsPath); return 1; }
         return ok ? 0 : 1;
     }
+    if (cmd == "bench-paths") {
+        Baked b;
+        if (!bake(c, g, false, 1, b)) return 1;
+        dtNavMeshQuery* q = dtAllocNavMeshQuery();
+        if (!q || dtStatusFailed(q->init(b.nav, 2048))) return 1;
+        dtQueryFilter filter;
+        g_rng = c.seed ? c.seed : 1;
+        dtPolyRef refs[201]; float pts[603];
+        for (int i=0;i<201;++i)
+            if (dtStatusFailed(q->findRandomPoint(&filter,frand,&refs[i],pts+i*3))) return 1;
+        dtPolyRef path[256]; float straight[768]; unsigned char flags[256]; dtPolyRef sr[256];
+        const float ext[3] = {2,4,2};
+        auto start = std::chrono::steady_clock::now();
+        for (int r=0;r<repeat;++r) for (int i=0;i<200;++i) {
+            dtPolyRef nearest; float np[3]; int npath=0, ns=0;
+            if (dtStatusFailed(q->findNearestPoly(pts+i*3,ext,&filter,&nearest,np))) return 1;
+            if (dtStatusFailed(q->findPath(refs[i],refs[i+1],pts+i*3,pts+(i+1)*3,&filter,path,&npath,256))) return 1;
+            if (dtStatusFailed(q->findStraightPath(pts+i*3,pts+(i+1)*3,path,npath,straight,flags,sr,&ns,256,0))) return 1;
+        }
+        printf("pairs=200 repeat=%d total_ms=%.6f\n",repeat,
+            std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count());
+        dtFreeNavMeshQuery(q);
+        return 0;
+    }
     if (cmd == "bench") {
         // Bakes `repeat` times; per-bake cost is the difference between two runs
         // with different repeat counts, so loading and start-up cancel out.

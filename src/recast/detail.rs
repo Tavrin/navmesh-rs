@@ -32,7 +32,7 @@ impl PolyMeshDetail {
         sample_max_error: f32,
     ) -> Result<PolyMeshDetail, Error> {
         ws.begin();
-        check_chf(ws, chf)?;
+        check_surface_chf(ws, chf)?;
         let mut dmesh = PolyMeshDetail::default();
         if mesh.nverts == 0 || mesh.npolys == 0 {
             return Ok(dmesh);
@@ -170,6 +170,100 @@ impl PolyMeshDetail {
         }
         Ok(dmesh)
     }
+}
+
+// These stages only read the compact field. Validate single-layer grids in
+// one pass, including grids with empty cells, before any polygon/contour traversal.
+// Other layouts and finite budgets retain the general validator and its exact
+// error/charging order. Nothing is cached across edits to public fields.
+pub(super) fn check_surface_chf(ws: &mut Workspace, chf: &CompactHeightfield) -> Result<(), Error> {
+    let cells = (chf.width.max(0) as usize).checked_mul(chf.height.max(0) as usize);
+    if ws.limits().max_work != u64::MAX
+        || chf.width <= 0
+        || chf.height <= 0
+        || cells != Some(chf.cells.len())
+        || chf.spans.len() != chf.span_count.max(0) as usize
+        || chf.areas.len() != chf.spans.len()
+    {
+        return check_chf(ws, chf);
+    }
+    let before = ws.clone();
+    ws.work(
+        (chf.cells.len() as u64)
+            .checked_add(
+                (chf.spans.len() as u64)
+                    .checked_mul(4)
+                    .ok_or(Error::SizeOverflow)?,
+            )
+            .ok_or(Error::SizeOverflow)?,
+    )?;
+    if single_layer_connections_valid(chf) {
+        ws.work(chf.height as u64)
+    } else {
+        *ws = before;
+        check_chf(ws, chf)
+    }
+}
+
+fn single_layer_connections_valid(chf: &CompactHeightfield) -> bool {
+    let Ok(nspans) = u32::try_from(chf.spans.len()) else {
+        return false;
+    };
+    // Check ranges and links together, once per occupied cell. Empty cells
+    // need only a range check. In particular, do not visit all four neighbours
+    // of every empty cell: sparse terrain can interleave holes in every block.
+    let valid = |c: &super::CompactCell, present: u32| {
+        if c.count > 1 || c.index > nspans || (c.count != 0 && c.index == nspans) {
+            return false;
+        }
+        if c.count == 0 {
+            return true;
+        }
+        let con = chf.spans[c.index as usize].con;
+        // Every six-bit layer must be zero or NOT_CONNECTED (63). A zero
+        // layer may connect only to an occupied neighbour. High bits are
+        // ignored, as they are by CompactSpan::con and the general validator.
+        ((con ^ (con >> 1)) & 0x007d_f7df) == 0 && (!con & 0x0004_1041 & !present) == 0
+    };
+    let w = chf.width as usize;
+    let h = chf.height as usize;
+    for (y, row) in chf.cells.chunks_exact(w).enumerate() {
+        let above = if y > 0 {
+            &chf.cells[(y - 1) * w..y * w]
+        } else {
+            row
+        };
+        let below = if y + 1 < h {
+            &chf.cells[(y + 1) * w..(y + 2) * w]
+        } else {
+            row
+        };
+        let mask = 1 | (u32::from(y + 1 < h) << 6) | (1 << 12) | (u32::from(y > 0) << 18);
+        let vertical = |x: usize| {
+            ((u32::from(below[x].count) << 6) | (u32::from(above[x].count) << 18)) & mask
+        };
+        if w == 1 {
+            if !valid(&row[0], vertical(0)) {
+                return false;
+            }
+            continue;
+        }
+        if !valid(&row[0], vertical(0) | (u32::from(row[1].count) << 12))
+            || !valid(&row[w - 1], vertical(w - 1) | u32::from(row[w - 2].count))
+        {
+            return false;
+        }
+        for ((cells, up), down) in row.windows(3).zip(&above[1..w - 1]).zip(&below[1..w - 1]) {
+            let present = u32::from(cells[0].count)
+                | (u32::from(down.count) << 6)
+                | (u32::from(cells[2].count) << 12)
+                | (u32::from(up.count) << 18);
+            if !valid(&cells[1], present & mask) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 const UNSET_HEIGHT: u16 = 0xffff;
@@ -1263,5 +1357,105 @@ mod allocation_tests {
             Err(Error::LimitExceeded)
         );
         assert_eq!(tris.capacity(), 0);
+    }
+
+    fn compare_surface_validation(chf: &CompactHeightfield) {
+        let mut fast = Workspace::new();
+        let mut generic = Workspace::new();
+        assert_eq!(
+            check_surface_chf(&mut fast, chf),
+            check_chf(&mut generic, chf)
+        );
+        assert_eq!(fast.usage().work, generic.usage().work);
+    }
+
+    #[test]
+    fn sparse_surface_validation_matches_every_direction_and_layer() {
+        for (w, h) in [(1, 1), (1, 7), (7, 1), (3, 3), (17, 4), (65, 3)] {
+            for pattern in 0..12 {
+                let mut chf = CompactHeightfield {
+                    width: w,
+                    height: h,
+                    ..CompactHeightfield::default()
+                };
+                for i in 0..w * h {
+                    let occupied = match pattern {
+                        8 => false,
+                        9 => i == w * h / 2,
+                        10 => !(32..64).contains(&i),
+                        11 => i % w == w / 2,
+                        _ => (i + pattern) % (pattern + 1) == 0,
+                    };
+                    chf.cells.push(CompactCell {
+                        index: chf.spans.len() as u32,
+                        count: u8::from(occupied),
+                    });
+                    if occupied {
+                        chf.spans.push(CompactSpan {
+                            con: 0xffffff,
+                            ..CompactSpan::default()
+                        });
+                        chf.areas.push(63);
+                    }
+                }
+                chf.span_count = chf.spans.len() as i32;
+                for y in 0..h {
+                    for x in 0..w {
+                        let c = chf.cells[(x + y * w) as usize];
+                        if c.count == 0 {
+                            continue;
+                        }
+                        for dir in 0..4 {
+                            let nx = x + dir_offset_x(dir);
+                            let ny = y + dir_offset_y(dir);
+                            if nx >= 0
+                                && ny >= 0
+                                && nx < w
+                                && ny < h
+                                && chf.cells[(nx + ny * w) as usize].count != 0
+                            {
+                                chf.spans[c.index as usize].set_con(dir, 0);
+                            }
+                        }
+                    }
+                }
+                compare_surface_validation(&chf);
+                for i in 0..chf.spans.len() {
+                    for dir in 0..4 {
+                        let original = chf.spans[i].con(dir);
+                        for layer in 0..64 {
+                            chf.spans[i].set_con(dir, layer);
+                            compare_surface_validation(&chf);
+                        }
+                        chf.spans[i].set_con(dir, original);
+                    }
+                }
+                // Caller edits may reorder/alias spans, leave spans unused, or
+                // change a cell to empty/multilayer/out of range.
+                for i in 0..chf.cells.len() {
+                    let original = chf.cells[i];
+                    for index in [0, chf.spans.len() as u32, u32::MAX] {
+                        for count in [0, 1, 2, 255] {
+                            chf.cells[i] = CompactCell { index, count };
+                            compare_surface_validation(&chf);
+                        }
+                    }
+                    chf.cells[i] = original;
+                }
+                for limit in 0..100 {
+                    let limits = Limits {
+                        max_work: limit,
+                        ..Limits::default()
+                    };
+                    let mut fast = Workspace::with_limits(limits);
+                    let mut generic = Workspace::with_limits(limits);
+                    assert_eq!(
+                        check_surface_chf(&mut fast, &chf),
+                        check_chf(&mut generic, &chf)
+                    );
+                    assert_eq!(fast.usage().work, generic.usage().work);
+                }
+            }
+        }
     }
 }

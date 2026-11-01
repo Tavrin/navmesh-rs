@@ -190,7 +190,11 @@ pub(crate) fn closest_point_on_detail_edges(
         if only_boundary && (tris[3] & ANY_BOUNDARY_EDGE) == 0 {
             continue;
         }
-        let v = [0, 1, 2].map(|j| detail_vert(tile, poly, pd.vert_base, tris[j]));
+        let v = [
+            detail_vert(tile, poly, pd.vert_base, tris[0]),
+            detail_vert(tile, poly, pd.vert_base, tris[1]),
+            detail_vert(tile, poly, pd.vert_base, tris[2]),
+        ];
         let mut j = 2;
         for k in 0..3 {
             let flags = (tris[3] >> (j * 2)) & 0x3;
@@ -230,7 +234,11 @@ pub(crate) fn poly_height(tile: &MeshTile, ip: usize, pos: &[f32]) -> Option<f32
     for j in 0..pd.tri_count as usize {
         let t = (pd.tri_base as usize + j) * 4;
         let tr = &tile.detail_tris[t..t + 4];
-        let v = [0, 1, 2].map(|k| detail_vert(tile, poly, pd.vert_base, tr[k]));
+        let v = [
+            detail_vert(tile, poly, pd.vert_base, tr[0]),
+            detail_vert(tile, poly, pd.vert_base, tr[1]),
+            detail_vert(tile, poly, pd.vert_base, tr[2]),
+        ];
         if let Some(h) = closest_height_point_triangle(pos, v[0], v[1], v[2]) {
             return Some(h);
         }
@@ -265,6 +273,20 @@ pub(crate) fn query_polygons_in_tile(
     max: usize,
 ) {
     out.clear();
+    query_polygons_in_tile_with(tile, qmin, qmax, &mut |ip| {
+        if out.len() < max {
+            out.push(ip);
+        }
+        true
+    });
+}
+
+pub(crate) fn query_polygons_in_tile_with(
+    tile: &MeshTile,
+    qmin: &[f32],
+    qmax: &[f32],
+    visit: &mut impl FnMut(u32) -> bool,
+) -> bool {
     let h = &tile.header;
     if !tile.bv_tree.is_empty() {
         let tbmin = &h.bmin;
@@ -279,8 +301,8 @@ pub(crate) fn query_polygons_in_tile(
             let node = &tile.bv_tree[i];
             let overlap = overlap_quant_bounds(&bmin, &bmax, &node.bmin, &node.bmax);
             let leaf = node.i >= 0;
-            if leaf && overlap && out.len() < max {
-                out.push(node.i as u32);
+            if leaf && overlap && !visit(node.i as u32) {
+                return false;
             }
             if overlap || leaf {
                 i += 1;
@@ -301,11 +323,12 @@ pub(crate) fn query_polygons_in_tile(
                 vmin(&mut bmin, v);
                 vmax(&mut bmax, v);
             }
-            if overlap_bounds(qmin, qmax, &bmin, &bmax) && out.len() < max {
-                out.push(i as u32);
+            if overlap_bounds(qmin, qmax, &bmin, &bmax) && !visit(i as u32) {
+                return false;
             }
         }
     }
+    true
 }
 
 /// `findNearestPolyInTile`: nearest polygon index and point.

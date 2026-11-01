@@ -6,6 +6,30 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-01
+
+### Added
+
+- World-space float tile import with `create_nav_mesh_data_f32`; vertex floats are
+  preserved without a uniform-grid round trip.
+- `find_path_with_heuristic_scale`, including zero for Dijkstra searches with
+  zero-cost links or costs below one.
+- `PolyMesh::build_with_report`, typed partial-triangulation errors in strict
+  mode, and per-tile triangulation diagnostics in the bake results.
+- Matching 200-pair path/funnel/nearest-query benchmarks in both record drivers.
+
+### Changed
+
+- Specialize path and nearest-polygon queries for concrete filters while retaining
+  support for trait-object filters.
+- Stream polygon candidates to query callbacks without a temporary allocation.
+- Swap rasterization buffer references directly, preserving clipping order.
+- Validate dense triangle meshes with contiguous coordinate and index scans;
+  preserve referenced-only validation for sparse tile subsets.
+- Validate dense single-layer compact fields with bit-field scans, retaining
+  generic validation and finite work-budget traversal.
+- Resolve detail-triangle corners directly in nearest-polygon height queries.
+
 ## [0.1.3] - 2026-10-31
 
 ### Added
@@ -93,7 +117,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.0...v0.1.1

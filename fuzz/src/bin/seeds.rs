@@ -640,11 +640,241 @@ fn parallel_seeds(out: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+/// Seeds for `f32_import`: accepted tiles of one and two polygons (with and without
+/// BV tree, detail mesh, off-mesh connection), plus raw-float and out-of-range
+/// inputs that must be rejected. Layout in the target source.
+fn f32_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    // Bounds x, y, z min = 0 (byte 128), max x, y, z = 10, 4, 10.
+    let bounds = [128u8, 128, 128, 10, 4, 10];
+    // A vertex coordinate in bounds: tag 8, then the 0..=255 fraction.
+    let c = |t: u8| [8u8, t];
+    let vert = |x: u8, z: u8| [c(x), c(0), c(z)].concat();
+    let quad = [vert(0, 0), vert(0, 255), vert(255, 255), vert(255, 0)].concat();
+    let mut cases: Vec<(&str, Vec<u8>)> = Vec::new();
+    for (name, flags) in [
+        ("bv", 1u8),
+        ("nobv", 0),
+        ("detail", 0x11),
+        ("outside", 0x21),
+    ] {
+        // [flags, 4 vertices, 1 polygon, nvp 4, cs 1, ch 1, areas, no off-mesh]
+        let mut v = vec![flags, 4, 1, 1, 0, 0, 0, 0];
+        v.extend(bounds);
+        v.extend(&quad);
+        // One polygon of 4 vertices: nv byte 1, indices 0..3, no neighbours.
+        v.extend([1u8, 0, 0, 1, 0, 2, 0, 3, 0]);
+        v.extend([1u8, 1, 1, 1]);
+        v.extend([1u8, 0, 0, 5]);
+        if flags & 0x10 != 0 {
+            // Detail: 4 vertices (3 coordinates each), 1 triangle.
+            for _ in 0..4 {
+                v.extend([c(0), c(128), c(0)].concat());
+            }
+            v.extend([0u8, 1, 2, 5]);
+        }
+        cases.push((name, v));
+    }
+    // Two connected polygons sharing an edge, an off-mesh connection and a large area byte.
+    let six = [
+        vert(0, 0),
+        vert(0, 255),
+        vert(128, 255),
+        vert(128, 0),
+        vert(255, 255),
+        vert(255, 0),
+    ]
+    .concat();
+    let mut v = vec![1u8, 6, 2, 1, 0, 0, 1, 1];
+    v.extend(bounds);
+    v.extend(&six);
+    v.extend([1u8, 0, 0, 1, 0, 2, 0, 3, 0, 1, 1, 1, 1]);
+    v.extend([1u8, 3, 0, 2, 0, 4, 0, 5, 0, 1, 1, 1, 1]);
+    v.extend([1u8, 0, 2, 0, 1, 0, 1, 0]);
+    for k in 0..6 {
+        v.extend(c(if k % 3 == 0 { 20 } else { 100 }));
+    }
+    v.extend([8u8, 8, 4, 0, 1, 0, 1]);
+    cases.push(("two-polys-offmesh", v));
+    // Raw floats: NaN vertex and an infinite bound.
+    let mut v = vec![3u8, 3, 1, 0, 0, 0, 0, 0];
+    v.extend(bounds);
+    v.extend(f32::NAN.to_le_bytes());
+    v.extend([0u8; 8]);
+    cases.push(("raw-nan", v));
+    let mut v = vec![7u8, 3, 1, 0, 0, 0, 0, 0];
+    for b in [0.0f32, 0.0, 0.0, f32::INFINITY, 4.0, 10.0] {
+        v.extend(b.to_le_bytes());
+    }
+    cases.push(("raw-inf-bound", v));
+    for (name, bytes) in cases {
+        std::fs::write(out.join(format!("f32-{name}")), bytes).map_err(|e| e.to_string())?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// Seeds for `compact_dense`: small meshes (a plane, a plane with a hole, stairs,
+/// stacked planes with two layers, a bumpy grid) under the three partitions and with
+/// every optional step on. Each is at most 14 by 14 cells at the demo cell size.
+fn dense_seeds(out: &Path) -> Result<usize, String> {
+    let quad = |v: &mut Vec<f32>, t: &mut Vec<i32>, x0: f32, z0: f32, x1: f32, z1: f32, y: f32| {
+        let b = (v.len() / 3) as i32;
+        v.extend([x0, y, z0, x0, y, z1, x1, y, z1, x1, y, z0]);
+        t.extend([b, b + 1, b + 2, b, b + 2, b + 3]);
+    };
+    let mut meshes: Vec<(&str, Vec<f32>, Vec<i32>)> = Vec::new();
+    let (mut v, mut t) = (Vec::new(), Vec::new());
+    quad(&mut v, &mut t, 0.0, 0.0, 4.0, 4.0, 0.0);
+    meshes.push(("plane", v, t));
+    let (mut v, mut t) = (Vec::new(), Vec::new());
+    for (a, b, c, d) in [
+        (0.0, 0.0, 4.0, 1.5),
+        (0.0, 2.5, 4.0, 4.0),
+        (0.0, 1.5, 1.5, 2.5),
+        (2.5, 1.5, 4.0, 2.5),
+    ] {
+        quad(&mut v, &mut t, a, b, c, d, 0.0);
+    }
+    meshes.push(("hole", v, t));
+    let (mut v, mut t) = (Vec::new(), Vec::new());
+    for i in 0..6 {
+        let f = i as f32;
+        quad(&mut v, &mut t, f * 0.7, 0.0, f * 0.7 + 0.7, 3.0, f * 0.15);
+    }
+    meshes.push(("stairs", v, t));
+    let (mut v, mut t) = (Vec::new(), Vec::new());
+    quad(&mut v, &mut t, 0.0, 0.0, 4.0, 4.0, 0.0);
+    quad(&mut v, &mut t, 1.0, 1.0, 3.0, 3.0, 3.0);
+    meshes.push(("stacked", v, t));
+    let (mut v, mut t) = (Vec::new(), Vec::new());
+    for i in 0..8 {
+        for j in 0..8 {
+            let y = ((i * 7 + j * 3) % 5) as f32 * 0.05;
+            quad(
+                &mut v,
+                &mut t,
+                i as f32 * 0.5,
+                j as f32 * 0.5,
+                i as f32 * 0.5 + 0.5,
+                j as f32 * 0.5 + 0.5,
+                y,
+            );
+        }
+    }
+    meshes.push(("bumpy", v, t));
+    let mut written = 0;
+    for (name, verts, tris) in meshes {
+        for (sname, settings) in [
+            ("watershed", demo_settings(0)),
+            ("monotone", demo_settings(1)),
+            ("layers", demo_settings(2)),
+            ("all-steps", {
+                let mut s = demo_settings(0);
+                s[0] = 0xfc;
+                s
+            }),
+        ] {
+            let input = RecastInput {
+                settings,
+                verts: verts.clone(),
+                tris: tris.clone(),
+            };
+            let bytes = input.encode().ok_or("seed does not encode")?;
+            std::fs::write(out.join(format!("dense-{name}-{sname}")), bytes)
+                .map_err(|e| e.to_string())?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Seeds for `heuristic_path`: scale tags 0 to 7 and raw scales (NaN, negative,
+/// infinite, large) on a row of linked tiles, with several area costs.
+fn heuristic_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    // Tiles 0 and 2 link on to 5 and 4; the rest are isolated.
+    let links = [0x85u8, 0, 0x84, 0, 0, 0];
+    let raws = [
+        0.0f32,
+        0.999,
+        f32::NAN,
+        -1.0,
+        f32::INFINITY,
+        1e30,
+        1e-45,
+        3.0,
+    ];
+    for (i, raw) in raws.iter().enumerate() {
+        for costs in [0x00u8, 0x31, 0x77] {
+            let mut v = vec![costs, 1, 1 + (i as u8 % 12)];
+            v.extend(raw.to_le_bytes());
+            v.extend(links);
+            // Queries 0->5, 5->0, 2->4, 1->3 under every scale tag.
+            for tag in 0..8u8 {
+                for (s, e) in [(0u8, 5u8), (5, 0), (2, 4), (1, 3)] {
+                    v.extend([s, e, 0, tag]);
+                }
+            }
+            std::fs::write(out.join(format!("heuristic-{i}-{costs:02x}")), v)
+                .map_err(|e| e.to_string())?;
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Seeds for `strict_triangulation`: convex contours (complete triangulation),
+/// a bow-tie and random-coordinate contours (incomplete), out-of-range
+/// coordinates, and every polygon-size selector.
+fn strict_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    let mut put = |name: String, bytes: Vec<u8>| -> Result<(), String> {
+        std::fs::write(out.join(name), bytes).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+    for nvp in 0..11u8 {
+        // Convex contours of 6 and 12 vertices.
+        let mut v = vec![nvp, 2];
+        for n in [6u8, 12] {
+            v.extend([0u8, n, 1, 1]);
+            for i in 0..n {
+                v.extend([20 + i, 0]);
+            }
+        }
+        put(format!("strict-convex-nvp{nvp}"), v)?;
+        // A bow-tie, a spiral-like random contour and out-of-range coordinates.
+        let mut v = vec![nvp, 3];
+        v.extend([2u8, 4, 1, 1, 0, 0, 100, 100, 0, 100, 100, 0]);
+        v.extend([2u8, 10, 2, 1]);
+        for i in 0..10u8 {
+            v.extend([i.wrapping_mul(97), i.wrapping_mul(61)]);
+        }
+        v.extend([3u8, 5, 3, 1]);
+        for i in 0..5u8 {
+            v.extend([i.wrapping_mul(53), i.wrapping_mul(29)]);
+        }
+        put(format!("strict-bad-nvp{nvp}"), v)?;
+    }
+    Ok(written)
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let no_inputs = matches!(
         args.first().map(String::as_str),
-        Some("crowd" | "budget" | "tilecache" | "parallel" | "recast-grid")
+        Some(
+            "crowd"
+                | "budget"
+                | "tilecache"
+                | "parallel"
+                | "recast-grid"
+                | "f32"
+                | "heuristic"
+                | "dense"
+                | "strict"
+        )
     );
     if args.len() < if no_inputs { 2 } else { 3 } {
         eprintln!(
@@ -663,6 +893,10 @@ fn main() -> ExitCode {
         "recast-grid" => recast_grid_seeds(out),
         "crowd" => crowd_seeds(out),
         "budget" => budget_seeds(out),
+        "f32" => f32_seeds(out),
+        "dense" => dense_seeds(out),
+        "heuristic" => heuristic_seeds(out),
+        "strict" => strict_seeds(out),
         "tilecache" => tilecache_seeds(out),
         "parallel" => parallel_seeds(out),
         other => Err(format!("unknown mode {other}")),

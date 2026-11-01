@@ -567,3 +567,177 @@ fn global_off_mesh_links_resolve_in_any_tile_and_survive_remove_and_re_add() {
     nav.set_global_off_mesh_links(false);
     assert!(!far_path_found(&nav, 0.0, 10.0));
 }
+
+#[test]
+fn float_import_preserves_small_features_at_large_extent() {
+    let verts = [
+        -0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0001, 0.0, 1.0, 0.0001, 0.0, 0.0, 10000.0, 0.0, 0.0,
+        10000.0, 0.0, 1.0, 10001.0, 0.0, 1.0, 10001.0, 0.0, 0.0,
+    ];
+    let n = u16::MAX;
+    let params = NavMeshCreateParams {
+        vert_count: 8,
+        polys: &[0, 1, 2, 3, n, n, n, n, 4, 5, 6, 7, n, n, n, n],
+        nvp: 4,
+        poly_count: 2,
+        poly_flags: &[1, 1],
+        poly_areas: &[0, 0],
+        bmin: [0.0; 3],
+        bmax: [10001.0, 1.0, 1.0],
+        cs: 1.0,
+        ch: 1.0,
+        build_bv_tree: true,
+        ..Default::default()
+    };
+    let bytes = detour::create_nav_mesh_data_f32(&params, &verts).unwrap();
+    let mut nav = NavMesh::new(&NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: 10001.0,
+        tile_height: 1.0,
+        max_tiles: 1,
+        max_polys: 4,
+    })
+    .unwrap();
+    nav.add_tile(bytes).unwrap();
+    let tile = nav.tile(0).unwrap();
+    assert_eq!(
+        tile.verts[..verts.len()]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect::<Vec<_>>(),
+        verts.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+    let q = NavMeshQuery::new(&nav, 64).unwrap();
+    let hit = q
+        .find_nearest_poly(
+            &[0.00005, 0.0, 0.5],
+            &[0.00001, 0.1, 0.1],
+            &DefaultFilter::default(),
+        )
+        .unwrap();
+    assert_ne!(hit.0, 0);
+    let mut bad = verts;
+    bad[0] = f32::NAN;
+    assert!(detour::create_nav_mesh_data_f32(&params, &bad).is_err());
+    assert!(detour::create_nav_mesh_data_f32(&params, &verts[..3]).is_err());
+}
+
+#[test]
+fn explicit_heuristic_default_and_invalid_scales() {
+    let mut nav = NavMesh::new(&NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: 10.0,
+        tile_height: 10.0,
+        max_tiles: 1,
+        max_polys: 8,
+    })
+    .unwrap();
+    nav.add_tile(mesh_tile(0, 0, true, false)).unwrap();
+    let mut q = NavMeshQuery::new(&nav, 64).unwrap();
+    let f = DefaultFilter::default();
+    let a = [1.0, 0.0, 8.0];
+    let b = [8.0, 0.0, 1.0];
+    let ra = q.find_nearest_poly(&a, &[1.0; 3], &f).unwrap().0;
+    let rb = q.find_nearest_poly(&b, &[1.0; 3], &f).unwrap().0;
+    let mut expected = Vec::new();
+    let status = q.find_path(ra, rb, &a, &b, &f, &mut expected, 64).unwrap();
+    for scale in [0.999, 0.0] {
+        let mut actual = Vec::new();
+        assert_eq!(
+            q.find_path_with_heuristic_scale(ra, rb, &a, &b, &f, &mut actual, 64, scale)
+                .unwrap(),
+            status
+        );
+        assert_eq!(actual, expected);
+    }
+    for scale in [-1.0, f32::NAN, f32::INFINITY] {
+        assert!(
+            q.find_path_with_heuristic_scale(ra, rb, &a, &b, &f, &mut Vec::new(), 64, scale)
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn dijkstra_takes_geometric_detour_with_zero_cost_links() {
+    use navmesh_rs::detour::{Poly, PolyRef, QueryFilter};
+    struct CheapLinks;
+    impl QueryFilter for CheapLinks {
+        fn pass_filter(&self, _: PolyRef, _: &MeshTile, _: &Poly) -> bool {
+            true
+        }
+        fn cost(
+            &self,
+            a: &[f32; 3],
+            b: &[f32; 3],
+            _: Option<(PolyRef, &MeshTile, &Poly)>,
+            cur: (PolyRef, &MeshTile, &Poly),
+            _: Option<(PolyRef, &MeshTile, &Poly)>,
+        ) -> f32 {
+            if cur.2.flags == 2 {
+                0.0
+            } else {
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt() * 0.1
+            }
+        }
+    }
+    let n = u16::MAX;
+    let verts = [
+        0, 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 10, 0, 0, 10, 0, 1, 11, 0, 1, 11, 0, 0, 100, 0, 0, 100,
+        0, 1, 101, 0, 1, 101, 0, 0,
+    ];
+    let polys = [
+        0, 1, 2, 3, n, n, n, n, 4, 5, 6, 7, n, n, n, n, 8, 9, 10, 11, n, n, n, n,
+    ];
+    let links = [
+        0.5, 0.0, 0.5, 10.5, 0.0, 0.5, 0.5, 0.0, 0.5, 100.5, 0.0, 0.5, 100.5, 0.0, 0.5, 10.5, 0.0,
+        0.5,
+    ];
+    let bytes = detour::create_nav_mesh_data(&NavMeshCreateParams {
+        verts: &verts,
+        vert_count: 12,
+        polys: &polys,
+        nvp: 4,
+        poly_count: 3,
+        poly_flags: &[1; 3],
+        poly_areas: &[0; 3],
+        off_mesh_con_verts: &links,
+        off_mesh_con_count: 3,
+        off_mesh_con_rad: &[0.1; 3],
+        off_mesh_con_flags: &[1, 2, 2],
+        off_mesh_con_areas: &[0; 3],
+        off_mesh_con_dir: &[1; 3],
+        bmin: [0.0; 3],
+        bmax: [102.0, 1.0, 1.0],
+        cs: 1.0,
+        ch: 1.0,
+        walkable_climb: 0.1,
+        ..Default::default()
+    })
+    .unwrap();
+    let mut nav = NavMesh::new(&NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: 102.0,
+        tile_height: 1.0,
+        max_tiles: 1,
+        max_polys: 8,
+    })
+    .unwrap();
+    nav.add_tile(bytes).unwrap();
+    let mut q = NavMeshQuery::new(&nav, 64).unwrap();
+    let a = [0.5, 0.0, 0.5];
+    let b = [10.5, 0.0, 0.5];
+    let ra = q.find_nearest_poly(&a, &[0.1; 3], &CheapLinks).unwrap().0;
+    let rb = q.find_nearest_poly(&b, &[0.1; 3], &CheapLinks).unwrap().0;
+    let mut path = Vec::new();
+    let status = q
+        .find_path_with_heuristic_scale(ra, rb, &a, &b, &CheapLinks, &mut path, 64, 0.0)
+        .unwrap();
+    assert!(!status.has_detail(Status::PARTIAL_RESULT));
+    // Ground -> zero-cost link -> remote ground -> zero-cost link -> goal.
+    assert_eq!(path.len(), 5);
+    let mut plain = Vec::new();
+    q.find_path(ra, rb, &a, &b, &CheapLinks, &mut plain, 64)
+        .unwrap();
+    assert_eq!(plain.len(), 3);
+}

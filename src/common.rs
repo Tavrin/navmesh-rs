@@ -32,6 +32,13 @@ pub enum Error {
     TileSlotOccupied,
     /// The navmesh has no free tile slot (or the requested slot is in use).
     NoFreeTile,
+    /// Ear clipping was incomplete in strict mode (not in recastnavigation).
+    PartialTriangulation {
+        /// Number of incomplete contours encountered.
+        failed_contours: usize,
+        /// Number of expected triangles not emitted.
+        missing_triangles: usize,
+    },
     /// An output buffer is too small.
     BufferTooSmall,
 }
@@ -74,6 +81,13 @@ impl fmt::Display for Error {
             Error::InvalidTileData(r) => write!(f, "invalid tile data: {r:?}"),
             Error::TileSlotOccupied => f.write_str("tile location already occupied"),
             Error::NoFreeTile => f.write_str("no free tile slot"),
+            Error::PartialTriangulation {
+                failed_contours,
+                missing_triangles,
+            } => write!(
+                f,
+                "partial triangulation: {failed_contours} contours, {missing_triangles} missing triangles"
+            ),
             Error::BufferTooSmall => f.write_str("buffer too small"),
         }
     }

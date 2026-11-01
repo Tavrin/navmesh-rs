@@ -5,6 +5,15 @@ use alloc::vec::Vec;
 use super::{BORDER_VERTEX, ContourSet, MESH_NULL_IDX, MULTIPLE_REGS};
 use crate::{Error, Workspace};
 
+/// Partial ear-clipping counts (not in recastnavigation).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TriangulationReport {
+    /// Contours producing fewer than n-2 triangles.
+    pub failed_contours: usize,
+    /// Expected triangles that were not produced.
+    pub missing_triangles: usize,
+}
+
 /// A polygon mesh (`rcPolyMesh`).
 #[derive(Clone, Debug, Default)]
 pub struct PolyMesh {
@@ -44,6 +53,19 @@ impl PolyMesh {
     /// Builds a convex polygon mesh from contours (`rcBuildPolyMesh`); `nvp` is the
     /// largest number of vertices per polygon.
     pub fn build(ws: &mut Workspace, cset: &ContourSet, nvp: i32) -> Result<PolyMesh, Error> {
+        Self::build_with_report(ws, cset, nvp, false).map(|(mesh, _)| mesh)
+    }
+
+    /// Builds with partial-triangulation diagnostics (not in recastnavigation).
+    /// Default-compatible mode retains upstream's partial output. Strict mode
+    /// returns a typed error at the first incomplete contour.
+    pub fn build_with_report(
+        ws: &mut Workspace,
+        cset: &ContourSet,
+        nvp: i32,
+        strict: bool,
+    ) -> Result<(PolyMesh, TriangulationReport), Error> {
+        let mut report = TriangulationReport::default();
         ws.begin();
         if !(3..=0xffff).contains(&nvp) {
             return Err(Error::InvalidParameter("vertices per polygon"));
@@ -105,6 +127,24 @@ impl PolyMesh {
                 *idx = j as i32;
             }
             let mut ntris = triangulate(cn, &cont.verts, &mut indices[..cn], &mut tris);
+            let produced =
+                usize::try_from(ntris.unsigned_abs()).map_err(|_| Error::SizeOverflow)?;
+            if produced < cn - 2 {
+                report.failed_contours = report
+                    .failed_contours
+                    .checked_add(1)
+                    .ok_or(Error::SizeOverflow)?;
+                report.missing_triangles = report
+                    .missing_triangles
+                    .checked_add(cn - 2 - produced)
+                    .ok_or(Error::SizeOverflow)?;
+                if strict {
+                    return Err(Error::PartialTriangulation {
+                        failed_contours: report.failed_contours,
+                        missing_triangles: report.missing_triangles,
+                    });
+                }
+            }
             if ntris <= 0 {
                 ntris = -ntris;
             }
@@ -217,7 +257,7 @@ impl PolyMesh {
             }
         }
         mesh.flags = ws.vec(mesh.npolys as usize, 0u16)?;
-        Ok(mesh)
+        Ok((mesh, report))
     }
 }
 
