@@ -150,13 +150,21 @@ pub enum Reached {
 /// Runs the Recast pipeline configured by `input`, builds a tile from its output,
 /// loads it and runs queries on it.
 pub fn run_recast(input: &RecastInput) -> Result<Reached, Error> {
+    run_recast_with(input, RECAST_LIMITS).map(|(reached, _)| reached)
+}
+
+/// [`run_recast`] under the given limits; also returns the polygon and detail
+/// meshes flattened into one word vector, to compare runs under different limits.
+/// With `max_work == u64::MAX` the compact-field validation takes its dense
+/// single-pass path, with any finite `max_work` the generic one.
+pub fn run_recast_with(input: &RecastInput, limits: Limits) -> Result<(Reached, Vec<u32>), Error> {
     let s = &input.settings;
     let flags = s[0];
     let cs = (f32::from(s[1]) + 1.0) / 100.0;
     let ch = (f32::from(s[2]) + 1.0) / 100.0;
     let (height, climb, radius) = (i32::from(s[4]), i32::from(s[5]), i32::from(s[6]));
     let border = i32::from(s[14]);
-    let mut ws = Workspace::with_limits(RECAST_LIMITS);
+    let mut ws = Workspace::with_limits(limits);
     let (verts, tris) = (&input.verts[..], &input.tris[..]);
 
     let (bmin, bmax) = recast::calc_bounds(verts);
@@ -216,6 +224,13 @@ pub fn run_recast(input: &RecastInput) -> Result<Reached, Error> {
     let sample_err = f32::from(s[13]) / 10.0;
     let dmesh = PolyMeshDetail::build(&mut ws, &pmesh, &chf, sample_dist, sample_err)?;
 
+    let mut digest: Vec<u32> = vec![pmesh.npolys as u32, pmesh.nverts as u32];
+    digest.extend(pmesh.verts.iter().map(|&v| u32::from(v)));
+    digest.extend(pmesh.polys.iter().map(|&v| u32::from(v)));
+    digest.extend(pmesh.areas.iter().map(|&v| u32::from(v)));
+    digest.extend(dmesh.meshes.iter().copied());
+    digest.extend(dmesh.verts.iter().map(|v| v.to_bits()));
+    digest.extend(dmesh.tris.iter().map(|&v| u32::from(v)));
     let poly_flags = vec![1u16; usize::try_from(pmesh.npolys).unwrap_or(0)];
     let tile = detour::create_nav_mesh_data(&NavMeshCreateParams {
         verts: &pmesh.verts,
@@ -241,9 +256,9 @@ pub fn run_recast(input: &RecastInput) -> Result<Reached, Error> {
         ..Default::default()
     });
     let Ok(tile) = tile else {
-        return Ok(Reached::DetailMesh);
+        return Ok((Reached::DetailMesh, digest));
     };
     let (nav, _) = NavMesh::new_single(tile)?;
     exercise_queries(&nav);
-    Ok(Reached::NavMesh)
+    Ok((Reached::NavMesh, digest))
 }

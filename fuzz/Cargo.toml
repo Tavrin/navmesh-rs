@@ -70,3 +70,31 @@ path = "fuzz_targets/budgeted_query.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "f32_import"
+path = "fuzz_targets/f32_import.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "heuristic_path"
+path = "fuzz_targets/heuristic_path.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "strict_triangulation"
+path = "fuzz_targets/strict_triangulation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compact_dense"
+path = "fuzz_targets/compact_dense.rs"
+test = false
+doc = false
+bench = false

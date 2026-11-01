@@ -48,6 +48,27 @@ cargo run --release --bin seeds -- budget corpus/budgeted_query
 cargo +nightly fuzz run budgeted_query corpus/budgeted_query -- -max_len=200
 ```
 
+`f32_import` feeds `create_nav_mesh_data_f32` arbitrary float vertices (NaN, infinities, huge
+values, out-of-bounds points), polygons, bounds, cell sizes, off-mesh connections and detail
+data, then loads an accepted tile and queries it. `heuristic_path` runs
+`find_path_with_heuristic_scale` with arbitrary scale bit patterns and area costs (including
+zero) on linked tiles; invalid scales must be errors and reachability must not depend on the
+scale. `strict_triangulation` builds polygon meshes from arbitrary contours in default and
+strict mode and compares the two. `compact_dense` runs a small mesh through the Recast
+pipeline under unlimited work (one-pass compact-field validation) and under a finite work
+limit (generic validation) and requires identical meshes. Seed writers and runs:
+
+```sh
+cargo run --release --bin seeds -- f32 corpus/f32_import
+cargo run --release --bin seeds -- heuristic corpus/heuristic_path
+cargo run --release --bin seeds -- strict corpus/strict_triangulation
+cargo run --release --bin seeds -- dense corpus/compact_dense
+cargo +nightly fuzz run f32_import corpus/f32_import -- -max_len=512 -rss_limit_mb=512
+cargo +nightly fuzz run heuristic_path corpus/heuristic_path -- -max_len=256 -rss_limit_mb=512
+cargo +nightly fuzz run strict_triangulation corpus/strict_triangulation -- -max_len=512 -rss_limit_mb=512
+cargo +nightly fuzz run compact_dense corpus/compact_dense -- -max_len=4096 -rss_limit_mb=512
+```
+
 `crowd_update` and `tilecache_update` have seed writers:
 
 ```sh

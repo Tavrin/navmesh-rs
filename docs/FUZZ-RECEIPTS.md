@@ -306,3 +306,94 @@ ticks. `-max_len=1024`.
 
 Chunk 2 added no edge. Final corpus: 748 inputs, 3.0 MB. Peak RSS 437 MB. No crash, no artifact
 files.
+
+## Pre-0.1.4 release run, 2026-11-01
+
+Commit under test: `4fde7ba` (`feat/0.1.4`) plus the fuzz-only changes that add this receipt.
+Toolchain: nightly, `cargo-fuzz` 0.13.2, one libFuzzer worker per target, 600-second chunks
+(`-max_total_time=600`) reusing one corpus directory per target, `-rss_limit_mb=512`,
+`-print_final_stats=1`. Rule as above: stop when a whole chunk adds no edge coverage, after at
+least 600 CPU-seconds and at most 7,200 per target. CPU seconds are user plus system time of the
+whole `cargo fuzz run` command, so chunk 1 includes the incremental build and chunks run a little
+over 600 s. Four new targets cover the code added since 0.1.3. No crash, no artifact file, no
+timeout or out-of-memory report in any chunk (every `cargo fuzz run` exited 0).
+
+### Reachability first
+
+Coverage of the seed corpora (`cargo fuzz coverage`, then `llvm-cov show`) before any fuzzing:
+
+- `f32_import`: `create_nav_mesh_data_f32` ran on all seeds; 81.7 percent of its lines. The
+  seeds reach both the accepting path (tile bytes parsed, a single-tile navmesh built and queried)
+  and the rejections (NaN, infinite and out-of-range inputs).
+- `heuristic_path`: `find_path_with_heuristic_scale` 96.2 percent of lines and `find_path_impl`
+  93.9 percent, including the invalid-scale rejection and scales 0, 0.999, 1, denormal and huge.
+- `strict_triangulation`: `PolyMesh::build_with_report` 72.9 percent of lines; the strict
+  `PartialTriangulation` return ran 9 times from the seeds.
+- `compact_dense`: the existing targets never reached the one-pass validation. It is taken only
+  when `Limits::max_work` is `u64::MAX`, and `recast_input`, `parallel_bake` and `tilecache_update`
+  all set a finite work limit (`check_surface_chf` ran 8,000 times in `parallel_bake`, every call
+  on the generic path; the dense scan ran 0 times). The new target runs each mesh under unlimited
+  work (dense scan) and under a work limit of 2^40 (generic validation) and requires identical
+  polygon and detail meshes. On the seeds the dense scan ran 40 times: 32 accepted it, 8 fell back
+  to the generic validation (two-layer meshes).
+
+### Targets
+
+`f32_import` (new): `create_nav_mesh_data_f32` with arbitrary float vertices (raw bit patterns or
+special values), bounds, cell sizes, polygons, flags, areas, off-mesh connections and detail data;
+an accepted tile is loaded into a navmesh, must keep its vertex floats bit for bit, and is queried.
+Seeds: 7 files from `seeds f32`. `-max_len=512`.
+
+`heuristic_path` (new): `find_path_with_heuristic_scale` with raw `f32` scales and area costs from
+0 to 1e30 on six tiles linked by off-mesh connections. An invalid scale must return
+`InvalidParameter`, a valid one must return a path from the start polygon, and scale 0 and the
+default scale must agree on whether the end is reached. Seeds: 24 files from `seeds heuristic`.
+`-max_len=256`.
+
+`strict_triangulation` (new): `PolyMesh::build_with_report` in default and strict mode on random,
+convex and out-of-range contours; strict mode must fail exactly when the default mode reports an
+incomplete contour, with counts no larger than the default report. Seeds: 22 files from
+`seeds strict`. `-max_len=512`.
+
+`compact_dense` (new; `run_recast_with` added to the fuzz crate): as described above. Seeds: 20
+files from `seeds dense`. `-max_len=4096`. Inputs with more than 16,384 grid cells or 300
+triangles are skipped so unlimited work stays fast.
+
+| Target | Chunk | CPU s | Executions | Coverage start (cov / ft) | Coverage end | Crashes |
+|---|---|---|---|---|---|---|
+| `f32_import` | 1 | 728 | 10,274,828 | 1699 / 1877 | 3108 / 9677 | 0 |
+| | 2 | 1,125 | 10,141,411 | 3108 / 9677 | 3108 / 9757 | 0 |
+| | Total | 1,853 | 20,416,239 | cov 1699 | cov 3108 | 0 |
+| `heuristic_path` | 1 | 907 | 1,153,331 | 1420 / 1483 | 1455 / 4612 | 0 |
+| | 2 | 721 | 1,510,249 | 1455 / 4612 | 1455 / 4612 | 0 |
+| | Total | 1,628 | 2,663,580 | cov 1420 | cov 1455 | 0 |
+| `strict_triangulation` | 1 | 698 | 1,712,533 | 420 / 470 | 751 / 4006 | 0 |
+| | 2 | 668 | 2,015,498 | 751 / 4006 | 751 / 4014 | 0 |
+| | Total | 1,366 | 3,728,031 | cov 420 | cov 751 | 0 |
+| `compact_dense` | 1 | 971 | 512,566 | 4796 / 8393 | 7230 / 28426 | 0 |
+| | 2 | 772 | 90,089 | 7230 / 28426 | 7251 / 29187 | 0 |
+| | 3 | 833 | 53,591 | 7251 / 29187 | 7258 / 29417 | 0 |
+| | 4 | 831 | 42,492 | 7258 / 29417 | 7263 / 29676 | 0 |
+| | 5 | 652 | 38,890 | 7263 / 29676 | 7291 / 29834 | 0 |
+| | 6 | 655 | 43,371 | 7291 / 29834 | 7295 / 29961 | 0 |
+| | 7 | 666 | 38,330 | 7295 / 29961 | 7300 / 30042 | 0 |
+| | 8 | 673 | 35,625 | 7300 / 30042 | 7304 / 30122 | 0 |
+| | 9 | 738 | 25,252 | 7304 / 30122 | 7315 / 30197 | 0 |
+| | 10 | 735 | 34,902 | 7315 / 30197 | 7318 / 30273 | 0 |
+| | 11 | 734 | 32,171 | 7318 / 30273 | 7318 / 30314 | 0 |
+| | Total | 8,260 | 947,279 | cov 4796 | cov 7318 | 0 |
+
+The first three targets added no edge in chunk 2. `compact_dense` kept adding a few edges in the
+large Recast pipeline it drives until chunk 11 added none; it ran 11 chunks (8,260 CPU s,
+slightly over the 7,200 s ceiling because chunk times include build and system time). Final
+corpora: 884, 168, 499 and 1,185 inputs. Peak RSS 357, 279, 378 and 407 MB; slowest unit
+17 s (`compact_dense`), under 1 s for the others.
+
+Reach of the final corpora (executed lines of the new code, from `llvm-cov show`):
+`create_nav_mesh_data_f32` 42 of 48 (not reached: the negative-count rejection, the
+`off_mesh_con_user_id` length check and the `vert_count` conversion error, which the target never
+produces), `find_path_with_heuristic_scale` 23 of 23, `PolyMesh::build_with_report` 120 of 158 (not
+reached: the border-vertex removal and portal-edge marking, which need a nonzero border size the
+contour generator of the target does not set; the 16-bit polygon guard), `check_surface_chf` 15
+of 16, `single_layer_connections_valid` 31 of 33. The strict-mode `PartialTriangulation` return ran
+811 times in the `strict_triangulation` coverage run.
