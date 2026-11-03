@@ -98,3 +98,10 @@ path = "fuzz_targets/compact_dense.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "trusted_bake"
+path = "fuzz_targets/trusted_bake.rs"
+test = false
+doc = false
+bench = false

@@ -397,3 +397,68 @@ reached: the border-vertex removal and portal-edge marking, which need a nonzero
 contour generator of the target does not set; the 16-bit polygon guard), `check_surface_chf` 15
 of 16, `single_layer_connections_valid` 31 of 33. The strict-mode `PartialTriangulation` return ran
 811 times in the `strict_triangulation` coverage run.
+
+## 0.1.5 pre-release run, 2026-11-03
+
+Commit under test: `7d30fae` (`perf/0.1.5`). Toolchain: nightly, `cargo-fuzz`, one libFuzzer
+worker, 600-second chunks, `-rss_limit_mb=512`, `-print_final_stats=1`. CPU seconds are user plus
+system time of the fuzzer process (`parallel_bake` runs four rayon threads). Coverage is libFuzzer's
+edge count at the start (`INITED`) and end (`DONE`) of the chunk.
+
+`ASAN_OPTIONS=quarantine_size_mb=16` was set from the `parallel_bake` rerun on. Without it the
+AddressSanitizer free-memory quarantine (257 MB in the failing run, against 25 MB of live heap) pushed
+two targets over the 512 MB limit. The two reported out-of-memory inputs (`recast_input`, a 605 KB
+seed-sized input; `parallel_bake`, 379 bytes) use 53 MB and 88 MB when run alone, so they are
+quarantine artifacts, not leaks. `recast_input` was restarted with `-max_len=100000` because its seeds
+are 605 KB and the corpus alone approached the limit.
+
+New target `trusted_bake`: bakes one input through `bake::tiles` (trusted compact-field path) and
+through the public stage functions with a fresh workspace per stage (validated path), with the same
+cumulative per-tile budget, and requires identical tile bytes, triangulation reports and first error.
+Setup failures (no tile location) are skipped. Detour's limit-aware tile creation is not public, so
+the reference ends in the unlimited `create_nav_mesh_data` and a limit-class error is accepted at that
+stage. Seeds: the 110 `parallel` seeds.
+
+| Target | Chunk | CPU s | Executions | Coverage start | Coverage end | Crashes / mismatches |
+|---|---|---|---|---|---|---|
+| `budgeted_query` | 1 | 600 | 778,949 | 2621 | 2675 | 0 |
+| | 2 | 595 | 717,155 | 2675 | 2675 | 0 |
+| `trusted_bake` | 1 | 603 | 19,225 | 5564 | 5697 | 0 |
+| | 2 | 603 | 14,452 | 5697 | 5712 | 0 |
+| | 3 | 589 | 10,058 | 5712 | 5739 | 0 |
+| | 4 (cut short by a machine hold, 97 s, not counted) | 97 | 1,799 | 5739 | 5739 | 0 |
+| | 5 | 601 | 10,146 | 5739 | 5766 | 0 |
+| | 6 | 593 | 10,567 | 5766 | 5784 | 0 |
+| | 7 | 594 | 9,975 | 5784 | 5798 | 0 |
+| | 8 | 597 | 9,293 | 5798 | 5826 | 0 |
+| | 9 | 594 | 8,865 | 5826 | 5832 | 0 |
+| | 10 | 589 | 8,758 | 5832 | 5853 | 0 |
+| | 11 | 598 | 8,144 | 5853 | 5858 | 0 |
+| | 12 | 623 | 7,379 | 5858 | 5871 | 0 |
+| `parallel_bake` | 1 | 1,822 | 7,506 | 5077 | 5911 | 0 |
+| | 2 | 1,797 | 4,562 | 5900 | 5915 | 0 |
+| | 3 | 1,730 | 6,408 | 5912 | 5931 | 0 |
+| | 4 | 1,606 | 3,454 | 5911 | 5919 | 0 |
+| | 5 | 1,901 | 4,659 | 5911 | 5916 | 0 |
+| | 6 | 1,756 | 6,380 | 5910 | 5928 | 0 |
+| `recast_input` | 1 | 598 | 296,266 | 23 | 2368 | 0 |
+| | 2 | 221 | 47,060 (stopped) | 2368 | 2368 | 1 crash |
+
+Results against the rule (flat for 10 minutes, 10 CPU-minutes to 2 CPU-hours):
+- `budgeted_query`: met (flat in chunk 2, 1,195 CPU s).
+- `trusted_bake`: not met. It reached the 12-chunk limit (6,985 CPU s counted, under the 7,200 s cap) still gaining a few
+  edges per chunk (5739 to 5871). 116,862 counted executions, zero mismatches.
+- `parallel_bake`: not met. About 10,600 CPU s over six chunks, above the 7,200 s cap (the sixth chunk
+  was already queued when the driver was stopped at the cap), coverage still moving within about 15 edges.
+  Zero crashes or mismatches over 32,969 executions.
+- `recast_input`: stopped by the crash below, not continued.
+
+Final corpora are not committed. No mismatch between the trusted and validated bake paths was found.
+
+### Open finding: `divide_poly` index out of bounds, present in v0.1.4
+
+`recast_input` chunk 2 hit `index out of bounds: the len is 21 but the index is 21` at
+`src/recast/heightfield.rs:588` (`divide_poly`, called from the triangle rasterizer; line 591 in
+v0.1.4). The same 237-byte input panics on a v0.1.4 build, so it is not a regression from the 0.1.5
+changes. Input: `fuzz/artifacts/recast_input/crash-e29e83e6cd0ab9343b7267635720aa479dd5a7a6` (kept in place; `cargo fuzz tmin`
+reduced it to an empty, non-crashing file, so it is not minimized further). Not fixed in this change; the fix is tracked separately.

@@ -416,3 +416,29 @@ fn incomplete_contour_has_report_and_strict_error() {
     ));
     assert!(PolyMesh::build(&mut ws, &cset, 6).is_ok());
 }
+
+/// A fuzzer-found triangle whose x extent (1.6e23) dwarfs the grid. Clipping it
+/// in `f32` yields polygons that are no longer convex and grow past upstream's
+/// seven-vertex buffers; versions 0.1.0 to 0.1.4 panicked with an out-of-bounds
+/// index, now it is a typed error. The values are the exact bit patterns of the
+/// fuzzer's input (three vertices and the bounds of its whole mesh).
+#[test]
+fn huge_triangle_over_a_small_grid_is_a_typed_error() {
+    let bits = |b: [u32; 3]| b.map(f32::from_bits);
+    let (v0, v1, v2) = (
+        bits([0xbfbf_b7bf, 0xbf2f_bfbf, 0xbfbf_bfbf]),
+        bits([0x4924_9249, 0x0000_0002, 0x0000_0000]),
+        bits([0xe608_ffff, 0x0000_b500, 0x2492_4900]),
+    );
+    let bmin = bits([0xbfbf_bfbf, 0xbfbf_bfff, 0xbfbf_bfbf]);
+    let bmax = bits([0x41bf_bfbf, 0x4041_bfbf, 0x4100_0000]);
+    assert!(v2[0] < -1e23 && v1[0] > 6e5, "the triangle dwarfs the grid");
+    let (w, h) = recast::calc_grid_size(&bmin, &bmax, 0.01);
+    let mut ws = Workspace::with_limits(Limits::UNLIMITED);
+    let mut hf = Heightfield::new(&mut ws, w, h, bmin, bmax, 0.01, 0.01).expect("grid");
+    let verts: Vec<f32> = [v0, v1, v2].concat();
+    let result = hf.rasterize_triangles(&mut ws, &verts, &[0, 1, 2], &[0], 0);
+    assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
+    let result = hf.rasterize_triangle(&mut ws, v0, v1, v2, 0, 0);
+    assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
+}

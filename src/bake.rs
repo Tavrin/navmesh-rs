@@ -514,6 +514,20 @@ impl TileWorkspace {
             .ok_or(Error::SizeOverflow)?;
         out
     }
+
+    /// Like [`stage`](Self::stage) for a stage whose compact field was built by
+    /// this pipeline: callers never see it, so the per-stage whole-grid
+    /// connection scans (a full pass per stage) are skipped. Their work is still
+    /// charged, so budgets behave as before.
+    fn trusted_stage<T>(
+        &mut self,
+        f: impl FnOnce(&mut Workspace) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        self.ws.set_compact_trusted(true);
+        let out = self.stage(f);
+        self.ws.set_compact_trusted(false);
+        out
+    }
 }
 
 fn build_tile(
@@ -603,17 +617,17 @@ fn build_tile_in_workspace(
     let mut chf =
         tw.stage(|ws| CompactHeightfield::build(ws, cfg.walkable_height, cfg.walkable_climb, &hf))?;
     drop(hf);
-    tw.stage(|ws| recast::erode_walkable_area(ws, cfg.walkable_radius, &mut chf))?;
+    tw.trusted_stage(|ws| recast::erode_walkable_area(ws, cfg.walkable_radius, &mut chf))?;
     for &i in volume_bucket {
         let v = &input.volumes[i];
-        tw.stage(|ws| {
+        tw.trusted_stage(|ws| {
             recast::mark_convex_poly_area(ws, v.verts, v.hmin, v.hmax, v.area, &mut chf)
         })?;
     }
     match c.partition {
         Partition::Watershed => {
-            tw.stage(|ws| recast::build_distance_field(ws, &mut chf))?;
-            tw.stage(|ws| {
+            tw.trusted_stage(|ws| recast::build_distance_field(ws, &mut chf))?;
+            tw.trusted_stage(|ws| {
                 recast::build_regions(
                     ws,
                     &mut chf,
@@ -623,7 +637,7 @@ fn build_tile_in_workspace(
                 )
             })?;
         }
-        Partition::Monotone => tw.stage(|ws| {
+        Partition::Monotone => tw.trusted_stage(|ws| {
             recast::build_regions_monotone(
                 ws,
                 &mut chf,
@@ -632,11 +646,11 @@ fn build_tile_in_workspace(
                 cfg.merge_region_area,
             )
         })?,
-        Partition::Layers => tw.stage(|ws| {
+        Partition::Layers => tw.trusted_stage(|ws| {
             recast::build_layer_regions(ws, &mut chf, cfg.border_size, cfg.min_region_area)
         })?,
     }
-    let contours = tw.stage(|ws| {
+    let contours = tw.trusted_stage(|ws| {
         ContourSet::build(
             ws,
             &chf,
@@ -674,7 +688,7 @@ fn build_tile_in_workspace(
             return Err(Error::InvalidParameter("detail sample distance too small"));
         }
     }
-    let detail = tw.stage(|ws| {
+    let detail = tw.trusted_stage(|ws| {
         PolyMeshDetail::build(
             ws,
             &mesh,

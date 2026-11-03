@@ -171,8 +171,18 @@ impl NodePool {
     }
 }
 
+/// One open-list slot: the node index with the node's total as it was when the
+/// slot was written. Only `modify` changes a queued node's total, and it rewrites
+/// the slot first, so the cached key always equals `nodes[node].total`; the heap
+/// operations then never touch the node array.
+#[derive(Clone, Copy)]
+struct Entry {
+    total: f32,
+    node: u32,
+}
+
 pub(crate) struct NodeQueue {
-    heap: Vec<usize>,
+    heap: Vec<Entry>,
 }
 
 impl NodeQueue {
@@ -188,51 +198,61 @@ impl NodeQueue {
     pub fn empty(&self) -> bool {
         self.heap.is_empty()
     }
-    pub fn pop(&mut self, nodes: &[Node]) -> usize {
-        let result = self.heap[0];
-        let last = self.heap.len() - 1;
-        let node = self.heap[last];
-        self.heap.truncate(last);
-        if last > 0 {
-            self.trickle_down(0, node, nodes);
+    /// Removes and returns the node with the smallest total (`dtNodeQueue::pop`).
+    pub fn pop(&mut self, _nodes: &[Node]) -> usize {
+        let result = self.heap[0].node as usize;
+        let Some(last) = self.heap.pop() else {
+            return result;
+        };
+        if !self.heap.is_empty() {
+            self.trickle_down(0, last);
         }
         result
     }
     pub fn push(&mut self, node: usize, nodes: &[Node]) {
-        self.heap.push(node);
+        let entry = Entry {
+            total: nodes[node].total,
+            node: node as u32,
+        };
+        self.heap.push(entry);
         let i = self.heap.len() - 1;
-        self.bubble_up(i, node, nodes);
+        self.bubble_up(i, entry);
     }
     pub fn modify(&mut self, node: usize, nodes: &[Node]) {
-        if let Some(i) = self.heap.iter().position(|&n| n == node) {
-            self.bubble_up(i, node, nodes);
+        if let Some(i) = self.heap.iter().position(|e| e.node as usize == node) {
+            self.bubble_up(
+                i,
+                Entry {
+                    total: nodes[node].total,
+                    node: node as u32,
+                },
+            );
         }
     }
-    fn bubble_up(&mut self, mut i: usize, node: usize, nodes: &[Node]) {
-        let total = nodes[node].total;
+    fn bubble_up(&mut self, mut i: usize, entry: Entry) {
         while i > 0 {
             let parent = (i - 1) / 2;
-            if nodes[self.heap[parent]].total > total {
-                self.heap[i] = self.heap[parent];
+            let p = self.heap[parent];
+            if p.total > entry.total {
+                self.heap[i] = p;
                 i = parent;
             } else {
                 break;
             }
         }
-        self.heap[i] = node;
+        self.heap[i] = entry;
     }
-    fn trickle_down(&mut self, mut i: usize, node: usize, nodes: &[Node]) {
+    fn trickle_down(&mut self, mut i: usize, entry: Entry) {
         let size = self.heap.len();
         let mut child = i * 2 + 1;
         while child < size {
-            if child + 1 < size && nodes[self.heap[child]].total > nodes[self.heap[child + 1]].total
-            {
+            if child + 1 < size && self.heap[child].total > self.heap[child + 1].total {
                 child += 1;
             }
             self.heap[i] = self.heap[child];
             i = child;
             child = i * 2 + 1;
         }
-        self.bubble_up(i, node, nodes);
+        self.bubble_up(i, entry);
     }
 }

@@ -6,6 +6,29 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-03
+
+### Fixed
+
+- Rasterizing a finite triangle that is enormous next to the grid (for example an x extent
+  of 1e23) no longer panics with an out-of-bounds index in the polygon clipper. In `f32`
+  the clipped polygon stops being convex and outgrows upstream's seven-vertex buffers
+  (upstream writes out of bounds there); the clipper now checks every write and
+  `rasterize_triangles` / `rasterize_triangle` return `Error::InvalidInput`. Output for
+  every input that fits the buffers is unchanged. Affects 0.1.0 to 0.1.4.
+
+### Changed
+
+- The bake pipeline validates a compact field once, where it builds it, instead of
+  scanning the whole grid again at every stage; the work budget is charged as before.
+  Public stage functions still validate compact fields they are given.
+- Validate sparse single-layer compact fields with the packed row pass in every stage
+  entry point (unlimited budgets only).
+- Replace library `floorf`/`ceilf` calls in span insertion and detail sampling with
+  integer floor and ceiling of identical value.
+- Cache each node's total in the A* open list so heap operations do not index the node
+  pool. Results are unchanged.
+
 ## [0.1.4] - 2026-11-01
 
 ### Added
@@ -117,7 +140,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...v0.1.2

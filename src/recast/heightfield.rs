@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use super::{NULL_AREA, SPAN_MAX_HEIGHT, dir_offset_x, dir_offset_y, validate_mesh};
-use crate::common::{ceilf, clamp, floorf, fmax, fmin, v3, vmax, vmin};
+use crate::common::{ceil_i32, clamp, floor_i32, fmax, fmin, v3, vmax, vmin};
 use crate::{Error, Workspace};
 
 const NONE: u32 = u32::MAX;
@@ -348,10 +348,10 @@ impl Heightfield {
 
         // Four polygon buffers whose roles (in, inRow, p1, p2) are permuted by
         // reference swaps, exactly like upstream's pointer swaps.
-        let mut a = [0.0f32; 7 * 3];
-        let mut b = [0.0f32; 7 * 3];
-        let mut c = [0.0f32; 7 * 3];
-        let mut d = [0.0f32; 7 * 3];
+        let mut a = [0.0f32; MAX_POLY_VERTS * 3];
+        let mut b = [0.0f32; MAX_POLY_VERTS * 3];
+        let mut c = [0.0f32; MAX_POLY_VERTS * 3];
+        let mut d = [0.0f32; MAX_POLY_VERTS * 3];
         let (mut inp, mut row, mut p1, mut p2) = (&mut a, &mut b, &mut c, &mut d);
         inp[0..3].copy_from_slice(v0);
         inp[3..6].copy_from_slice(v1);
@@ -359,7 +359,7 @@ impl Heightfield {
         let mut nv_in = 3usize;
         for z in z0..=z1 {
             let cell_z = bmin[2] + z as f32 * cs;
-            let (nv_row, nv_rest) = divide_poly(&inp[..], nv_in, row, p1, cell_z + cs, 2);
+            let (nv_row, nv_rest) = divide_poly(&inp[..], nv_in, row, p1, cell_z + cs, 2)?;
             core::mem::swap(&mut inp, &mut p1);
             nv_in = nv_rest;
             if nv_row < 3 || z < 0 {
@@ -386,7 +386,7 @@ impl Heightfield {
             let mut nv2 = nv_row;
             for x in x0..=x1 {
                 let cx = bmin[0] + x as f32 * cs;
-                let (nv, rest) = divide_poly(&row[..], nv2, p1, p2, cx + cs, 0);
+                let (nv, rest) = divide_poly(&row[..], nv2, p1, p2, cx + cs, 0)?;
                 core::mem::swap(&mut row, &mut p2);
                 nv2 = rest;
                 if nv < 3 || x < 0 {
@@ -409,12 +409,9 @@ impl Heightfield {
                 if smax > by {
                     smax = by;
                 }
-                let ismin = clamp(floorf(smin * ich) as i32, 0, SPAN_MAX_HEIGHT) as u16;
-                let ismax = clamp(
-                    ceilf(smax * ich) as i32,
-                    i32::from(ismin) + 1,
-                    SPAN_MAX_HEIGHT,
-                ) as u16;
+                let ismin = clamp(floor_i32(smin * ich), 0, SPAN_MAX_HEIGHT) as u16;
+                let ismax =
+                    clamp(ceil_i32(smax * ich), i32::from(ismin) + 1, SPAN_MAX_HEIGHT) as u16;
                 self.insert_span(ws, x, z, ismin, ismax, area, flag_merge_thr)?;
             }
         }
@@ -566,17 +563,51 @@ impl Heightfield {
     }
 }
 
+/// Most vertices a polygon buffer of the rasterizer holds (upstream's `7`).
+///
+/// A triangle clipped by axis-aligned planes stays within this bound in exact
+/// arithmetic. In `f32` the interpolated cut points of a triangle that is huge
+/// next to the grid can fall on the wrong side of a later plane, so the clipped
+/// polygon stops being convex, crosses a plane more than twice and grows past
+/// the buffers (upstream writes out of bounds there).
+const MAX_POLY_VERTS: usize = 7;
+
+/// Appends vertex `src` to `out`, or fails when the buffer is full.
+#[inline(always)]
+fn push_vertex(
+    out: &mut [f32; MAX_POLY_VERTS * 3],
+    count: &mut usize,
+    src: &[f32],
+) -> Result<(), Error> {
+    if *count >= MAX_POLY_VERTS {
+        return Err(Error::InvalidInput(
+            "triangle coordinates too large for single-precision clipping",
+        ));
+    }
+    out[*count * 3..*count * 3 + 3].copy_from_slice(&src[..3]);
+    *count += 1;
+    Ok(())
+}
+
 /// Splits a convex polygon along `axis` at `offset` (`dividePoly`): returns the
 /// vertex counts of the part below the line (`out1`) and above it (`out2`).
+///
+/// `n` is at most [`MAX_POLY_VERTS`]. Fails with [`Error::InvalidInput`] instead
+/// of overflowing when either part would exceed that many vertices.
 fn divide_poly(
     input: &[f32],
     n: usize,
-    out1: &mut [f32; 21],
-    out2: &mut [f32; 21],
+    out1: &mut [f32; MAX_POLY_VERTS * 3],
+    out2: &mut [f32; MAX_POLY_VERTS * 3],
     offset: f32,
     axis: usize,
-) -> (usize, usize) {
-    let mut d = [0.0f32; 12];
+) -> Result<(usize, usize), Error> {
+    if n > MAX_POLY_VERTS || input.len() < n * 3 {
+        return Err(Error::InvalidInput(
+            "triangle coordinates too large for single-precision clipping",
+        ));
+    }
+    let mut d = [0.0f32; MAX_POLY_VERTS];
     for i in 0..n {
         d[i] = offset - input[i * 3 + axis];
     }
@@ -587,34 +618,80 @@ fn divide_poly(
         let same_side = (d[i] >= 0.0) == (d[j] >= 0.0);
         if !same_side {
             let s = d[j] / (d[j] - d[i]);
+            let mut cut = [0.0f32; 3];
             for c in 0..3 {
-                out1[m * 3 + c] = input[j * 3 + c] + (input[i * 3 + c] - input[j * 3 + c]) * s;
+                cut[c] = input[j * 3 + c] + (input[i * 3 + c] - input[j * 3 + c]) * s;
             }
-            for c in 0..3 {
-                out2[k * 3 + c] = out1[m * 3 + c];
-            }
-            m += 1;
-            k += 1;
+            push_vertex(out1, &mut m, &cut)?;
+            push_vertex(out2, &mut k, &cut)?;
             if d[i] > 0.0 {
-                out1[m * 3..m * 3 + 3].copy_from_slice(&input[i * 3..i * 3 + 3]);
-                m += 1;
+                push_vertex(out1, &mut m, &input[i * 3..i * 3 + 3])?;
             } else if d[i] < 0.0 {
-                out2[k * 3..k * 3 + 3].copy_from_slice(&input[i * 3..i * 3 + 3]);
-                k += 1;
+                push_vertex(out2, &mut k, &input[i * 3..i * 3 + 3])?;
             }
         } else {
             if d[i] >= 0.0 {
-                out1[m * 3..m * 3 + 3].copy_from_slice(&input[i * 3..i * 3 + 3]);
-                m += 1;
+                push_vertex(out1, &mut m, &input[i * 3..i * 3 + 3])?;
                 if d[i] != 0.0 {
                     j = i;
                     continue;
                 }
             }
-            out2[k * 3..k * 3 + 3].copy_from_slice(&input[i * 3..i * 3 + 3]);
-            k += 1;
+            push_vertex(out2, &mut k, &input[i * 3..i * 3 + 3])?;
         }
         j = i;
     }
-    (m, k)
+    Ok((m, k))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A regular `n`-gon in the xz plane, centred on the origin.
+    fn ngon(n: usize) -> [f32; MAX_POLY_VERTS * 3] {
+        let mut p = [0.0f32; MAX_POLY_VERTS * 3];
+        for i in 0..n {
+            let a = i as f32 * core::f32::consts::TAU / n as f32;
+            p[i * 3] = a.cos();
+            p[i * 3 + 2] = a.sin();
+        }
+        p
+    }
+
+    #[test]
+    fn divide_poly_fills_the_buffers_exactly_at_the_bound() {
+        let p = ngon(7);
+        let (mut o1, mut o2) = ([0.0; 21], [0.0; 21]);
+        // Entirely on one side: a full 7-vertex part, copied unchanged.
+        assert_eq!(divide_poly(&p, 7, &mut o1, &mut o2, 10.0, 0), Ok((7, 0)));
+        assert_eq!(o1, p);
+        assert_eq!(divide_poly(&p, 7, &mut o1, &mut o2, -10.0, 0), Ok((0, 7)));
+        assert_eq!(o2, p);
+        // One cut through the polygon: two cut points added to both parts.
+        let (m, k) = divide_poly(&p, 7, &mut o1, &mut o2, 0.05, 2).expect("within bounds");
+        assert_eq!((m, k), (6, 5));
+    }
+
+    #[test]
+    fn divide_poly_reports_overflow_instead_of_writing_past_the_buffers() {
+        // A zig-zag list crossing the plane at every edge cannot come from exact
+        // clipping of a triangle, but rounding on huge coordinates produces such
+        // lists. Six crossings put six cut points in each part, plus the vertices.
+        let mut p = [0.0f32; MAX_POLY_VERTS * 3];
+        for i in 0..MAX_POLY_VERTS {
+            p[i * 3 + 2] = if i % 2 == 0 { -1.0 } else { 1.0 };
+            p[i * 3] = i as f32;
+        }
+        let (mut o1, mut o2) = ([0.0; 21], [0.0; 21]);
+        assert!(matches!(
+            divide_poly(&p, 7, &mut o1, &mut o2, 0.0, 2),
+            Err(Error::InvalidInput(_))
+        ));
+        // A list longer than the buffers is refused up front.
+        assert!(matches!(
+            divide_poly(&[0.0; 36], 12, &mut o1, &mut o2, 0.0, 2),
+            Err(Error::InvalidInput(_))
+        ));
+    }
 }
