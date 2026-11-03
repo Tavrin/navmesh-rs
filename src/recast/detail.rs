@@ -7,7 +7,7 @@ use super::{
     CompactHeightfield, MESH_NULL_IDX, MULTIPLE_REGS, NOT_CONNECTED, PolyMesh, dir_for_offset,
     dir_offset_x, dir_offset_y,
 };
-use crate::common::{ceilf, clamp, floorf, fmax, fmin, sqr, sqrtf, vmax, vmin};
+use crate::common::{ceil_i32, clamp, floor_i32, fmax, fmin, sqr, sqrtf, vmax, vmin};
 use crate::{Error, Workspace};
 
 /// Height detail per polygon (`rcPolyMeshDetail`).
@@ -62,7 +62,7 @@ impl PolyMeshDetail {
         let ch = mesh.ch;
         let orig = mesh.bmin;
         let bs = mesh.border_size;
-        let search_radius = 1.max(ceilf(mesh.max_edge_error) as i32);
+        let search_radius = 1.max(ceil_i32(mesh.max_edge_error));
         let mut edges: Vec<i32> = Vec::new();
         let mut tris: Vec<i32> = Vec::new();
         let mut arr: Vec<i32> = Vec::new();
@@ -178,7 +178,8 @@ impl PolyMeshDetail {
 // error/charging order. Nothing is cached across edits to public fields.
 pub(super) fn check_surface_chf(ws: &mut Workspace, chf: &CompactHeightfield) -> Result<(), Error> {
     let cells = (chf.width.max(0) as usize).checked_mul(chf.height.max(0) as usize);
-    if ws.limits().max_work != u64::MAX
+    if ws.compact_trusted()
+        || ws.limits().max_work != u64::MAX
         || chf.width <= 0
         || chf.height <= 0
         || cells != Some(chf.cells.len())
@@ -205,7 +206,7 @@ pub(super) fn check_surface_chf(ws: &mut Workspace, chf: &CompactHeightfield) ->
     }
 }
 
-fn single_layer_connections_valid(chf: &CompactHeightfield) -> bool {
+pub(super) fn single_layer_connections_valid(chf: &CompactHeightfield) -> bool {
     let Ok(nspans) = u32::try_from(chf.spans.len()) else {
         return false;
     };
@@ -453,8 +454,8 @@ fn dist_to_poly(verts: &[f32], p: &[f32]) -> f32 {
 
 #[allow(clippy::too_many_arguments)]
 fn get_height(fx: f32, fy: f32, fz: f32, ics: f32, ch: f32, radius: i32, hp: &HeightPatch) -> u16 {
-    let mut ix = floorf(fx * ics + 0.01) as i32;
-    let mut iz = floorf(fz * ics + 0.01) as i32;
+    let mut ix = floor_i32(fx * ics + 0.01);
+    let mut iz = floor_i32(fz * ics + 0.01);
     // A spiral wider than the patch finds nothing more; clamping keeps huge radii finite.
     let radius = radius.min(hp.width.max(hp.height) + 1);
     ix = clamp(ix.wrapping_sub(hp.xmin), 0, hp.width - 1);
@@ -901,7 +902,7 @@ fn build_poly_detail(
             let dy = vi[1] - vj[1];
             let dz = vi[2] - vj[2];
             let d = sqrtf(dx * dx + dz * dz);
-            let mut nn = 1 + floorf(d / sample_dist) as i32;
+            let mut nn = 1 + floor_i32(d / sample_dist);
             if nn >= MAX_VERTS_PER_EDGE as i32 {
                 nn = MAX_VERTS_PER_EDGE as i32 - 1;
             }
@@ -993,10 +994,10 @@ fn build_poly_detail(
             vmin(&mut bmin, v);
             vmax(&mut bmax, v);
         }
-        let x0 = floorf(bmin[0] / sample_dist) as i32;
-        let x1 = ceilf(bmax[0] / sample_dist) as i32;
-        let z0 = floorf(bmin[2] / sample_dist) as i32;
-        let z1 = ceilf(bmax[2] / sample_dist) as i32;
+        let x0 = floor_i32(bmin[0] / sample_dist);
+        let x1 = ceil_i32(bmax[0] / sample_dist);
+        let z0 = floor_i32(bmin[2] / sample_dist);
+        let z1 = ceil_i32(bmax[2] / sample_dist);
         samples.clear();
         ws.work(((x1 - x0).max(0) as u64) * ((z1 - z0).max(0) as u64))?;
         for z in z0..z1 {

@@ -152,6 +152,9 @@ pub struct Usage {
 pub struct Workspace {
     limits: Limits,
     usage: Usage,
+    /// Set only by the crate's own pipelines while every compact field they pass
+    /// to a stage was built by this crate and not exposed to caller edits since.
+    compact_trusted: bool,
 }
 
 impl Workspace {
@@ -165,7 +168,19 @@ impl Workspace {
         Workspace {
             limits,
             usage: Usage::default(),
+            compact_trusted: false,
         }
+    }
+
+    /// Whether the compact field passed to the running stage is known valid, so the
+    /// whole-grid connection scan can be skipped (its work is still charged).
+    #[inline]
+    pub(crate) fn compact_trusted(&self) -> bool {
+        self.compact_trusted
+    }
+
+    pub(crate) fn set_compact_trusted(&mut self, trusted: bool) {
+        self.compact_trusted = trusted;
     }
 
     /// The limits applied to each call.
@@ -326,6 +341,29 @@ pub(crate) fn ceilf(x: f32) -> f32 {
     }
 }
 
+/// `floorf(x) as i32` without the library call: truncate, then step down for a
+/// negative fraction. Saturates and maps NaN to zero exactly like the `as` cast.
+#[inline(always)]
+pub(crate) fn floor_i32(x: f32) -> i32 {
+    let t = x as i32;
+    if (t as f32) > x {
+        t.saturating_sub(1)
+    } else {
+        t
+    }
+}
+
+/// `ceilf(x) as i32` without the library call (see [`floor_i32`]).
+#[inline(always)]
+pub(crate) fn ceil_i32(x: f32) -> i32 {
+    let t = x as i32;
+    if (t as f32) < x {
+        t.saturating_add(1)
+    } else {
+        t
+    }
+}
+
 #[inline]
 pub(crate) fn cosf(x: f32) -> f32 {
     #[cfg(all(feature = "std", not(feature = "libm")))]
@@ -419,5 +457,36 @@ pub(crate) fn sinf(x: f32) -> f32 {
     #[cfg(feature = "libm")]
     {
         libm::sinf(x)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn integer_floor_and_ceil_match_the_library_functions() {
+        let values = [
+            f32::NEG_INFINITY,
+            -3.0e9,
+            -2_147_483_648.0,
+            -2.5,
+            -1.0,
+            -0.5,
+            -0.0,
+            0.0,
+            0.25,
+            0.999_999_94,
+            1.0,
+            1.5,
+            2_147_483_520.0,
+            3.0e9,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        for x in values {
+            assert_eq!(floor_i32(x), floorf(x) as i32, "floor {x}");
+            assert_eq!(ceil_i32(x), ceilf(x) as i32, "ceil {x}");
+        }
     }
 }

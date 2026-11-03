@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use super::{NULL_AREA, SPAN_MAX_HEIGHT, dir_offset_x, dir_offset_y, validate_mesh};
-use crate::common::{ceilf, clamp, floorf, fmax, fmin, v3, vmax, vmin};
+use crate::common::{ceil_i32, clamp, floor_i32, fmax, fmin, v3, vmax, vmin};
 use crate::{Error, Workspace};
 
 const NONE: u32 = u32::MAX;
@@ -409,12 +409,9 @@ impl Heightfield {
                 if smax > by {
                     smax = by;
                 }
-                let ismin = clamp(floorf(smin * ich) as i32, 0, SPAN_MAX_HEIGHT) as u16;
-                let ismax = clamp(
-                    ceilf(smax * ich) as i32,
-                    i32::from(ismin) + 1,
-                    SPAN_MAX_HEIGHT,
-                ) as u16;
+                let ismin = clamp(floor_i32(smin * ich), 0, SPAN_MAX_HEIGHT) as u16;
+                let ismax =
+                    clamp(ceil_i32(smax * ich), i32::from(ismin) + 1, SPAN_MAX_HEIGHT) as u16;
                 self.insert_span(ws, x, z, ismin, ismax, area, flag_merge_thr)?;
             }
         }

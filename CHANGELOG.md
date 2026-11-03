@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Changed
+
+- The bake pipeline validates a compact field once, where it builds it, instead of
+  scanning the whole grid again at every stage; the work budget is charged as before.
+  Public stage functions still validate compact fields they are given.
+- Validate sparse single-layer compact fields with the packed row pass in every stage
+  entry point (unlimited budgets only).
+- Replace library `floorf`/`ceilf` calls in span insertion and detail sampling with
+  integer floor and ceiling of identical value.
+- Cache each node's total in the A* open list so heap operations do not index the node
+  pool. Results are unchanged.
+
 ## [0.1.4] - 2026-11-01
 
 ### Added

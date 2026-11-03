@@ -25,6 +25,14 @@ pub(crate) fn check_chf(ws: &mut Workspace, chf: &CompactHeightfield) -> Result<
             )
             .ok_or(Error::SizeOverflow)?,
     )?;
+    if ws.compact_trusted() {
+        // Built by this crate's pipeline and unreachable by callers since: skip
+        // the scans but charge exactly what the generic path charges.
+        for _ in 0..chf.height {
+            ws.work(1)?;
+        }
+        return Ok(());
+    }
     if chf
         .cells
         .iter()
@@ -68,6 +76,14 @@ pub(crate) fn check_chf(ws: &mut Workspace, chf: &CompactHeightfield) -> Result<
         } else {
             Err(Error::InvalidInput("compact span connection out of range"))
         };
+    }
+    // Sparse single-layer fields (terrain with holes): one row pass over the
+    // packed connection masks instead of four neighbour lookups per span.
+    if chf.width > 0
+        && ws.limits().max_work == u64::MAX
+        && super::detail::single_layer_connections_valid(chf)
+    {
+        return ws.work(chf.height as u64);
     }
     for z in 0..chf.height {
         ws.work(1)?;
@@ -537,6 +553,77 @@ mod validation_tests {
                 }
             }
         }
+    }
+
+    fn sparse_field() -> CompactHeightfield {
+        // 3x3 grid, centre column empty: eight single-layer spans.
+        let mut index = 0;
+        let cells = (0..9)
+            .map(|i| {
+                let count = u8::from(i != 4);
+                let cell = CompactCell { index, count };
+                index += u32::from(count);
+                cell
+            })
+            .collect();
+        CompactHeightfield {
+            width: 3,
+            height: 3,
+            span_count: 8,
+            cells,
+            spans: alloc::vec![CompactSpan { con: 0xffffff, ..CompactSpan::default() }; 8],
+            areas: alloc::vec![63; 8],
+            ..CompactHeightfield::default()
+        }
+    }
+
+    #[test]
+    fn sparse_single_layer_matches_generic_validation() {
+        let mut chf = sparse_field();
+        for i in 0..8 {
+            for dir in 0..4 {
+                for layer in 0..64 {
+                    chf.spans[i].set_con(dir, layer);
+                    let mut fast = Workspace::new();
+                    let mut generic = Workspace::with_limits(crate::Limits {
+                        max_work: 1000,
+                        ..crate::Limits::default()
+                    });
+                    assert_eq!(check_chf(&mut fast, &chf), check_chf(&mut generic, &chf));
+                    chf.spans[i].set_con(dir, NOT_CONNECTED);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trusted_compact_field_charges_like_validation() {
+        let chf = sparse_field();
+        for max_work in [u64::MAX, 1000] {
+            let limits = crate::Limits {
+                max_work,
+                ..crate::Limits::default()
+            };
+            let mut checked = Workspace::with_limits(limits);
+            let mut trusted = Workspace::with_limits(limits);
+            trusted.set_compact_trusted(true);
+            checked.begin();
+            trusted.begin();
+            assert_eq!(check_chf(&mut checked, &chf), Ok(()));
+            assert_eq!(check_chf(&mut trusted, &chf), Ok(()));
+            assert_eq!(checked.usage(), trusted.usage());
+        }
+        // A budget that runs out inside the row charges fails the same way.
+        let tight = crate::Limits {
+            max_work: 8 + 8 * 4 + 1,
+            ..crate::Limits::default()
+        };
+        let mut checked = Workspace::with_limits(tight);
+        let mut trusted = Workspace::with_limits(tight);
+        trusted.set_compact_trusted(true);
+        assert_eq!(check_chf(&mut checked, &chf), Err(Error::LimitExceeded));
+        assert_eq!(check_chf(&mut trusted, &chf), Err(Error::LimitExceeded));
+        assert_eq!(checked.usage(), trusted.usage());
     }
 
     #[test]

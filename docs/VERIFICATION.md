@@ -937,3 +937,65 @@ match C++, and all **3,035 determinism digests** match the unchanged golden file
 All five tiled cases retain serial/parallel identity at 1, 2, 4, 8 and 16 threads
 in both reference widths. These results qualify output identity and the measured
 instruction reductions; they do not establish the unmet 1.1x performance target.
+
+## 0.1.5 speed: validate once per pipeline, not once per stage
+
+Same machine, toolchains, pinned oracle and measurement method as above (hardware
+`instructions:u`, CPU 6, repeat-3 minus repeat-1 for bakes, repeat-101 minus repeat-1
+over 20,000 pairs for queries). Function-level attribution used `perf record -e
+ibs_op/cnt_ctl=1/ -c 500000` on both binaries, grouped by stage; it counts dispatched
+ops, not instructions (a compare fused with its branch is one op), so it ranks
+functions and is not a substitute for the instruction totals.
+
+Causes found and fixed, all with byte-identical output:
+
+- **Per-stage whole-grid validation.** The public stage functions each re-scan the whole
+  compact field (11.6 million cells on the solo terrain). Attribution put `check_chf` and
+  the surface validator at 2,382 million ops of 33,490 (7.1%). The crate's own bake
+  pipeline now marks the workspace as holding a compact field it built and never exposed
+  (`Workspace::compact_trusted`, crate-private, set only around the stages after
+  `CompactHeightfield::build`), so those stages skip the scans while charging exactly the
+  work the scans charged. Public stage calls on caller-supplied fields still validate in
+  full, and a caller who edits public fields between calls is still caught. The public
+  validator also takes the packed single-layer row pass for sparse fields when no work
+  budget is set (it previously did so only for the detail and contour stages).
+- **Library `floorf`/`ceilf` calls in span insertion and detail sampling.** The library
+  routine linked into the binary (the baseline x86-64 target has no rounding instruction)
+  took 2,027 samples, 3.0% of ops. `floor_i32`/`ceil_i32` truncate and correct, with the same saturation
+  and NaN behaviour as `floorf(x) as i32`.
+- **Open-list slots read the node array.** Each heap comparison indexed the node pool
+  (a bounds check and a dependent load). Slots now cache the node's total, which only
+  `modify` changes and `modify` rewrites the slot first, so the order, tie-breaks and
+  results are unchanged.
+
+| Bake (billion instructions per bake) | 0.1.4 | 0.1.5 | C++ | 0.1.5 / C++ |
+|---|---:|---:|---:|---:|
+| terrain_large_solo, public stage API | 30.47 | 28.50 | 26.21 | 1.087 |
+| terrain_large_tiled, public stage API | 44.31 | 41.54 | 38.33 | 1.084 |
+| terrain_large_tiled, `bake::tiles` pipeline (incl. bucketing, assembly) | 46.25 | 39.86 | 38.33 | 1.040 |
+
+Stage attribution, solo terrain, million ops per bake (from `ibs_op`), 0.1.4 / 0.1.5 / C++:
+setup 228 / 212 / 142; rasterization 15,134 / 14,190 / 14,558; filters 2,528 / 2,544 /
+1,962; compact field 2,022 / 2,031 / 2,133; erosion 1,704 / 1,650 / 1,774; validation
+2,382 / 1,324 / 0; distance field 2,383 / 2,388 / 2,221; regions 1,424 / 1,425 / 1,928;
+contours 648 / 632 / 557 (the remainder of the contour and detail gap in the earlier
+tables was validation). Through the public API the validation passes (1,324) are the
+whole remaining excess in contours and detail; through the bake pipeline they are zero.
+Filters (about 1.3x) and setup (1.5x of a small stage) were attributed but not reduced.
+
+| Query, instructions per pair | 0.1.4 | 0.1.5 | C++ | 0.1.5 / C++ |
+|---|---:|---:|---:|---:|
+| equally weighted 21-case mean of the ratio | 1.187 | 1.154 | 1.000 | 1.154 |
+| sum over the 21 cases | 746,399 | 717,929 | 615,252 | 1.167 |
+
+The best cases are 1.09 (`godot_level_solo`) and 1.10 (`terrain_large_solo`); the worst
+are 1.19 (`multilevel_tilecache`, `dungeon_tilecache`). Query profiles are flat: the
+largest function is `find_path_impl` at about 32% of ops, and no single line holds more
+than 2%. The remaining gap is spread over bounds checks and `Option` handling in
+polygon lookup, portal points and the node pool, which the unsafe-free crate cannot
+remove without per-function rewrites.
+
+**The goal of at most 1.1x C++ for every stage and for queries was not reached.** Bake
+totals are within 1.09x through the public API and 1.04x through the pipeline. Queries
+remain at 1.15x. Output is unchanged: all 76,018 parity records (38,009 per width) match
+C++ and all 3,035 determinism digests match the unchanged golden file.
