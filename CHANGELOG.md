@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-03
+
 ### Fixed
 
 - Rasterizing a finite triangle that is enormous next to the grid (for example an x extent
@@ -138,7 +140,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.1...v0.1.2
