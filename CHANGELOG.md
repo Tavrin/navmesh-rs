@@ -6,6 +6,15 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Rasterizing a finite triangle that is enormous next to the grid (for example an x extent
+  of 1e23) no longer panics with an out-of-bounds index in the polygon clipper. In `f32`
+  the clipped polygon stops being convex and outgrows upstream's seven-vertex buffers
+  (upstream writes out of bounds there); the clipper now checks every write and
+  `rasterize_triangles` / `rasterize_triangle` return `Error::InvalidInput`. Output for
+  every input that fits the buffers is unchanged. Affects 0.1.0 to 0.1.4.
+
 ### Changed
 
 - The bake pipeline validates a compact field once, where it builds it, instead of
