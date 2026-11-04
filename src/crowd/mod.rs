@@ -13,7 +13,7 @@ use crate::detour::{
     DefaultFilter, NavMesh, NavMeshQuery, PolyRef, QueryFilter, STRAIGHTPATH_END,
     STRAIGHTPATH_OFFMESH_CONNECTION, Status, StraightPathPoint,
 };
-use crate::{Budget, Budgeted, Error, Limits, Workspace};
+use crate::{Budget, Budgeted, Error, Limits, UpstreamFixes, Workspace};
 use alloc::vec::Vec;
 mod avoidance;
 mod boundary;
@@ -223,6 +223,11 @@ pub struct CrowdAgent {
     anim: Animation,
 }
 impl CrowdAgent {
+    /// The neighbours kept by the last update (at most six), nearest first, as
+    /// the neighbour's agent slot and its squared planar distance.
+    pub fn neighbours(&self) -> &[(usize, f32)] {
+        &self.neis[..self.nneis]
+    }
     // Preserve allocated storage, but no state belonging to a previous occupant.
     fn reset_slot(&mut self) {
         self.active = false;
@@ -264,6 +269,7 @@ pub struct Crowd {
     pathq: PathQueue,
     active: Vec<usize>,
     velocity_samples: usize,
+    fixes: UpstreamFixes,
 }
 impl Crowd {
     /// Allocates agents and all persistent crowd components under workspace limits.
@@ -320,7 +326,22 @@ impl Crowd {
             filters: core::array::from_fn(|_| DefaultFilter::default()),
             active: ws.vec_with_capacity(max_agents)?,
             velocity_samples: 0,
+            fixes: UpstreamFixes::NONE,
         })
+    }
+    /// Selects the upstream defect corrections the crowd applies; the default is
+    /// [`UpstreamFixes::NONE`]. The crowd uses [`UpstreamFixes::NEAREST_NEIGHBOURS`],
+    /// [`UpstreamFixes::ADAPTIVE_PATTERN`] and, for its path queue,
+    /// [`UpstreamFixes::SLICED_CROSS_SIDE`]. Set it before the first agent is
+    /// given a target so one request is not planned under two settings.
+    pub fn set_fixes(&mut self, fixes: UpstreamFixes) {
+        self.fixes = fixes;
+        self.pathq.set_fixes(fixes);
+        self.avoidance.set_fixes(fixes);
+    }
+    /// The corrections the crowd applies.
+    pub fn fixes(&self) -> UpstreamFixes {
+        self.fixes
     }
     /// Maximum number of agent slots.
     pub fn max_agents(&self) -> usize {
@@ -333,6 +354,25 @@ impl Crowd {
     /// Reads an active slot.
     pub fn agent(&self, id: AgentId) -> Option<&CrowdAgent> {
         self.agents.get(id.0).filter(|a| a.active)
+    }
+    /// The active agents in slot order (`dtCrowd::getActiveAgents`, without the
+    /// copy into a caller array).
+    pub fn active_agents(&self) -> impl Iterator<Item = &CrowdAgent> {
+        self.agents.iter().filter(|a| a.active)
+    }
+    /// Half extents of the box used to place agents on the navmesh
+    /// (`dtCrowd::getQueryHalfExtents`).
+    pub fn query_half_extents(&self) -> V3 {
+        self.extents
+    }
+    /// The proximity grid the last update filled with the active agents
+    /// (`dtCrowd::getGrid`).
+    pub fn grid(&self) -> &ProximityGrid {
+        &self.grid
+    }
+    /// The path queue that serves the agents' path requests (`dtCrowd::getPathQueue`).
+    pub fn path_queue(&self) -> &PathQueue {
+        &self.pathq
     }
     fn agent_mut(&mut self, id: AgentId) -> Result<&mut CrowdAgent, Error> {
         self.agents

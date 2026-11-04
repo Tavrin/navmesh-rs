@@ -5,11 +5,16 @@ use alloc::vec::Vec;
 use super::math::*;
 use super::tile::{MeshTile, Poly, peek_header};
 use super::{
-    DETAIL_EDGE_BOUNDARY, EXT_LINK, NULL_LINK, OFFMESH_CON_BIDIR, POLYTYPE_OFFMESH_CONNECTION,
-    PolyRef, TileRef, VERTS_PER_POLYGON,
+    DETAIL_EDGE_BOUNDARY, EXT_LINK, NAVMESH_STATE_MAGIC, NAVMESH_STATE_VERSION, NULL_LINK,
+    OFFMESH_CON_BIDIR, POLYTYPE_OFFMESH_CONNECTION, PolyRef, TileRef, VERTS_PER_POLYGON,
 };
 use crate::common::floorf;
-use crate::{Error, Limits, TileDataError};
+use crate::{Error, Limits, TileDataError, TileStateError};
+
+/// Size of the tile state header: `int` magic, `int` version, tile ref.
+const TILE_STATE_HEADER_SIZE: usize = 8 + (PolyRef::BITS / 8) as usize;
+/// Size of one polygon's state: `u16` flags, `u8` area, one pad byte.
+const TILE_POLY_STATE_SIZE: usize = 4;
 
 /// Navmesh layout (`dtNavMeshParams`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -782,6 +787,94 @@ impl NavMesh {
     /// A polygon's area.
     pub fn poly_area(&self, r: PolyRef) -> Result<u8, Error> {
         Ok(self.tile_and_poly_by_ref(r)?.1.area())
+    }
+
+    /// Bytes of the state blob of a resident tile (`dtNavMesh::getTileStateSize`):
+    /// a header (magic, version, tile ref) then four bytes per polygon.
+    /// [`Error::InvalidRef`] when `tile` is not a resident tile's ref.
+    pub fn tile_state_size(&self, tile: TileRef) -> Result<usize, Error> {
+        let t = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?;
+        let polys = usize::try_from(t.header.poly_count).map_err(|_| Error::InvalidRef)?;
+        polys
+            .checked_mul(TILE_POLY_STATE_SIZE)
+            .and_then(|n| n.checked_add(TILE_STATE_HEADER_SIZE))
+            .ok_or(Error::SizeOverflow)
+    }
+
+    /// Writes the state of a resident tile into `out` (`dtNavMesh::storeTileState`)
+    /// and returns the bytes written, [`NavMesh::tile_state_size`].
+    ///
+    /// The state is the non-structural, caller-editable data: every polygon's flags
+    /// and area. It is bound to the tile's current ref, so it can be restored only
+    /// into the same tile incarnation, not after the tile was removed and added
+    /// again. The blob is little-endian; polygon entries are `u16` flags, `u8` area
+    /// and a zero pad byte (upstream leaves the pad uninitialised).
+    /// [`Error::BufferTooSmall`] when `out` is shorter than the state.
+    pub fn store_tile_state(&self, tile: TileRef, out: &mut [u8]) -> Result<usize, Error> {
+        let size = self.tile_state_size(tile)?;
+        if out.len() < size {
+            return Err(Error::BufferTooSmall);
+        }
+        let t = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?;
+        out[0..4].copy_from_slice(&NAVMESH_STATE_MAGIC.to_le_bytes());
+        out[4..8].copy_from_slice(&NAVMESH_STATE_VERSION.to_le_bytes());
+        out[8..TILE_STATE_HEADER_SIZE].copy_from_slice(&tile.to_le_bytes());
+        for (p, s) in t
+            .polys
+            .iter()
+            .zip(out[TILE_STATE_HEADER_SIZE..size].chunks_exact_mut(TILE_POLY_STATE_SIZE))
+        {
+            s[0..2].copy_from_slice(&p.flags.to_le_bytes());
+            s[2] = p.area();
+            s[3] = 0;
+        }
+        Ok(size)
+    }
+
+    /// Restores polygon flags and areas stored by [`NavMesh::store_tile_state`]
+    /// (`dtNavMesh::restoreTileState`). The tile's ref and polygon refs do not
+    /// change.
+    ///
+    /// The blob is untrusted: it is checked completely before the tile is touched.
+    /// Errors, in upstream's order: [`Error::InvalidRef`] for a ref that is not a
+    /// resident tile; [`Error::InvalidTileState`] with
+    /// [`TileStateError::TooShort`](crate::TileStateError::TooShort) when `data` is shorter than the tile's state,
+    /// `WrongMagic`, `WrongVersion`, or `WrongTile` when the stored ref differs from
+    /// `tile`. Bytes after the state and the pad bytes are ignored. Area ids are
+    /// masked to 6 bits, as `setPolyArea` does.
+    pub fn restore_tile_state(&mut self, tile: TileRef, data: &[u8]) -> Result<(), Error> {
+        let size = self.tile_state_size(tile)?;
+        if data.len() < size {
+            return Err(Error::InvalidTileState(TileStateError::TooShort));
+        }
+        let le_i32 =
+            |at: usize| i32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+        if le_i32(0) != NAVMESH_STATE_MAGIC {
+            return Err(Error::InvalidTileState(TileStateError::WrongMagic));
+        }
+        if le_i32(4) != NAVMESH_STATE_VERSION {
+            return Err(Error::InvalidTileState(TileStateError::WrongVersion));
+        }
+        let mut stored = [0u8; (PolyRef::BITS / 8) as usize];
+        stored.copy_from_slice(&data[8..TILE_STATE_HEADER_SIZE]);
+        if PolyRef::from_le_bytes(stored) != tile {
+            return Err(Error::InvalidTileState(TileStateError::WrongTile));
+        }
+        let (_, it, _) = self.decode_poly_id(tile);
+        let t = self
+            .slots
+            .get_mut(it as usize)
+            .and_then(|s| s.tile.as_mut())
+            .ok_or(Error::InvalidRef)?;
+        for (p, s) in t
+            .polys
+            .iter_mut()
+            .zip(data[TILE_STATE_HEADER_SIZE..size].chunks_exact(TILE_POLY_STATE_SIZE))
+        {
+            p.flags = u16::from_le_bytes([s[0], s[1]]);
+            p.set_area(s[2]);
+        }
+        Ok(())
     }
 
     /// Adds a tile from its bytes into the next free slot (`addTile` without a last

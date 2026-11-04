@@ -53,8 +53,15 @@ dungeon_solo filtered.q_closest_point_on_poly 1092 bbd9ade816573098
 dungeon_solo filtered.q_closest_point_on_poly_boundary 1028 8816d6ba63479c23
 dungeon_solo filtered.q_poly_height 1028 803c189fd585ec6e
 dungeon_solo filtered.q_random_point_around_circle 1540 678b4151ec51205f
+dungeon_solo poly_mesh_copy 4812 a2130b599a751e83
+dungeon_solo merged_poly_mesh 4812 26b79d9783ca3368
+dungeon_solo merged_detail_mesh 9220 62715dacb2b7ba13
+dungeon_solo merged_poly_mesh_block 4812 26b79d9783ca3368
+dungeon_solo merged_detail_mesh_block 9220 62715dacb2b7ba13
+dungeon_solo tile_endian 133 574edeaad3896db3
+dungeon_solo tile_state 2496 9d98f2035048840c
 dungeon_solo malformed_tiles 128 faaf2edc03d18be6
-dungeon_solo * 56 f7fa0a31fcec197a
+dungeon_solo * 63 e5ee0802c4ad11c7
 dungeon_tiled geometry 182816 c609b81d009cb3d1
 dungeon_tiled tile_0_0.config 92 a84f6326e8b921d4
 dungeon_tiled tile_0_0.tri_areas 4 4d25767f9dce13f5
@@ -1067,6 +1074,13 @@ dungeon_tiled filtered.q_closest_point_on_poly 1092 de323d4dc04b413f
 dungeon_tiled filtered.q_closest_point_on_poly_boundary 1028 de6c2862b19e4c7e
 dungeon_tiled filtered.q_poly_height 1028 59260762ce356e37
 dungeon_tiled filtered.q_random_point_around_circle 1540 86c73256220b46e6
+dungeon_tiled poly_mesh_copy 52 2d236eca2060c082
+dungeon_tiled merged_poly_mesh 5861 fba865d263ca42c9
+dungeon_tiled merged_detail_mesh 11128 0e53243ce9375798
+dungeon_tiled merged_poly_mesh_block 52 8cd1e454b411c448
+dungeon_tiled merged_detail_mesh_block 12 5467b0da1d106495
+dungeon_tiled tile_endian 5293 629b343c54c777c0
+dungeon_tiled tile_state 8276 3c06c46adf1c6c07
 dungeon_tiled malformed_tiles 128 faaf2edc03d18be6
 dungeon_tiled crowd_trajectories 839988 e7a2a9ce27ee581c
 dungeon_tiled crowd_quality_0 840404 e95a0be933050a30
@@ -1076,7 +1090,7 @@ dungeon_tiled crowd_quality_3 836372 75bd9d9e3a4f6c61
 dungeon_tiled crowd_move_velocity 519420 46124e32884f6bd8
 dungeon_tiled crowd_remove_readd 748188 f8306408863a5956
 dungeon_tiled crowd_tile_swap 838948 24c367dfcbe0a93a
-dungeon_tiled * 1021 ea09205ff54da6df
+dungeon_tiled * 1028 a97ec9a26a7f63a5
 dungeon_tilecache geometry 182816 c609b81d009cb3d1
 dungeon_tilecache tile_0_0.config 92 becfe82c17721551
 dungeon_tilecache tile_0_0.tri_areas 4 4d25767f9dce13f5
@@ -1103,7 +1117,9 @@ dungeon_tilecache tile_2_0.compact_eroded 29436 ab2efc78a86318b4
 dungeon_tilecache tile_2_0.compact_marked 29436 ab2efc78a86318b4
 dungeon_tilecache tile_2_0.heightfield_layers 13956 1556f202a721bf40
 dungeon_tilecache layer_2_0_0.layer_data 6972 c8de53ff1bf61d49
+dungeon_tilecache layer_2_0_0.layer_endian 59 1cbca52c3f93d750
 dungeon_tilecache layer_2_0_1.layer_data 6972 7ad100c676bb53a7
+dungeon_tilecache layer_2_0_1.layer_endian 59 be46e30adfe964b8
 dungeon_tilecache tile_3_0.config 92 8ee482b9f83dc5f1
 dungeon_tilecache tile_3_0.tri_areas 1133 591e92c66bf2fed4
 dungeon_tilecache tile_3_0.heightfield_initial 43336 f9b7290067ef6203
@@ -1113,7 +1129,9 @@ dungeon_tilecache tile_3_0.compact_eroded 34380 cb6b2c59d10bfb2e
 dungeon_tilecache tile_3_0.compact_marked 34380 cb6b2c59d10bfb2e
 dungeon_tilecache tile_3_0.heightfield_layers 13956 9093ee51d70883dc
 dungeon_tilecache layer_3_0_0.layer_data 6972 3b38fd57aba2c948
+dungeon_tilecache layer_3_0_0.layer_endian 59 f8f031480b27c3fa
 dungeon_tilecache layer_3_0_1.layer_data 6972 602bf0d1682a3172
+dungeon_tilecache layer_3_0_1.layer_endian 59 64e71fe65d98029d
 dungeon_tilecache tile_4_0.config 92 b0fa54cc6d8f40bf
 dungeon_tilecache tile_4_0.tri_areas 4 4d25767f9dce13f5
 dungeon_tilecache tile_4_0.heightfield_initial 13496 25732c5f4410e35f
@@ -1155,7 +1173,9 @@ dungeon_tilecache tile_2_1.compact_eroded 25220 55c7b6680f88633a
 dungeon_tilecache tile_2_1.compact_marked 25220 55c7b6680f88633a
 dungeon_tilecache tile_2_1.heightfield_layers 13956 4483afb8b4311657
 dungeon_tilecache layer_2_1_0.layer_data 6972 c2b3c060f9c025a2
+dungeon_tilecache layer_2_1_0.layer_endian 59 7769c704cf33a363
 dungeon_tilecache layer_2_1_1.layer_data 6972 a807999e1b3558b7
+dungeon_tilecache layer_2_1_1.layer_endian 59 2b94405d20a0d902
 dungeon_tilecache tile_3_1.config 92 515098ef7459e98a
 dungeon_tilecache tile_3_1.tri_areas 842 457ea1507b361b56
 dungeon_tilecache tile_3_1.heightfield_initial 35066 0a9a83226085d263
@@ -1165,7 +1185,9 @@ dungeon_tilecache tile_3_1.compact_eroded 30500 fd2c8087843fca87
 dungeon_tilecache tile_3_1.compact_marked 30500 fd2c8087843fca87
 dungeon_tilecache tile_3_1.heightfield_layers 13956 939256dcc630bd6d
 dungeon_tilecache layer_3_1_0.layer_data 6972 a8dc80b59740ae48
+dungeon_tilecache layer_3_1_0.layer_endian 59 1ac520e80e6f2b3b
 dungeon_tilecache layer_3_1_1.layer_data 6972 da72c6607bc13337
+dungeon_tilecache layer_3_1_1.layer_endian 59 7fa70a2cb6249d4b
 dungeon_tilecache tile_4_1.config 92 07a37c9a799b8334
 dungeon_tilecache tile_4_1.tri_areas 4 4d25767f9dce13f5
 dungeon_tilecache tile_4_1.heightfield_initial 13496 6b73d2681488264c
@@ -1207,6 +1229,7 @@ dungeon_tilecache tile_2_2.compact_eroded 23868 38a1d590f8b8e0e7
 dungeon_tilecache tile_2_2.compact_marked 23868 38a1d590f8b8e0e7
 dungeon_tilecache tile_2_2.heightfield_layers 6980 1a725c300b67c6ec
 dungeon_tilecache layer_2_2_0.layer_data 6972 d520b4ffa3eb4cb2
+dungeon_tilecache layer_2_2_0.layer_endian 59 a209467056dd061b
 dungeon_tilecache tile_3_2.config 92 6fd37b0a62a0c278
 dungeon_tilecache tile_3_2.tri_areas 615 24f1d38f71d101a6
 dungeon_tilecache tile_3_2.heightfield_initial 29806 4951a79ce9353db2
@@ -1216,6 +1239,7 @@ dungeon_tilecache tile_3_2.compact_eroded 28396 6a3bd49ce9b76dde
 dungeon_tilecache tile_3_2.compact_marked 28396 6a3bd49ce9b76dde
 dungeon_tilecache tile_3_2.heightfield_layers 6980 cf15ffca486e58e8
 dungeon_tilecache layer_3_2_0.layer_data 6972 d7a3d69a67ae7ae3
+dungeon_tilecache layer_3_2_0.layer_endian 59 d70e1e46225c7781
 dungeon_tilecache tile_4_2.config 92 42f3324c6e710c86
 dungeon_tilecache tile_4_2.tri_areas 4 4d25767f9dce13f5
 dungeon_tilecache tile_4_2.heightfield_initial 13496 25dc93e56dafbf0e
@@ -1249,6 +1273,7 @@ dungeon_tilecache tile_1_3.compact_eroded 23908 9d02524a5146d60c
 dungeon_tilecache tile_1_3.compact_marked 23908 9d02524a5146d60c
 dungeon_tilecache tile_1_3.heightfield_layers 6980 2e80e93b2527bd95
 dungeon_tilecache layer_1_3_0.layer_data 6972 9aab34961ab5bad9
+dungeon_tilecache layer_1_3_0.layer_endian 59 46b0f07d363a7af4
 dungeon_tilecache tile_2_3.config 92 bfe676911706c3e1
 dungeon_tilecache tile_2_3.tri_areas 755 299991eea0330ec5
 dungeon_tilecache tile_2_3.heightfield_initial 35716 057d289ac7fba880
@@ -1258,6 +1283,7 @@ dungeon_tilecache tile_2_3.compact_eroded 32548 63d0f2fe50fae738
 dungeon_tilecache tile_2_3.compact_marked 32548 63d0f2fe50fae738
 dungeon_tilecache tile_2_3.heightfield_layers 6980 a8d8b47a6557e13f
 dungeon_tilecache layer_2_3_0.layer_data 6972 d179dea706942498
+dungeon_tilecache layer_2_3_0.layer_endian 59 f02cd055844c2eb8
 dungeon_tilecache tile_3_3.config 92 0cc1d9a90c1035ce
 dungeon_tilecache tile_3_3.tri_areas 254 c454ef10ad037da5
 dungeon_tilecache tile_3_3.heightfield_initial 19986 00a887f136c1385c
@@ -1267,6 +1293,7 @@ dungeon_tilecache tile_3_3.compact_eroded 21428 3a2234f72a1185b5
 dungeon_tilecache tile_3_3.compact_marked 21428 3a2234f72a1185b5
 dungeon_tilecache tile_3_3.heightfield_layers 6980 4fa5ca893d3fbdae
 dungeon_tilecache layer_3_3_0.layer_data 6972 c4b9bbd05cf05024
+dungeon_tilecache layer_3_3_0.layer_endian 59 6e713daef0decd4a
 dungeon_tilecache tile_4_3.config 92 e8b766ab355a9fcc
 dungeon_tilecache tile_4_3.tri_areas 4 4d25767f9dce13f5
 dungeon_tilecache tile_4_3.heightfield_initial 13496 9ab7233cd3872a84
@@ -1292,6 +1319,7 @@ dungeon_tilecache tile_0_4.compact_eroded 23948 baf06b5cd6889ae4
 dungeon_tilecache tile_0_4.compact_marked 23948 baf06b5cd6889ae4
 dungeon_tilecache tile_0_4.heightfield_layers 6980 fe052e60213fc5b6
 dungeon_tilecache layer_0_4_0.layer_data 6972 04d51a3547986148
+dungeon_tilecache layer_0_4_0.layer_endian 59 0981499e6561122a
 dungeon_tilecache tile_1_4.config 92 be74384e06ced611
 dungeon_tilecache tile_1_4.tri_areas 893 10da5a701f2f3315
 dungeon_tilecache tile_1_4.heightfield_initial 40396 9b1b1766dabe029a
@@ -1301,6 +1329,7 @@ dungeon_tilecache tile_1_4.compact_eroded 35244 a179fe1b5d5148a7
 dungeon_tilecache tile_1_4.compact_marked 35244 a179fe1b5d5148a7
 dungeon_tilecache tile_1_4.heightfield_layers 6980 df6c96e6bc16dba0
 dungeon_tilecache layer_1_4_0.layer_data 6972 9e68fa0730ea6837
+dungeon_tilecache layer_1_4_0.layer_endian 59 834272bea59cf476
 dungeon_tilecache tile_2_4.config 92 3e825688d9aa992b
 dungeon_tilecache tile_2_4.tri_areas 645 e44e39c672632a50
 dungeon_tilecache tile_2_4.heightfield_initial 25061 022a896392ec69bd
@@ -1310,6 +1339,7 @@ dungeon_tilecache tile_2_4.compact_eroded 24476 ad67a32b95e82769
 dungeon_tilecache tile_2_4.compact_marked 24476 ad67a32b95e82769
 dungeon_tilecache tile_2_4.heightfield_layers 6980 b68a3e1aa4fcac11
 dungeon_tilecache layer_2_4_0.layer_data 6972 b28e8ecc94c95bcf
+dungeon_tilecache layer_2_4_0.layer_endian 59 409d9ff101afa1b8
 dungeon_tilecache tile_3_4.config 92 b608196190388890
 dungeon_tilecache tile_3_4.tri_areas 22 b328e85efa37a53f
 dungeon_tilecache tile_3_4.heightfield_initial 13496 6b384a5b3f90b3b8
@@ -1343,6 +1373,7 @@ dungeon_tilecache tile_0_5.compact_eroded 33732 2799d492c965ca32
 dungeon_tilecache tile_0_5.compact_marked 33732 2799d492c965ca32
 dungeon_tilecache tile_0_5.heightfield_layers 6980 f7a09db3264f9c00
 dungeon_tilecache layer_0_5_0.layer_data 6972 30353d5f10d168e3
+dungeon_tilecache layer_0_5_0.layer_endian 59 063b3276d58a846c
 dungeon_tilecache tile_1_5.config 92 66894ca464251047
 dungeon_tilecache tile_1_5.tri_areas 1275 a1537818ed4cb76f
 dungeon_tilecache tile_1_5.heightfield_initial 40441 ed32bcbeeb9103c3
@@ -1352,7 +1383,9 @@ dungeon_tilecache tile_1_5.compact_eroded 35388 4ad2d0f2f2ea7ae5
 dungeon_tilecache tile_1_5.compact_marked 35388 4ad2d0f2f2ea7ae5
 dungeon_tilecache tile_1_5.heightfield_layers 13956 c86668fd4b22d201
 dungeon_tilecache layer_1_5_0.layer_data 6972 67123a5d81b23477
+dungeon_tilecache layer_1_5_0.layer_endian 59 0b0af24d744e4e85
 dungeon_tilecache layer_1_5_1.layer_data 6972 fdb39636a79e76ac
+dungeon_tilecache layer_1_5_1.layer_endian 59 431fdb80617c0ffd
 dungeon_tilecache tile_2_5.config 92 dec7eedf6c02e5e5
 dungeon_tilecache tile_2_5.tri_areas 591 c1f6a759d780d06b
 dungeon_tilecache tile_2_5.heightfield_initial 26821 3af33ed72f198cb4
@@ -1362,6 +1395,7 @@ dungeon_tilecache tile_2_5.compact_eroded 25732 4141230bc55247be
 dungeon_tilecache tile_2_5.compact_marked 25732 4141230bc55247be
 dungeon_tilecache tile_2_5.heightfield_layers 6980 0f9c8cafa016c76f
 dungeon_tilecache layer_2_5_0.layer_data 6972 3ec8260a5dc629ae
+dungeon_tilecache layer_2_5_0.layer_endian 59 2ff7b102ee4548e6
 dungeon_tilecache tile_3_5.config 92 e594e4543b948dae
 dungeon_tilecache tile_3_5.tri_areas 223 78869f9502b46640
 dungeon_tilecache tile_3_5.heightfield_initial 18421 1e32ceb9ad2f5391
@@ -1371,6 +1405,7 @@ dungeon_tilecache tile_3_5.compact_eroded 20092 a0ad790e00a248e3
 dungeon_tilecache tile_3_5.compact_marked 20092 a0ad790e00a248e3
 dungeon_tilecache tile_3_5.heightfield_layers 6980 b90f0f74dabd03b3
 dungeon_tilecache layer_3_5_0.layer_data 6972 32409c14d94ebb83
+dungeon_tilecache layer_3_5_0.layer_endian 59 0b008286a9213c3c
 dungeon_tilecache tile_4_5.config 92 ccd987706045dd24
 dungeon_tilecache tile_4_5.tri_areas 344 14153458b5cfe172
 dungeon_tilecache tile_4_5.heightfield_initial 22816 07b11ddaa1820b1c
@@ -1380,6 +1415,7 @@ dungeon_tilecache tile_4_5.compact_eroded 23660 594112ce0eb41f0b
 dungeon_tilecache tile_4_5.compact_marked 23660 594112ce0eb41f0b
 dungeon_tilecache tile_4_5.heightfield_layers 6980 8f8eac4ee05ed24e
 dungeon_tilecache layer_4_5_0.layer_data 6972 2e7ade987b766da9
+dungeon_tilecache layer_4_5_0.layer_endian 59 8a885bf9460fe2b8
 dungeon_tilecache tile_5_5.config 92 57476d61ee760606
 dungeon_tilecache tile_5_5.tri_areas 107 80192aa8d7c0904b
 dungeon_tilecache tile_5_5.heightfield_initial 14756 bc970a4672db543d
@@ -1389,6 +1425,7 @@ dungeon_tilecache tile_5_5.compact_eroded 17644 97556554feb353d6
 dungeon_tilecache tile_5_5.compact_marked 17644 97556554feb353d6
 dungeon_tilecache tile_5_5.heightfield_layers 6980 6ffb48b8f0e72ce4
 dungeon_tilecache layer_5_5_0.layer_data 6972 dc4defc3d16f255c
+dungeon_tilecache layer_5_5_0.layer_endian 59 656b719e127fabdd
 dungeon_tilecache tile_0_6.config 92 868a3278e4338183
 dungeon_tilecache tile_0_6.tri_areas 2114 d1636aff331dba6b
 dungeon_tilecache tile_0_6.heightfield_initial 25966 d498fd6febe1ba1e
@@ -1398,6 +1435,7 @@ dungeon_tilecache tile_0_6.compact_eroded 25964 d175751f41e5313b
 dungeon_tilecache tile_0_6.compact_marked 25964 d175751f41e5313b
 dungeon_tilecache tile_0_6.heightfield_layers 6980 bab02bae5cfeacee
 dungeon_tilecache layer_0_6_0.layer_data 6972 add9a2d0c7f3ad5a
+dungeon_tilecache layer_0_6_0.layer_endian 59 773a98fa57725692
 dungeon_tilecache tile_1_6.config 92 5dbe1c2fc6b618b6
 dungeon_tilecache tile_1_6.tri_areas 2169 f2108ddc2d51619a
 dungeon_tilecache tile_1_6.heightfield_initial 33771 34a29f927a709a08
@@ -1407,7 +1445,9 @@ dungeon_tilecache tile_1_6.compact_eroded 31660 a3849b53012c68f7
 dungeon_tilecache tile_1_6.compact_marked 31660 a3849b53012c68f7
 dungeon_tilecache tile_1_6.heightfield_layers 13956 9c9dff017e7e8fbc
 dungeon_tilecache layer_1_6_0.layer_data 6972 4dfa37adb2bf096d
+dungeon_tilecache layer_1_6_0.layer_endian 59 2fff8f41606e0977
 dungeon_tilecache layer_1_6_1.layer_data 6972 5058fb291df40b45
+dungeon_tilecache layer_1_6_1.layer_endian 59 7a3387de33865ef2
 dungeon_tilecache tile_2_6.config 92 ba63f63b5a4dbd34
 dungeon_tilecache tile_2_6.tri_areas 482 50afc23f2b3c0b5c
 dungeon_tilecache tile_2_6.heightfield_initial 32801 a0e338aa4a1f48e5
@@ -1417,6 +1457,7 @@ dungeon_tilecache tile_2_6.compact_eroded 30452 034361b149727708
 dungeon_tilecache tile_2_6.compact_marked 30452 034361b149727708
 dungeon_tilecache tile_2_6.heightfield_layers 6980 24399e40c7e1906c
 dungeon_tilecache layer_2_6_0.layer_data 6972 8473fbce291ca566
+dungeon_tilecache layer_2_6_0.layer_endian 59 6e6ecb88737029c6
 dungeon_tilecache tile_3_6.config 92 c9ba4c26796b49ef
 dungeon_tilecache tile_3_6.tri_areas 543 fdcdb069448e8e70
 dungeon_tilecache tile_3_6.heightfield_initial 32006 997aa60db4cc095c
@@ -1426,6 +1467,7 @@ dungeon_tilecache tile_3_6.compact_eroded 30228 0055b824cbabb0bc
 dungeon_tilecache tile_3_6.compact_marked 30228 0055b824cbabb0bc
 dungeon_tilecache tile_3_6.heightfield_layers 6980 24b8b00a16d1aee2
 dungeon_tilecache layer_3_6_0.layer_data 6972 675241b09987f1e5
+dungeon_tilecache layer_3_6_0.layer_endian 59 3ea5d83c58fc0dd6
 dungeon_tilecache tile_4_6.config 92 e0102c0428629745
 dungeon_tilecache tile_4_6.tri_areas 580 44c1ffdcc82e72eb
 dungeon_tilecache tile_4_6.heightfield_initial 36781 f627f8c039d75516
@@ -1435,6 +1477,7 @@ dungeon_tilecache tile_4_6.compact_eroded 34516 4e9dc47e68634318
 dungeon_tilecache tile_4_6.compact_marked 34516 4e9dc47e68634318
 dungeon_tilecache tile_4_6.heightfield_layers 6980 2c7ef80d7c7fe4c1
 dungeon_tilecache layer_4_6_0.layer_data 6972 cbafa4755185e5b3
+dungeon_tilecache layer_4_6_0.layer_endian 59 709f2a436422d45c
 dungeon_tilecache tile_5_6.config 92 35fdc9ee267d58d7
 dungeon_tilecache tile_5_6.tri_areas 201 58c451e8587dcc4d
 dungeon_tilecache tile_5_6.heightfield_initial 17581 abad31b4410f897f
@@ -1444,6 +1487,7 @@ dungeon_tilecache tile_5_6.compact_eroded 19660 866c68d5a91a57e8
 dungeon_tilecache tile_5_6.compact_marked 19660 866c68d5a91a57e8
 dungeon_tilecache tile_5_6.heightfield_layers 6980 efe76bdec4534f80
 dungeon_tilecache layer_5_6_0.layer_data 6972 fa3bb847bdfd8141
+dungeon_tilecache layer_5_6_0.layer_endian 59 ef6fd82d4491ae7e
 dungeon_tilecache layer_2_0_1.layer_grid 6966 056f7b2aff34859e
 dungeon_tilecache layer_2_0_1.layer_regions 2309 ccfb8eeab3486f93
 dungeon_tilecache layer_2_0_1.layer_contours 34 0a2ac8003dd702f2
@@ -1607,6 +1651,8 @@ dungeon_tilecache filtered.q_closest_point_on_poly 548 06902b9800249a3b
 dungeon_tilecache filtered.q_closest_point_on_poly_boundary 516 8354f288a1cf8d3e
 dungeon_tilecache filtered.q_poly_height 516 b2f806ece260cc84
 dungeon_tilecache filtered.q_random_point_around_circle 772 490fa5532ee4f6cb
+dungeon_tilecache tile_endian 3874 c0224eb3707b2f7d
+dungeon_tilecache tile_state 6504 e9fb1835aaa6ad95
 dungeon_tilecache malformed_tiles 128 faaf2edc03d18be6
 dungeon_tilecache obstacle_update_1.q_random_point 796 2e55c05d3c36e1da
 dungeon_tilecache obstacle_update_1.q_nearest_poly 829 70d0c49211d92310
@@ -1735,7 +1781,7 @@ dungeon_tilecache obstacle_update_3.filtered.q_closest_point_on_poly_boundary 51
 dungeon_tilecache obstacle_update_3.filtered.q_poly_height 516 b2f806ece260cc84
 dungeon_tilecache obstacle_update_3.filtered.q_random_point_around_circle 772 b62b99467dd84309
 dungeon_tilecache tilecache_obstacles 6154 9aa7e723a702b37b
-dungeon_tilecache * 658 cca7fa2894258373
+dungeon_tilecache * 690 1b4b8f75fc28228d
 nav_test_solo geometry 29960 9a00e5177c9a71e5
 nav_test_solo config 92 fea45fb7d2aa6926
 nav_test_solo tri_areas 1616 2eaa25d26345a2b1
@@ -1791,6 +1837,13 @@ nav_test_solo filtered.q_closest_point_on_poly 1092 7c5db06195f9569a
 nav_test_solo filtered.q_closest_point_on_poly_boundary 1028 04b2fc50eb2ff84b
 nav_test_solo filtered.q_poly_height 1028 faaa21ed66394a19
 nav_test_solo filtered.q_random_point_around_circle 1540 124a3329fae0e0eb
+nav_test_solo poly_mesh_copy 6641 9fe9fcc3ce6f4055
+nav_test_solo merged_poly_mesh 6641 fe2f6cd50eecae78
+nav_test_solo merged_detail_mesh 14480 5c5e1ba15d2c3f22
+nav_test_solo merged_poly_mesh_block 6641 fe2f6cd50eecae78
+nav_test_solo merged_detail_mesh_block 14480 5c5e1ba15d2c3f22
+nav_test_solo tile_endian 133 b9a6787b26f7a8b5
+nav_test_solo tile_state 3236 198b48bee5b44754
 nav_test_solo malformed_tiles 128 faaf2edc03d18be6
 nav_test_solo crowd_trajectories 410916 adba7abdd00c8956
 nav_test_solo crowd_quality_0 409436 85bb0d3a8e8693fb
@@ -1800,7 +1853,7 @@ nav_test_solo crowd_quality_3 410884 bebda517c7cc2577
 nav_test_solo crowd_move_velocity 379172 4d2ce2e416cc9004
 nav_test_solo crowd_remove_readd 400732 9dc7b1de921c9432
 nav_test_solo crowd_tile_swap 404516 d436067b9dd5754f
-nav_test_solo * 64 32146a8658a1e7f2
+nav_test_solo * 71 0578f1e209e1e6b3
 nav_test_tiled geometry 29960 9a00e5177c9a71e5
 nav_test_tiled tile_0_0.config 92 5d7e21a4f179ca44
 nav_test_tiled tile_0_0.tri_areas 4 4d25767f9dce13f5
@@ -2835,8 +2888,15 @@ nav_test_tiled filtered.q_closest_point_on_poly 1092 b17fa8cdfba8e242
 nav_test_tiled filtered.q_closest_point_on_poly_boundary 1028 b6c663849047f312
 nav_test_tiled filtered.q_poly_height 1028 2595d71b7909caa8
 nav_test_tiled filtered.q_random_point_around_circle 1540 67e44660fb5f098f
+nav_test_tiled poly_mesh_copy 52 9925d9bcac8ebc90
+nav_test_tiled merged_poly_mesh 11060 1701cb3385498753
+nav_test_tiled merged_detail_mesh 21784 c72472e837dc6dfb
+nav_test_tiled merged_poly_mesh_block 52 45eb014ee6037a0f
+nav_test_tiled merged_detail_mesh_block 12 5467b0da1d106495
+nav_test_tiled tile_endian 8518 3624cfcbebd59bdc
+nav_test_tiled tile_state 14156 ca6ce202af7f39aa
 nav_test_tiled malformed_tiles 128 faaf2edc03d18be6
-nav_test_tiled * 1035 5ad93af8cfe8e515
+nav_test_tiled * 1042 7f46de2bd6e41669
 nav_test_areas geometry 29960 9a00e5177c9a71e5
 nav_test_areas config 92 fea45fb7d2aa6926
 nav_test_areas tri_areas 1616 2eaa25d26345a2b1
@@ -2893,6 +2953,13 @@ nav_test_areas filtered.q_closest_point_on_poly 1092 22a2ddba93f7cf20
 nav_test_areas filtered.q_closest_point_on_poly_boundary 1028 68767c9848f3ddd0
 nav_test_areas filtered.q_poly_height 1028 c7339bb7fb0e19a3
 nav_test_areas filtered.q_random_point_around_circle 1540 495e07c0699afc2a
+nav_test_areas poly_mesh_copy 7514 a72d93081636920e
+nav_test_areas merged_poly_mesh 7514 a3ef48beb3c173b9
+nav_test_areas merged_detail_mesh 16272 e4d30813eba00698
+nav_test_areas merged_poly_mesh_block 7514 a3ef48beb3c173b9
+nav_test_areas merged_detail_mesh_block 16272 e4d30813eba00698
+nav_test_areas tile_endian 133 5434776db6d1da76
+nav_test_areas tile_state 3776 fe29b4661260041f
 nav_test_areas malformed_tiles 128 faaf2edc03d18be6
 nav_test_areas crowd_trajectories 137172 cbd8106ae11163aa
 nav_test_areas crowd_quality_0 138108 e2b25e4ab0b93650
@@ -2902,7 +2969,7 @@ nav_test_areas crowd_quality_3 137212 6b5767346db6d4ab
 nav_test_areas crowd_move_velocity 121772 2ea33b62d664ca81
 nav_test_areas crowd_remove_readd 129560 bc448e0ee64d70a1
 nav_test_areas crowd_tile_swap 137028 4072d1a2787f5fc0
-nav_test_areas * 65 364b12df343b6ec7
+nav_test_areas * 72 a8803ddd1b224773
 godot_level_solo geometry 3356 1fff384d5e22db41
 godot_level_solo config 92 2d5afdf647dda91c
 godot_level_solo tri_areas 142 4fdf82c210c2d315
@@ -2958,6 +3025,13 @@ godot_level_solo filtered.q_closest_point_on_poly 548 9c700aa6a4d5653f
 godot_level_solo filtered.q_closest_point_on_poly_boundary 516 4a8e0777022ab580
 godot_level_solo filtered.q_poly_height 516 6e908dc1c2930952
 godot_level_solo filtered.q_random_point_around_circle 772 8205aa072ed8ec8a
+godot_level_solo poly_mesh_copy 1576 2c35de4661d7bc7d
+godot_level_solo merged_poly_mesh 1576 3801f7c183fd1076
+godot_level_solo merged_detail_mesh 2844 3ece7bd060b6fa16
+godot_level_solo merged_poly_mesh_block 1576 3801f7c183fd1076
+godot_level_solo merged_detail_mesh_block 2844 3ece7bd060b6fa16
+godot_level_solo tile_endian 133 99c15588748cdca8
+godot_level_solo tile_state 856 2e7b82bb08353635
 godot_level_solo malformed_tiles 128 faaf2edc03d18be6
 godot_level_solo crowd_trajectories 117140 afbb9dd54a252572
 godot_level_solo crowd_quality_0 125644 c70127ea9476f803
@@ -2967,7 +3041,7 @@ godot_level_solo crowd_quality_3 116356 85d2783b67919ab0
 godot_level_solo crowd_move_velocity 113588 3df21f7b7304fc4f
 godot_level_solo crowd_remove_readd 110704 8f07198abe15c4ee
 godot_level_solo crowd_tile_swap 117180 e678adecacb441cb
-godot_level_solo * 64 a91699025e6d0f4e
+godot_level_solo * 71 adeddc756564ce7e
 undulating_crowd geometry 96032 22d813d0d3118294
 undulating_crowd config 92 355e33a9f741308a
 undulating_crowd tri_areas 5206 22e491629de869ec
@@ -3023,6 +3097,13 @@ undulating_crowd filtered.q_closest_point_on_poly 1092 a08c6f10a1174089
 undulating_crowd filtered.q_closest_point_on_poly_boundary 1028 cfc298715fa92947
 undulating_crowd filtered.q_poly_height 1028 6a0ad7e32d8af671
 undulating_crowd filtered.q_random_point_around_circle 1540 b871e1e7f8baa699
+undulating_crowd poly_mesh_copy 8560 7df11fe8eb29ed54
+undulating_crowd merged_poly_mesh 8560 f2e30eb473071bd3
+undulating_crowd merged_detail_mesh 49920 6ff11f41b372c29e
+undulating_crowd merged_poly_mesh_block 8560 f2e30eb473071bd3
+undulating_crowd merged_detail_mesh_block 49920 6ff11f41b372c29e
+undulating_crowd tile_endian 133 4c71ff905561f22d
+undulating_crowd tile_state 4456 64febf51b70b0269
 undulating_crowd malformed_tiles 128 faaf2edc03d18be6
 undulating_crowd crowd_trajectories 1121932 69d89cab8faa38dc
 undulating_crowd crowd_quality_0 1120436 699da9798335c3ef
@@ -3032,4 +3113,4 @@ undulating_crowd crowd_quality_3 1121948 17579b13a4b91eb3
 undulating_crowd crowd_move_velocity 878780 3b382e69980cc5b8
 undulating_crowd crowd_remove_readd 1050548 36be5dc116b1eebe
 undulating_crowd crowd_tile_swap 1119772 aa36ce435cb0dc92
-undulating_crowd * 64 09b2b1aebfa351ad
+undulating_crowd * 71 0355f6fa68821c1b

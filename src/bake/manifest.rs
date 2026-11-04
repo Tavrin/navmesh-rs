@@ -786,6 +786,7 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
         tile_limits: _,
         max_total_bytes: _,
         strict_triangulation,
+        fixes,
     } = *cfg;
     let Config {
         width: _,
@@ -836,6 +837,7 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
     h.f32(walkable_radius);
     h.f32(walkable_climb);
     h.u8(u8::from(strict_triangulation));
+    h.u32(fixes.bits());
     h.finish()
 }
 

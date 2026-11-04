@@ -449,12 +449,13 @@ impl<'a> TileTask<'a> {
                     }
                 }
                 let detail = self.tw.trusted_stage(|ws| {
-                    PolyMeshDetail::build(
+                    PolyMeshDetail::build_with_fixes(
                         ws,
                         &mesh,
                         &chf,
                         cfg.detail_sample_dist,
                         cfg.detail_sample_max_error,
+                        self.c.fixes,
                     )
                 })?;
                 if mesh.npolys == 0 {

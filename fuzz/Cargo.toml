@@ -120,3 +120,17 @@ test = false
 doc = false
 bench = false
 required-features = ["parallel"]
+
+[[bin]]
+name = "tile_state"
+path = "fuzz_targets/tile_state.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tile_endian"
+path = "fuzz_targets/tile_endian.rs"
+test = false
+doc = false
+bench = false

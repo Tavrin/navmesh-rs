@@ -479,3 +479,42 @@ limit within seconds). Seeds: 48 files from `seeds bake-job` plus the two inputs
   edges in the chunk ending at 5,400 s. `bake_job_steps`: 17,175 executions, edges 6,942 to 6,945,
   6,961, 6,965, 6,969, then 0 new in the chunk ending at 5,400 s. No crash, peak RSS 121 and
   208 MB. 5,400 s = 90 CPU-minutes per target.
+
+## `tile_state` and `tile_endian`, 2026-11-04
+
+Base commit `d30e372` plus the uncommitted tile state, byte-order and merge work. Toolchain: nightly,
+`cargo-fuzz`, one libFuzzer worker, `-rss_limit_mb=512`, 600-second chunks (`-max_total_time=600`)
+reusing one corpus directory, stopped when a whole chunk added no coverage. Seeds from
+`seeds tilestate` (11 inputs) and `seeds endian` plus `seeds tiles` over three corpus cases
+(`tile_endian`: 115 seeds, `-max_len=262144`; `tile_state`: `-max_len=512`).
+
+| Target | Chunk | CPU seconds | Executions | Coverage start | Coverage end | Crashes |
+|---|---|---|---|---|---|---|
+| `tile_state` | 1 | 600 | 5,036,632 | cov 1218 / ft 1921 | cov 1221 / ft 1936 | 0 |
+| | 2 | 600 | 4,189,524 | cov 1221 / ft 1936 | cov 1221 / ft 1936 | 0 |
+| `tile_endian` | 1 (first run) | 51 (stopped by the crash) | 831,366 | cov 1981 | cov 1981 | 1 |
+| | 1 | 600 | 9,144,644 | cov 1981 / ft 5890 | cov 2006 / ft 6406 | 0 |
+| | 2 | 600 | 8,160,842 | cov 2006 / ft 6406 | cov 2096 / ft 6677 | 0 |
+| | 3 | 600 | 10,359,663 | cov 2096 / ft 6677 | cov 2151 / ft 6903 | 0 |
+| | 4 | 600 | 9,630,214 | cov 2151 / ft 6903 | cov 2152 / ft 6972 | 0 |
+| | 5 | 600 | 10,890,954 | cov 2152 / ft 6972 | cov 2165 / ft 7041 | 0 |
+| | 6 | 600 | 12,735,407 | cov 2165 / ft 7041 | cov 2168 / ft 7150 | 0 |
+| | 7 | 600 | 13,179,501 | cov 2168 / ft 7150 | cov 2168 / ft 7202 | 0 |
+
+Results against the rule (flat for 10 minutes, 10 CPU-minutes to 2 CPU-hours):
+- `tile_state`: met. Flat in chunk 2; 1,200 CPU s, 9,226,156 executions, 0 crashes. The target
+  asserts the blob properties listed in its source.
+- `tile_endian`: met. Flat in chunk 7 (edge count 2168 at its start and end); 4,200 CPU s in
+  the counted chunks, 74,101,225 executions, 0 crashes after the fix below.
+
+### Finding: landing-link edge index on a misplaced off-mesh polygon (pre-existing, fixed)
+
+The first `tile_endian` chunk panicked after 51 CPU seconds with `index out of bounds: the len
+is 6 but the index is 255` at `src/detour/query.rs:712` (`portal_points_tp`). The 716-byte input
+(`fuzz/artifacts/tile_endian/crash-882f1b1858fae30370d9bfac8a08f59b32a571fa`, big-endian form) is a
+tile the reader accepts in which the BV tree reaches a polygon typed as an off-mesh connection, so
+a landing link with edge 255 is created on it. Reachable with `NavMesh::add_tile` bytes in 0.1.0
+to 0.1.5, not only through the new conversion functions. Fixed in this change (a bounds check that
+ends the portal lookup); the input is the regression test
+`landing_link_edge_on_a_misplaced_off_mesh_polygon_is_not_indexed` in `tests/detour.rs`. The
+chunks above ran on the fixed build.

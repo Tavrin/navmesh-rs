@@ -8,6 +8,8 @@
 //! seeds parallel <out-dir>                  `parallel_bake` inputs (layout in the target)
 //! seeds budget <out-dir>                    `budgeted_query` inputs (layout in the target)
 //! seeds recast-grid <out-dir>               two `recast_input` meshes with 50,000 polygons
+//! seeds tilestate <out-dir>                 `tile_state` inputs (layout in the target)
+//! seeds endian <out-dir>                    `tile_endian` inputs: tiles and layers in both byte orders
 //! ```
 use navmesh_fuzz::{RecastInput, demo_settings, run_recast};
 use navmesh_rs::Workspace;
@@ -874,6 +876,88 @@ fn heuristic_seeds(out: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+/// `tile_state` seeds: the sample tile's real state blob under each mode, edited
+/// copies (flags, area ids above 63, a wrong magic, version and tile ref) and short
+/// blobs.
+fn tilestate_seeds(out: &Path) -> Result<usize, String> {
+    use navmesh_rs::detour::{NavMesh, NavMeshParams};
+    let params = NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: 10.0,
+        tile_height: 10.0,
+        max_tiles: 4,
+        max_polys: 1 << 14,
+    };
+    let mut nav = NavMesh::new(&params).map_err(|e| e.to_string())?;
+    let tile = nav
+        .add_tile(navmesh_fuzz::sample_tile())
+        .map_err(|e| e.to_string())?;
+    let mut blob = vec![0u8; nav.tile_state_size(tile).map_err(|e| e.to_string())?];
+    nav.store_tile_state(tile, &mut blob)
+        .map_err(|e| e.to_string())?;
+    let header = 8 + core::mem::size_of::<navmesh_rs::detour::PolyRef>();
+    let mut written = 0;
+    let mut put = |name: &str, mode: u8, bytes: &[u8]| -> Result<(), String> {
+        let mut v = vec![mode];
+        v.extend_from_slice(bytes);
+        std::fs::write(out.join(name), v).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+    for mode in [0u8, 1, 2, 4] {
+        put(&format!("state-real-m{mode}"), mode, &blob)?;
+    }
+    let mut edited = blob.clone();
+    for (i, b) in edited[header..].iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(37) | u8::from(i % 4 == 2) * 0xc0;
+    }
+    put("state-edited", 0, &edited)?;
+    for (name, at) in [("magic", 0usize), ("version", 4), ("ref", 8)] {
+        let mut bad = blob.clone();
+        bad[at] ^= 1;
+        put(&format!("state-bad-{name}"), 0, &bad)?;
+    }
+    put("state-short", 0, &blob[..blob.len() - 1])?;
+    put("state-header-only", 0, &blob[..header])?;
+    put("state-empty", 0, &[])?;
+    Ok(written)
+}
+
+/// `tile_endian` seeds: the sample tile in both byte orders, with and without a
+/// damaged header, and a layer header in both orders.
+fn endian_seeds(out: &Path) -> Result<usize, String> {
+    use navmesh_rs::detour::{nav_mesh_data_swap_endian, nav_mesh_header_swap_endian};
+    let native = navmesh_fuzz::sample_tile();
+    let mut big = native.clone();
+    nav_mesh_data_swap_endian(&mut big).map_err(|e| e.to_string())?;
+    nav_mesh_header_swap_endian(&mut big).map_err(|e| e.to_string())?;
+    let mut written = 0;
+    let mut put = |name: &str, bytes: &[u8]| -> Result<(), String> {
+        std::fs::write(out.join(name), bytes).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+    put("tile-native", &native)?;
+    put("tile-big-endian", &big)?;
+    let mut half = native.clone();
+    nav_mesh_header_swap_endian(&mut half).map_err(|e| e.to_string())?;
+    put("tile-header-swapped-only", &half)?;
+    let mut counts = big.clone();
+    counts[24..28].copy_from_slice(&0x7fff_ffffu32.to_be_bytes());
+    put("tile-big-endian-huge-count", &counts)?;
+    put("tile-short", &native[..99])?;
+    let mut ws = Workspace::new();
+    let h = LayerHeader::new(4, 4);
+    let layer = build_layer(&mut ws, &RawCompressor, &h, &[0; 16], &[1; 16], &[0; 16])
+        .map_err(|e| e.to_string())?;
+    put("layer-native", &layer)?;
+    let mut layer_be = layer.clone();
+    navmesh_rs::tilecache::tile_cache_header_swap_endian(&mut layer_be)
+        .map_err(|e| e.to_string())?;
+    put("layer-big-endian", &layer_be)?;
+    Ok(written)
+}
+
 /// Seeds for `strict_triangulation`: convex contours (complete triangulation),
 /// a bow-tie and random-coordinate contours (incomplete), out-of-range
 /// coordinates, and every polygon-size selector.
@@ -925,6 +1009,8 @@ fn main() -> ExitCode {
                 | "dense"
                 | "strict"
                 | "bake-job"
+                | "tilestate"
+                | "endian"
         )
     );
     if args.len() < if no_inputs { 2 } else { 3 } {
@@ -948,6 +1034,8 @@ fn main() -> ExitCode {
         "dense" => dense_seeds(out),
         "heuristic" => heuristic_seeds(out),
         "strict" => strict_seeds(out),
+        "tilestate" => tilestate_seeds(out),
+        "endian" => endian_seeds(out),
         "tilecache" => tilecache_seeds(out),
         "parallel" => parallel_seeds(out),
         "bake-job" => bake_job_seeds(out),

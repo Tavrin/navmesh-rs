@@ -113,3 +113,19 @@ cargo run --release --bin seeds -- bake-job corpus/bake_job
 cargo +nightly fuzz run incremental_bake corpus/bake_job -- -max_len=1024
 cargo +nightly fuzz run bake_job_steps --features parallel corpus/bake_job -- -max_len=1024
 ```
+
+`tile_state` applies arbitrary bytes as stored tile state to a navmesh holding one real tile
+(mode byte, then the blob; layout and properties in the target source): restore never panics,
+an accepted blob leaves exactly its flags and masked area ids in the tile, a rejected one
+changes nothing, and store succeeds exactly when the buffer is large enough. `tile_endian`
+sends arbitrary bytes through the tile and layer-header byte-order conversions: no panic
+whatever the header counts say, converting to the other order and back restores the bytes, and
+a converted tile that the reader accepts can be queried. Seed writers and runs:
+
+```sh
+cargo run --release --bin seeds -- tilestate corpus/tile_state
+cargo run --release --bin seeds -- endian corpus/tile_endian
+cargo run --release --bin seeds -- tiles corpus/tile_endian <records-dir>/*.navrec
+cargo +nightly fuzz run tile_state corpus/tile_state -- -max_len=512 -rss_limit_mb=512
+cargo +nightly fuzz run tile_endian corpus/tile_endian -- -max_len=65536 -rss_limit_mb=512
+```

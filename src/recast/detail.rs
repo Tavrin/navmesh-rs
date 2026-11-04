@@ -8,7 +8,7 @@ use super::{
     dir_offset_x, dir_offset_y,
 };
 use crate::common::{ceil_i32, clamp, floor_i32, fmax, fmin, sqr, sqrtf, vmax, vmin};
-use crate::{Error, Workspace};
+use crate::{Error, UpstreamFixes, Workspace};
 
 /// Height detail per polygon (`rcPolyMeshDetail`).
 #[derive(Clone, Debug, Default)]
@@ -22,6 +22,58 @@ pub struct PolyMeshDetail {
 }
 
 impl PolyMeshDetail {
+    /// Concatenates detail meshes, for example the per-tile detail meshes of a tiled
+    /// build (`rcMergePolyMeshDetails`). Sub-mesh entries are rebased on the vertex
+    /// and triangle counts of the meshes before them.
+    ///
+    /// Differences from upstream, which would read out of bounds or wrap: arrays
+    /// shorter than a mesh's counts allow, or a total beyond what `u32` offsets and
+    /// `i32` counts can hold, are errors ([`Error::InvalidInput`],
+    /// [`Error::SizeOverflow`]).
+    pub fn merge(ws: &mut Workspace, meshes: &[&PolyMeshDetail]) -> Result<PolyMeshDetail, Error> {
+        ws.begin();
+        let mut max_meshes = 0usize;
+        let mut max_verts = 0usize;
+        let mut max_tris = 0usize;
+        for m in meshes {
+            if m.meshes.len() % 4 != 0 || m.verts.len() % 3 != 0 || m.tris.len() % 4 != 0 {
+                return Err(Error::InvalidInput("detail mesh array length"));
+            }
+            max_meshes += m.meshes.len() / 4;
+            max_verts += m.verts.len() / 3;
+            max_tris += m.tris.len() / 4;
+        }
+        if i32::try_from(max_meshes).is_err()
+            || i32::try_from(max_verts).is_err()
+            || i32::try_from(max_tris).is_err()
+        {
+            return Err(Error::SizeOverflow);
+        }
+        ws.work((max_meshes + max_verts + max_tris) as u64)?;
+        let mut out = PolyMeshDetail {
+            meshes: ws.vec_with_capacity(max_meshes * 4)?,
+            verts: ws.vec_with_capacity(max_verts * 3)?,
+            tris: ws.vec_with_capacity(max_tris * 4)?,
+        };
+        let mut nverts = 0u32;
+        let mut ntris = 0u32;
+        for m in meshes {
+            for s in m.meshes.chunks_exact(4) {
+                out.meshes.extend_from_slice(&[
+                    nverts.wrapping_add(s[0]),
+                    s[1],
+                    ntris.wrapping_add(s[2]),
+                    s[3],
+                ]);
+            }
+            out.verts.extend_from_slice(&m.verts);
+            out.tris.extend_from_slice(&m.tris);
+            nverts += (m.verts.len() / 3) as u32;
+            ntris += (m.tris.len() / 4) as u32;
+        }
+        Ok(out)
+    }
+
     /// Builds the detail mesh: per polygon, a triangulation that follows the
     /// heightfield within `sample_max_error` (`rcBuildPolyMeshDetail`).
     pub fn build(
@@ -30,6 +82,27 @@ impl PolyMeshDetail {
         chf: &CompactHeightfield,
         sample_dist: f32,
         sample_max_error: f32,
+    ) -> Result<PolyMeshDetail, Error> {
+        Self::build_with_fixes(
+            ws,
+            mesh,
+            chf,
+            sample_dist,
+            sample_max_error,
+            UpstreamFixes::NONE,
+        )
+    }
+
+    /// [`PolyMeshDetail::build`] with upstream corrections applied
+    /// ([`UpstreamFixes::ZERO_SAMPLE_DIST`]). With [`UpstreamFixes::NONE`] it is
+    /// identical to `build`.
+    pub fn build_with_fixes(
+        ws: &mut Workspace,
+        mesh: &PolyMesh,
+        chf: &CompactHeightfield,
+        sample_dist: f32,
+        sample_max_error: f32,
+        fixes: UpstreamFixes,
     ) -> Result<PolyMeshDetail, Error> {
         ws.begin();
         check_surface_chf(ws, chf)?;
@@ -148,6 +221,7 @@ impl PolyMeshDetail {
                 &mut tris,
                 &mut edges,
                 &mut samples,
+                fixes,
             )?;
             for v in verts[..nverts * 3].chunks_exact_mut(3) {
                 v[0] += orig[0];
@@ -868,6 +942,7 @@ fn build_poly_detail(
     tris: &mut Vec<i32>,
     edges: &mut Vec<i32>,
     samples: &mut Vec<i32>,
+    fixes: UpstreamFixes,
 ) -> Result<usize, Error> {
     const MAX_VERTS: usize = 127;
     const MAX_TRIS: usize = 255;
@@ -975,6 +1050,14 @@ fn build_poly_detail(
                 }
             }
             j = i;
+        }
+    }
+    if sample_dist <= 0.0 && fixes.contains(UpstreamFixes::ZERO_SAMPLE_DIST) {
+        // No edge subdivision was asked for: the hull is the polygon itself, in the
+        // order the subdivision loop above would have produced.
+        for k in 0..nin {
+            hull[nhull] = ((k + nin - 1) % nin) as i32;
+            nhull += 1;
         }
     }
     let hull = &hull[..nhull];

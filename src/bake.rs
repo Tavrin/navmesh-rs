@@ -31,7 +31,7 @@ use core::fmt;
 use crate::common::{floorf, fmax, fmin};
 use crate::detour::{self, NavMesh, NavMeshCreateParams, NavMeshParams};
 use crate::recast::{self, Config};
-use crate::{Error, Limits, Workspace};
+use crate::{Error, Limits, UpstreamFixes, Workspace};
 
 mod install;
 mod job;
@@ -144,6 +144,10 @@ pub struct BakeConfig {
     pub max_total_bytes: usize,
     /// Reject incomplete ear clipping (not in recastnavigation). Defaults to false.
     pub strict_triangulation: bool,
+    /// Upstream defect corrections applied while baking (not in recastnavigation).
+    /// Only [`UpstreamFixes::ZERO_SAMPLE_DIST`] concerns baking. Defaults to
+    /// [`UpstreamFixes::NONE`], which reproduces upstream.
+    pub fixes: UpstreamFixes,
 }
 
 impl Default for BakeConfig {
@@ -176,6 +180,7 @@ impl Default for BakeConfig {
             tile_limits: Limits::default(),
             max_total_bytes: usize::MAX,
             strict_triangulation: false,
+            fixes: UpstreamFixes::NONE,
         }
     }
 }

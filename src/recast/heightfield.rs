@@ -286,6 +286,54 @@ impl Heightfield {
         Ok(())
     }
 
+    /// [`Heightfield::rasterize_triangles`] with 16-bit indices (the
+    /// `unsigned short` overload of `rcRasterizeTriangles`).
+    pub fn rasterize_triangles_u16(
+        &mut self,
+        ws: &mut Workspace,
+        verts: &[f32],
+        tris: &[u16],
+        areas: &[u8],
+        flag_merge_thr: i32,
+    ) -> Result<(), Error> {
+        ws.begin();
+        let mut wide = ws.vec_with_capacity::<i32>(tris.len())?;
+        wide.extend(tris.iter().map(|&i| i32::from(i)));
+        self.rasterize_triangles(ws, verts, &wide, areas, flag_merge_thr)
+    }
+
+    /// Rasterizes a triangle list without indices: nine floats per triangle, one
+    /// area id per triangle (the overload of `rcRasterizeTriangles` that takes
+    /// `numTris` and no index array).
+    pub fn rasterize_triangle_soup(
+        &mut self,
+        ws: &mut Workspace,
+        verts: &[f32],
+        areas: &[u8],
+        flag_merge_thr: i32,
+    ) -> Result<(), Error> {
+        ws.begin();
+        self.check()?;
+        if !verts.len().is_multiple_of(9) || verts.len() / 9 != areas.len() {
+            return Err(Error::InvalidInput(
+                "vertex array is not nine floats per triangle area",
+            ));
+        }
+        if verts.iter().any(|v| !v.is_finite()) {
+            return Err(Error::InvalidInput("non-finite vertex coordinate"));
+        }
+        if areas.iter().any(|&a| a > 63) {
+            return Err(Error::InvalidInput("area id above 63"));
+        }
+        let ics = 1.0 / self.cs;
+        let ich = 1.0 / self.ch;
+        for (t, &area) in verts.chunks_exact(9).zip(areas) {
+            let (v0, v1, v2) = (v3(&t[0..]), v3(&t[3..]), v3(&t[6..]));
+            self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr)?;
+        }
+        Ok(())
+    }
+
     /// Rasterizes one triangle (`rcRasterizeTriangle`).
     pub fn rasterize_triangle(
         &mut self,

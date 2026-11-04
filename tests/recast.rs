@@ -442,3 +442,134 @@ fn huge_triangle_over_a_small_grid_is_a_typed_error() {
     let result = hf.rasterize_triangle(&mut ws, v0, v1, v2, 0, 0);
     assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
 }
+
+/// A 4 x 4 cell quad, `ox` cells from the origin on x, nvp 4.
+fn quad_mesh(ox: u16) -> PolyMesh {
+    const N: u16 = 0xffff;
+    PolyMesh {
+        verts: vec![ox, 0, 0, ox, 0, 4, ox + 4, 0, 4, ox + 4, 0, 0],
+        polys: vec![0, 1, 2, 3, N, N, N, N],
+        regs: vec![7],
+        flags: vec![1],
+        areas: vec![5],
+        nverts: 4,
+        npolys: 1,
+        maxpolys: 1,
+        nvp: 4,
+        bmin: [f32::from(ox) * 0.5, 0.0, 0.0],
+        bmax: [f32::from(ox) * 0.5 + 2.0, 1.0, 2.0],
+        cs: 0.5,
+        ch: 0.5,
+        border_size: 3,
+        max_edge_error: 1.3,
+    }
+}
+
+#[test]
+fn merging_poly_meshes_welds_vertices_and_relinks_the_seam() {
+    let mut ws = Workspace::new();
+    let mut a = quad_mesh(0);
+    let mut c = quad_mesh(0);
+    c.bmin[0] += 2.0;
+    c.bmax[0] += 2.0;
+    // Portal markers: x- on a (outer side, kept), x+ on a (faces c, dropped).
+    a.polys[4] = 0x8000;
+    a.polys[6] = 0x8002;
+    let merged = PolyMesh::merge(&mut ws, &[&a, &c]).unwrap();
+    assert_eq!((merged.nverts, merged.npolys), (6, 2));
+    assert_eq!(
+        merged.verts,
+        [0, 0, 0, 0, 0, 4, 4, 0, 4, 4, 0, 0, 8, 0, 4, 8, 0, 0]
+    );
+    assert_eq!(merged.bmax, [4.0, 1.0, 2.0]);
+    assert_eq!(
+        (merged.regs, merged.areas, merged.flags),
+        (vec![7, 7], vec![5, 5], vec![1, 1])
+    );
+    assert_eq!((merged.border_size, merged.maxpolys), (0, 0));
+    // Edge 2 of the left quad meets edge 0 of the right one.
+    assert_eq!(&merged.polys[..8], &[0, 1, 2, 3, 0x8000, 0xffff, 1, 0xffff]);
+    assert_eq!(
+        &merged.polys[8..16],
+        &[3, 2, 4, 5, 0, 0xffff, 0xffff, 0xffff]
+    );
+    assert!(PolyMesh::merge(&mut ws, &[]).unwrap().polys.is_empty());
+    let mut bad = quad_mesh(0);
+    bad.polys[1] = 9;
+    assert!(matches!(
+        PolyMesh::merge(&mut ws, &[&bad]),
+        Err(Error::InvalidInput(_))
+    ));
+    bad.polys[1] = 1;
+    bad.nvp = 5;
+    assert!(matches!(
+        PolyMesh::merge(&mut ws, &[&a, &bad]),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+#[test]
+fn copying_a_poly_mesh_trims_arrays_and_sets_maxpolys() {
+    let mut ws = Workspace::new();
+    let mut m = quad_mesh(0);
+    m.verts.extend([9, 9, 9]);
+    m.maxpolys = 40;
+    let c = m.copy(&mut ws).unwrap();
+    assert_eq!((c.verts.len(), c.polys.len(), c.maxpolys), (12, 8, 1));
+    assert_eq!((c.regs, c.areas, c.flags), (vec![7], vec![5], vec![1]));
+    assert_eq!((c.border_size, c.max_edge_error), (3, 1.3));
+    m.flags.clear();
+    assert!(matches!(m.copy(&mut ws), Err(Error::InvalidInput(_))));
+}
+
+#[test]
+fn merging_detail_meshes_rebases_sub_mesh_offsets() {
+    let mut ws = Workspace::new();
+    let d = |n: u32| PolyMeshDetail {
+        meshes: vec![0, 3, 0, 1],
+        verts: vec![n as f32; 9],
+        tris: vec![0, 1, 2, 0],
+    };
+    let (a, b) = (d(1), d(2));
+    let m = PolyMeshDetail::merge(&mut ws, &[&a, &b]).unwrap();
+    assert_eq!(m.meshes, [0, 3, 0, 1, 3, 3, 1, 1]);
+    assert_eq!((m.verts.len(), m.tris.len()), (18, 8));
+    assert_eq!(m.verts[9], 2.0);
+    let bad = PolyMeshDetail {
+        tris: vec![0; 3],
+        ..d(1)
+    };
+    assert!(matches!(
+        PolyMeshDetail::merge(&mut ws, &[&bad]),
+        Err(Error::InvalidInput(_))
+    ));
+}
+
+/// `rcFilterLedgeSpans` after upstream's ledge rewrite counts a neighbour whose free gap
+/// is exactly `walkable_height` cells as traversable, as the compact heightfield and
+/// the low-height filter do; one cell less is not. See `reference/UPSTREAM.md`.
+#[test]
+fn ledge_filter_treats_a_gap_of_exactly_walkable_height_as_traversable() {
+    // 3x3 columns, cell size 1: the middle column has a floor at 10 and a ceiling at 20;
+    // the north column drops to 3 and has a span at `north_ceiling`; the others are level.
+    let centre_area = |north_ceiling: u16| {
+        let mut ws = Workspace::new();
+        let mut hf = Heightfield::new(&mut ws, 3, 3, [0.; 3], [3.; 3], 1.0, 1.0).unwrap();
+        for (x, z) in [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (2, 2)] {
+            hf.add_span(&mut ws, x, z, 0, 10, 1, 0).unwrap();
+        }
+        hf.add_span(&mut ws, 1, 1, 0, 10, 1, 0).unwrap();
+        hf.add_span(&mut ws, 1, 1, 20, 21, 1, 0).unwrap();
+        hf.add_span(&mut ws, 1, 2, 0, 3, 1, 0).unwrap();
+        hf.add_span(&mut ws, 1, 2, north_ceiling, north_ceiling + 1, 1, 0)
+            .unwrap();
+        hf.filter_ledge_spans(&mut ws, 5, 1).unwrap();
+        hf.column(4).next().unwrap().area
+    };
+    assert_eq!(
+        centre_area(15),
+        0,
+        "gap == walkable height: a drop, so a ledge"
+    );
+    assert_eq!(centre_area(14), 1, "gap one cell short: not a neighbour");
+}

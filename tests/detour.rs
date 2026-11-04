@@ -741,3 +741,183 @@ fn dijkstra_takes_geometric_detour_with_zero_cost_links() {
         .unwrap();
     assert_eq!(plain.len(), 3);
 }
+
+/// Bytes of a tile state header: magic, version and the tile ref at its width.
+const STATE_HEADER: usize = 8 + (detour::POLYREF_BITS / 8) as usize;
+
+#[test]
+fn tile_state_round_trips_and_untrusted_blobs_are_typed_errors() {
+    use navmesh_rs::TileStateError::{TooShort, WrongMagic, WrongTile, WrongVersion};
+    let mut nav = NavMesh::new(&grid(4)).unwrap();
+    let t = nav.add_tile(mesh_tile(0, 0, true, true)).unwrap();
+    let polys = nav.tile_by_ref(t).unwrap().polys.len();
+    assert_eq!(polys, 4);
+    let size = nav.tile_state_size(t).unwrap();
+    assert_eq!(size, STATE_HEADER + 4 * polys);
+    let store = |nav: &NavMesh| {
+        let mut b = vec![0xaa; size];
+        assert_eq!(nav.store_tile_state(t, &mut b), Ok(size));
+        b
+    };
+    let original = store(&nav);
+    assert_eq!(&original[..4], &detour::NAVMESH_STATE_MAGIC.to_le_bytes());
+    assert_eq!(&original[STATE_HEADER + 3..STATE_HEADER + 4], &[0]);
+    assert_eq!(
+        nav.store_tile_state(t, &mut vec![0; size - 1]),
+        Err(Error::BufferTooSmall)
+    );
+    let base = nav.poly_ref_base(0).unwrap();
+    for i in 0..polys as detour::PolyRef {
+        nav.set_poly_flags(base + i, 0x100 + i as u16).unwrap();
+        nav.set_poly_area(base + i, 70 + i as u8).unwrap();
+    }
+    let edited = store(&nav);
+    assert_eq!(nav.poly_area(base + 1), Ok(7)); // 71 & 0x3f, as setPolyArea masks
+    nav.restore_tile_state(t, &original).unwrap();
+    assert_eq!((nav.poly_flags(base), nav.poly_area(base)), (Ok(1), Ok(0)));
+    nav.restore_tile_state(t, &edited).unwrap();
+    assert_eq!(nav.poly_flags(base + 3), Ok(0x103));
+
+    let mut blob = original.clone();
+    let reject = |nav: &mut NavMesh, b: &[u8], e| {
+        assert_eq!(
+            nav.restore_tile_state(t, b),
+            Err(Error::InvalidTileState(e))
+        );
+    };
+    reject(&mut nav, &original[..size - 1], TooShort);
+    blob[0] ^= 1;
+    reject(&mut nav, &blob, WrongMagic);
+    blob[0] ^= 1;
+    blob[4] ^= 1;
+    reject(&mut nav, &blob, WrongVersion);
+    blob[4] ^= 1;
+    blob[8] ^= 1;
+    reject(&mut nav, &blob, WrongTile);
+    assert_eq!(store(&nav), edited, "rejected blobs change nothing");
+    // A re-added tile has a new ref: the old ref is dead and old state is stale.
+    let bytes = nav.remove_tile(t).unwrap();
+    assert_eq!(nav.restore_tile_state(t, &original), Err(Error::InvalidRef));
+    let t2 = nav.add_tile(bytes).unwrap();
+    assert_ne!(t, t2);
+    assert_eq!(
+        nav.restore_tile_state(t2, &original),
+        Err(Error::InvalidTileState(WrongTile))
+    );
+}
+
+#[test]
+fn tile_bytes_convert_between_byte_orders() {
+    use navmesh_rs::TileDataError::{BadSize, WrongMagic, WrongVersion};
+    let mut native = mesh_tile(0, 0, true, true);
+    let (_, off_mesh) = bv_and_off_mesh_at(&native);
+    native[off_mesh + 32..off_mesh + 36].copy_from_slice(&0x0102_0304u32.to_le_bytes());
+    // Upstream's conversion skips the off-mesh user ids; the extension converts them.
+    let mut plain = native.clone();
+    detour::nav_mesh_data_swap_endian(&mut plain).unwrap();
+    assert_eq!(
+        &plain[off_mesh + 32..off_mesh + 36],
+        &native[off_mesh + 32..off_mesh + 36]
+    );
+    let mut big = native.clone();
+    detour::nav_mesh_swap_off_mesh_user_ids(&mut big).unwrap();
+    detour::nav_mesh_data_swap_endian(&mut big).unwrap();
+    detour::nav_mesh_header_swap_endian(&mut big).unwrap();
+    assert_eq!(&big[..4], &detour::NAVMESH_MAGIC.to_be_bytes());
+    assert_eq!(
+        &big[off_mesh + 32..off_mesh + 36],
+        &0x0102_0304u32.to_be_bytes()
+    );
+    assert_eq!(
+        rejected(big.clone()),
+        Some(Error::InvalidTileData(WrongMagic))
+    );
+    // The body swap needs the header in this crate's (little-endian) order.
+    assert_eq!(
+        detour::nav_mesh_data_swap_endian(&mut big.clone()),
+        Err(Error::InvalidTileData(WrongMagic))
+    );
+    let mut back = big.clone();
+    detour::nav_mesh_header_swap_endian(&mut back).unwrap();
+    detour::nav_mesh_data_swap_endian(&mut back).unwrap();
+    detour::nav_mesh_swap_off_mesh_user_ids(&mut back).unwrap();
+    assert_eq!(back, native);
+    let tile = MeshTile::parse(back).unwrap();
+    assert_eq!(tile.off_mesh_cons[0].user_id, 0x0102_0304);
+
+    let mut bad = native.clone();
+    bad[4] ^= 1;
+    assert_eq!(
+        detour::nav_mesh_header_swap_endian(&mut bad),
+        Err(Error::InvalidTileData(WrongVersion))
+    );
+    assert_eq!(bad[4], native[4] ^ 1, "a rejected header is not modified");
+    assert_eq!(
+        detour::nav_mesh_header_swap_endian(&mut native[..99].to_vec()),
+        Err(Error::InvalidTileData(BadSize))
+    );
+    // Counts that reach past the buffer are rejected before anything is swapped.
+    let mut huge = native.clone();
+    huge[24..28].copy_from_slice(&i32::MAX.to_le_bytes());
+    let copy = huge.clone();
+    assert_eq!(
+        detour::nav_mesh_data_swap_endian(&mut huge),
+        Err(Error::InvalidTileData(BadSize))
+    );
+    assert_eq!(huge, copy);
+}
+
+/// A fuzzer-found tile (found through the byte-order target, in big-endian form).
+/// A polygon typed as an off-mesh connection that the BV tree reaches receives a
+/// landing link whose edge index is 255, and `portal_points` indexed the polygon's
+/// six vertices with it. Now a typed error, never a panic. The bytes are a 64-bit
+/// ref tile (the link pool is 16 bytes per link), so the test needs `polyref64`.
+#[cfg(feature = "polyref64")]
+#[test]
+fn landing_link_edge_on_a_misplaced_off_mesh_polygon_is_not_indexed() {
+    const HEX: &str = concat!(
+        "444e4156000000070000000000000000000000000000000000000004000000080000000e000000020000000000000002",
+        "000000040000000200000002400000003f0000003f000000000000000000000000000000412000003f80000041200000",
+        "0000003f8000000000000000000000000000000000000000412000004120080000000000000000000057000000000000",
+        "fc00000040000000000000000040000041000000000000004100000040400000000000004040000040e0000000000000",
+        "40e000000000000000000001000200000000000000000000000200000000000000010300000000000000000200030000",
+        "000000000001000000000000000000000001030000000000000400050000000000000000000000000000000000000000",
+        "000102400000100000000000000000005c00000000000000000000000000000000010240000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+        "000000000000000000000000000000000000000000000000000000000001000000000000000000010001001b00000102",
+        "00010215000000000000000a0000000afffffffd000000000000000a0000000a00000002000000000000000a0000000a",
+        "00000001000000000000000000000000000000004000000000000000400000004100000000004d030000000000000000",
+        "000201ff0403020140400000000000004040000040e000000000000040e000003f800000000301ff08070605",
+    );
+    let mut bytes: Vec<u8> = (0..HEX.len() / 2)
+        .map(|i| u8::from_str_radix(&HEX[i * 2..i * 2 + 2], 16).unwrap())
+        .collect();
+    detour::nav_mesh_header_swap_endian(&mut bytes).unwrap();
+    detour::nav_mesh_data_swap_endian(&mut bytes).unwrap();
+    let (nav, _) = NavMesh::new_single(bytes).unwrap();
+    let mut q = NavMeshQuery::new(&nav, 64).unwrap();
+    let base = nav.poly_ref_base(0).unwrap();
+    let count = nav.tile(0).unwrap().polys.len() as detour::PolyRef;
+    let tile = nav.tile(0).unwrap();
+    let centre = |p: usize| {
+        let v = &tile.verts[tile.polys[p].verts[0] as usize * 3..];
+        [v[0], v[1], v[2]]
+    };
+    let f = DefaultFilter::default();
+    for a in 0..count {
+        for b in 0..count {
+            let _ = q.portal_points(base + a, base + b);
+            let (pa, pb) = (centre(a as usize), centre(b as usize));
+            let mut path = Vec::new();
+            if q.find_path(base + a, base + b, &pa, &pb, &f, &mut path, 16)
+                .is_ok()
+            {
+                let mut corners = Vec::new();
+                let _ = q.find_straight_path(&pa, &pb, &path, &mut corners, 16, 0);
+            }
+        }
+    }
+}

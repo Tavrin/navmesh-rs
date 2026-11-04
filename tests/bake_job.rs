@@ -970,3 +970,61 @@ fn an_indexed_input_gives_the_tiles_and_hashes_of_the_plain_input() {
         Err(Error::InvalidInput(_))
     ));
 }
+
+#[test]
+fn fixes_flow_through_jobs_and_invalidate_manifests() {
+    use navmesh_rs::UpstreamFixes;
+
+    let scene = Scene::new();
+    let input = Input::new(&scene.verts, &scene.tris);
+    let mut cfg = BakeConfig::default();
+    cfg.recast.detail_sample_dist = 0.0;
+    let grid = GridLayout::from_input(&input, &cfg).unwrap();
+    let mut previous: Option<BakeManifest> = None;
+    let mut baseline = None;
+    for fixes in [
+        UpstreamFixes::NONE,
+        UpstreamFixes::ZERO_SAMPLE_DIST,
+        UpstreamFixes::ALL,
+    ] {
+        cfg.fixes = fixes;
+        let expected = bake::tiles(&input, &cfg, &mut Workspace::new()).unwrap();
+        let expected: Vec<_> = expected.tiles.into_iter().map(|t| t.data).collect();
+        assert!(expected.iter().any(Option::is_some));
+        if let Some(ref baseline) = baseline {
+            assert_ne!(&expected, baseline);
+        } else {
+            baseline = Some(expected.clone());
+        }
+        for allowance in [1, u64::MAX] {
+            let mut job =
+                BakeJob::new(&input, &cfg, &grid, grid.keys(), JobOptions::default()).unwrap();
+            let got: Vec<_> = serial(&mut job, allowance)
+                .into_iter()
+                .map(|t| t.data)
+                .collect();
+            assert_eq!(got, expected);
+        }
+        let mut job =
+            BakeJob::new(&input, &cfg, &grid, grid.keys(), JobOptions::default()).unwrap();
+        job.run_parallel().unwrap();
+        let mut got = Vec::new();
+        drain(&mut job, &mut got);
+        assert_eq!(
+            got.into_iter().map(|t| t.data).collect::<Vec<_>>(),
+            expected
+        );
+        if let Some(ref previous) = previous {
+            let dirty = previous.dirty_from_boxes(&cfg, &grid, &[]).unwrap();
+            assert!(dirty.full_rebake);
+            assert_eq!(dirty.keys, grid.keys());
+            let mut job =
+                BakeJob::new(&input, &cfg, &grid, grid.keys(), JobOptions::default()).unwrap();
+            assert!(!job.skip_unchanged(previous, &mut Workspace::new()).unwrap());
+            assert_eq!(job.skipped(), 0);
+        }
+        let mut manifest = BakeManifest::new(&cfg, &grid).unwrap();
+        manifest.apply(&job.manifest_delta()).unwrap();
+        previous = Some(manifest);
+    }
+}
