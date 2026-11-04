@@ -1067,3 +1067,106 @@ remove without per-function rewrites.
 totals are within 1.09x through the public API and 1.04x through the pipeline. Queries
 remain at 1.15x. Output is unchanged: all 76,018 parity records (38,009 per width) match
 C++ and all 3,035 determinism digests match the unchanged golden file.
+
+## Incremental, resumable and cancellable baking (extension)
+
+The `bake` module's `GeometrySource`, `GridLayout`, `BakeManifest`, `BakeJob`,
+`TileInstaller` and `CancelToken` are extensions **not in recastnavigation**. There is no
+upstream to compare with; the reference is `bake::tiles`, which is itself compared with the
+oracle. The per-tile pipeline is one stage machine shared by `tiles` and the job, so the
+oracle comparison covers the job's stages too.
+
+| Claim | Evidence |
+|---|---|
+| `tiles` output, budgets and errors unchanged by the refactor | all 76,018 parity records (38,009 per reference width) equal; all 3,035 determinism digests equal the unchanged golden file |
+| A job over a borrowed mesh gives the bytes and order of `tiles` for any step budget (1 unit, 7,000, unlimited), `run_parallel` and rayon pools of 1, 4 and 16 threads; all three partitions; automatic, explicit and mixed per-triangle areas; area volumes and off-mesh links | `tests/bake_job.rs::every_driver_reproduces_tiles_for_borrowed_and_mixed_area_sources` |
+| Incremental rebake (dirty boxes, then input-hash skipping) equals a full bake of the edited world: every tile's bytes and the whole manifest, for raise, hole, wall, area volume and link edits; an unchanged world rebakes nothing; a changed configuration invalidates every tile | `tests/bake_job.rs::incremental_rebake_is_byte_identical_to_a_full_bake`; fuzz target `incremental_bake` |
+| Cancel returns no tile after it, tiles delivered before it equal the full bake, a cancel raised during a fetch is caught by the next work charge | `tests/bake_job.rs::cancel_returns_no_partial_tile_and_keeps_delivered_tiles_valid`; fuzz target `bake_job_steps` |
+| Manifest bytes are validated (magic, version, layout, layout against the stored configuration hash, grid size against `max_work`, exact length, strict `(z, x)` order, keys inside the grid, canonical flags, limits) | `tests/bake_job.rs::manifest_round_trips_and_untrusted_bytes_are_validated` |
+| A grown or shrunk grid, or a changed layout or configuration, is detected: new tiles are dirty, a layout change is a reported full rebake, `apply` refuses a delta baked under another configuration, non-finite edit boxes are errors | `tests/bake_job.rs::growing_the_grid_dirties_the_new_tiles`, `shrinking_the_grid_reports_the_removed_tiles`, `a_layout_change_is_a_reported_full_rebake_and_a_stale_delta_is_refused`, `edit_boxes_must_be_finite`, `a_manifest_with_a_foreign_layout_is_not_used_to_skip_tiles` |
+| `TileInstaller` replaces a resident tile (old refs die), the newest queued version of a tile wins, a refused tile leaves the resident one, a tile rebaked to nothing removes it | `tests/bake_job.rs::installer_replaces_resident_tiles_and_the_newest_queued_version_wins` |
+| Cancel rule: tiles are whole, new exactly where `manifest_delta` lists them, per-call install stays one tile per unit of budget | `tests/bake_job.rs::a_cancelled_rebake_leaves_whole_old_or_new_tiles_and_the_delta_names_the_new_ones`; fuzz target `bake_job_steps` |
+| A job meets the same `tile_limits.max_bytes` as `tiles` (least passing value equal), and enforces `max_total_bytes` | `tests/bake_job.rs::byte_limits_mean_the_same_for_a_job_and_tiles` |
+| `Input::indexed` gives the tiles and input hashes of the plain `Input` source; on 180,000 triangles in 400 tiles (release, serial, a shared machine, 3 runs) a serial job over the indexed mesh took 101 to 110% of `tiles()` (107 to 115% with the one-time index build), the plain `Input` source 335 to 350%; the all-tile hash pass 12 to 14 ms against 360 to 390 ms | `tests/bake_job.rs::an_indexed_input_gives_the_tiles_and_hashes_of_the_plain_input`; fuzz target `bake_job_steps` |
+
+A fuzz run found one defect, in the fuzz model (the dirty box of a removed area volume read
+the wrong coordinate), not in the library; the input is kept as a corpus seed.
+
+### Fuzz receipts
+
+Nightly, `cargo-fuzz`, ASAN with `quarantine_size_mb=8`, `-max_len=1024 -rss_limit_mb=512`,
+one libFuzzer worker per target, two targets concurrently, 48 generated seeds plus the
+regression inputs. 2,400 s, then 600 s chunks on the same corpus until a whole chunk added
+no edge coverage (the rule in `fuzz/README.md`), all with no crash:
+
+| Target | Executions in the first 2,400 s | Coverage (edges) at 2,400 s | Chunks | Result |
+|---|---:|---:|---|---|
+| `incremental_bake` | 23,303 | 6,568 | 2,400 + 5 x 600 s = 5,400 s | chunk 5 added 0 edges (6,588) |
+| `bake_job_steps` | 17,175 | 6,942 | 2,400 + 5 x 600 s = 5,400 s | chunk 5 added 0 edges (6,966) |
+
+CPU time per target is its wall time (one worker): 90 CPU-minutes, inside the 10 to 120
+minute window.
+
+After the review fixes the two targets were extended: `incremental_bake` varies the layout
+(the grid grows or shrinks by up to two tiles per axis, the top of the height range rises
+by up to three metres, which is a full rebake) and installs the rebaked tiles over the old
+ones behind stale queued versions; `bake_job_steps` also bakes on a grown grid, from an
+indexed mesh, and cancels a rebake over a navmesh holding the previous world. Same settings
+as above, continued from the previous corpus in 600 s chunks until a chunk added no edge
+coverage:
+
+| Target | Chunks | Coverage (edges) | Result |
+|---|---|---|---|
+| `incremental_bake` | 1,800 s on the first extension, then 2 x 600 s on the final code | 8,431 to 8,432, then 8,432 | last chunk added 0 edges, no crash |
+| `bake_job_steps` | 600 s on the first extension, then 600 s on the final code | 9,799, then 9,844 (final code) | last chunk added 0 edges, no crash |
+
+The first extension runs used the code before the last two changes (the word-wide digest
+step and the per-item bounds filter of the index), which touch only the digest and the index;
+the final-code chunks cover them.
+
+### Install cost and slicing
+
+`NavMesh::add_tile` validates and links a tile in one call, so a tile is the smallest piece.
+`TileInstaller::install` takes a `Budget` (one unit per KiB of tile data, at least one) and
+installs whole tiles until it is spent, resuming on the next call; a one-unit budget is one
+tile per call.
+
+Measured on the 4 km world (2,809 tiles, 3.2 KiB each), one tile per call: per call mean
+6 us, p99 12 us, max 33 us, no call over 1 ms, 1.8 us per KiB (1 km, one thread: max 12 us).
+
+At about 2 us per KiB, a 1 ms call fits roughly 500 KiB of tile data, a few hundred times
+the size of these tiles; a larger tile costs proportionally more and a tile is not split, so
+the bound on one call is the install time of the largest tile in the budget. The residency
+cap is the navmesh's `max_tiles` (`GridLayout::nav_mesh_params(max_tiles, max_polys)`); the
+job, the manifest and the installer have no tile-count limit of their own.
+
+### Bake and rebake measurements
+
+Generated world (`tests/common/world.rs`, `tests/large_world.rs`), release build, `parallel`,
+4 rayon threads, a shared machine that was running other work, so absolute times are only
+indicative; 256-cell tiles of 0.3 m (76.8 m).
+
+| World | Tiles | Full bake | Peak RSS | Manifest |
+|---|---:|---:|---:|---:|
+| 4 km | 2,809 | 92.7 s (138.0 s in an earlier run) | 34 MiB | 70,285 bytes |
+| 16 km | 43,681 | 1,564 s | 18 MiB | 1,092,085 bytes |
+
+Rebake after an edit, 4 km world, 4 threads (the tiles dirtied by the edit box, none skipped):
+one tile 17 ms; 9 tiles 80 ms; 81 tiles 2,321 ms (2.5% of the full bake time for 2.9% of the
+tiles). 16 km: 1 tile 21 ms; 9 tiles 195 ms; 81 tiles 2,416 ms. Proportionality under
+identical conditions (1 km, one thread, 196 tiles, 94 ms per tile on average): 4 dirty tiles
+301 ms (1.6% of the time for 2.0% of the tiles), 16 tiles 1,668 ms (9.0% for 8.2%), 64 tiles
+5,525 ms (29.9% for 32.7%); each within 20% of k/N. The longest single step (one stage of
+one 256-cell tile) was 11.9 ms in the 4 km run, 103 ms in the 1 km single-thread run and
+136 ms in the 16 km run; the spread is machine load, not tile content (the same tile).
+The proportionality figures use the generated world, not the downloaded terrain case.
+
+### A 240 km world in 256 m sectors (estimate)
+
+Centred on the origin (+-120 km), 0.5 m cells, 512-cell tiles: 938 x 938 = 879,844 tiles.
+Measured on 16 sample tiles spread over the world, including the four corners: bake mean
+778 ms and at most 1,028 ms per sector on one thread, 14.8 KiB of tile data each, install at
+most 31 us per tile. **Estimated, not measured**: a full bake takes 190 CPU-hours (47.6 hours
+on 4 threads); the manifest is 21.0 MiB and the list of keys 6.7 MiB; one edit near the far
+corner is mapped to its tile in 2.4 us. Tile coordinates and `f32` positions at 120 km have a
+spacing of 7.8 mm, far below the 0.5 m cell.

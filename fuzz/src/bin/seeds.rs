@@ -577,6 +577,56 @@ fn bake_mesh(kind: u8) -> (Vec<[u8; 3]>, Vec<[u8; 3]>) {
     (verts, tris)
 }
 
+/// `incremental_bake` and `bake_job_steps` inputs (layout in `navmesh_fuzz::bake_world`): a flat
+/// floor of two large triangles, a few pseudo-random triangles, volumes, links and edits, over
+/// the three partitions, explicit and automatic areas, and several tile sizes.
+fn bake_job_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u8
+    };
+    for n in 0..48u32 {
+        let (partition, explicit) = ((n % 3) as u8, n % 2 == 1);
+        let (ntri, nvol, nlink, nedit) = (
+            3 + (n % 7) as u8,
+            (n % 4) as u8,
+            (n % 3) as u8,
+            1 + (n % 8) as u8,
+        );
+        let mut v = vec![
+            (n * 5 % 33) as u8,
+            partition | ((n % 4) as u8) << 2,
+            u8::from(n % 5 == 4) | u8::from(explicit) << 1,
+            ntri - 1,
+            nvol,
+            nlink,
+            nedit,
+            (n * 13 % 256) as u8,
+        ];
+        // Two floor triangles spanning the world, then random ones.
+        for p in [
+            [0u8, 20, 0, 0, 20, 255, 255, 20, 255, 7],
+            [0, 20, 0, 255, 20, 255, 255, 20, 0, 7],
+        ] {
+            v.extend(p);
+        }
+        for _ in 2..ntri {
+            v.extend((0..10).map(|_| next()));
+        }
+        v.extend(
+            (0..usize::from(nvol) * 5 + usize::from(nlink) * 4 + usize::from(nedit) * 16)
+                .map(|_| next()),
+        );
+        std::fs::write(out.join(format!("bj-{n:02}")), v).map_err(|e| e.to_string())?;
+        written += 1;
+    }
+    Ok(written)
+}
+
 /// `parallel_bake` inputs (layout in the target): six meshes, three partitions and six feature
 /// sets (defaults, areas and volumes, filters off, tight tile limits, three aggregate budgets),
 /// plus two raw-float inputs with extreme coordinates.
@@ -958,6 +1008,7 @@ fn main() -> ExitCode {
                 | "heuristic"
                 | "dense"
                 | "strict"
+                | "bake-job"
                 | "tilestate"
                 | "endian"
         )
@@ -987,6 +1038,7 @@ fn main() -> ExitCode {
         "endian" => endian_seeds(out),
         "tilecache" => tilecache_seeds(out),
         "parallel" => parallel_seeds(out),
+        "bake-job" => bake_job_seeds(out),
         other => Err(format!("unknown mode {other}")),
     };
     match result {

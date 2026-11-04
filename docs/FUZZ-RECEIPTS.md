@@ -463,6 +463,23 @@ v0.1.4). The same 237-byte input panics on a v0.1.4 build, so it is not a regres
 changes. Input: `fuzz/artifacts/recast_input/crash-e29e83e6cd0ab9343b7267635720aa479dd5a7a6` (kept in place; `cargo fuzz tmin`
 reduced it to an empty, non-crashing file, so it is not minimized further). Not fixed in this change; the fix is tracked separately.
 
+## Incremental bake and bake job steps, 2026-11-04
+
+Targets `incremental_bake` and `bake_job_steps` (layout in `fuzz/src/bake_world.rs`), nightly,
+`cargo-fuzz`, one libFuzzer worker per target, both targets concurrently, `-max_len=1024
+-rss_limit_mb=512`, `ASAN_OPTIONS=quarantine_size_mb=8` (the default quarantine reached the RSS
+limit within seconds). Seeds: 48 files from `seeds bake-job` plus the two inputs below.
+
+- First run, 11 executions: `incremental_bake` asserted. The defect was in the target's model
+  (the dirty box of a removed area volume used the wrong coordinate), not in the library;
+  fixed, and the input is a seed. `bake_job_steps` ran out of memory at 530 MB with the default
+  ASAN quarantine; the same input runs below the limit with the setting above.
+- Second run, 2,400 s each, then 600 s chunks on the same corpus. `incremental_bake`: 23,303
+  executions in the first 2,400 s, edges 6,568 to 6,570 (3,000 s), 6,572, 6,582, 6,588, then 0 new
+  edges in the chunk ending at 5,400 s. `bake_job_steps`: 17,175 executions, edges 6,942 to 6,945,
+  6,961, 6,965, 6,969, then 0 new in the chunk ending at 5,400 s. No crash, peak RSS 121 and
+  208 MB. 5,400 s = 90 CPU-minutes per target.
+
 ## `tile_state` and `tile_endian`, 2026-11-04
 
 Base commit `d30e372` plus the uncommitted tile state, byte-order and merge work. Toolchain: nightly,
