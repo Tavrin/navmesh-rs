@@ -326,6 +326,13 @@ impl Crowd {
             self.grid
                 .add_item(j as u16, [p[0] - r, p[2] - r, p[0] + r, p[2] + r])?;
         }
+        let all_candidates = self.fixes.contains(UpstreamFixes::NEAREST_NEIGHBOURS);
+        // One id slot per active agent holds every candidate a query can return.
+        let mut wide = if all_candidates {
+            ws.vec(self.active.len(), 0u16)?
+        } else {
+            Vec::new()
+        };
         for &i in &self.active {
             let a = &mut self.agents[i];
             if a.state != S::Walking {
@@ -342,7 +349,12 @@ impl Crowd {
             a.nneis = 0;
             let pos = a.npos;
             let height = a.params.height;
-            let mut ids = [0u16; 32];
+            let mut capped = [0u16; 32];
+            let ids: &mut [u16] = if all_candidates {
+                &mut wide
+            } else {
+                &mut capped
+            };
             let n = self.grid.query_items_in(
                 ws,
                 [
@@ -351,7 +363,7 @@ impl Crowd {
                     pos[0] + range,
                     pos[2] + range,
                 ],
-                &mut ids,
+                ids,
             )?;
             for &id in &ids[..n] {
                 let j = self.active[id as usize];
@@ -369,7 +381,15 @@ impl Crowd {
                     continue;
                 }
                 let a = &mut self.agents[i];
-                let at = insert_pos(&a.neis[..a.nneis], dist, |v| v.1);
+                let at = if all_candidates {
+                    // Candidates arrive in grid order: order by (distance, index).
+                    a.neis[..a.nneis]
+                        .iter()
+                        .position(|v| dist < v.1 || (dist == v.1 && j < v.0))
+                        .unwrap_or(a.nneis)
+                } else {
+                    insert_pos(&a.neis[..a.nneis], dist, |v| v.1)
+                };
                 if at < 6 {
                     let end = a.nneis.min(5);
                     a.neis.copy_within(at..end, at + 1);

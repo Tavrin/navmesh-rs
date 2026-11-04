@@ -16,7 +16,8 @@
 //! features: bit 0 switches the three span filters off, bit 1 gives triangle areas, bits 2-3
 //! count the area volumes, bit 4 enables strict triangulation, bit 5 turns detail sampling off,
 //! bit 6 sets tight per-tile limits from `[4]` and `[5]`, bit 7 moves the volume polygon to the
-//! second vertex; `[4]`, `[5]` limit and volume parameters; `[6]` vertex count; then the vertices
+//! second vertex; `[4]`, `[5]` limit and volume parameters (`[4]` bit 0 also enables the
+//! zero-sample-distance correction when detail sampling is off); `[6]` vertex count; then the vertices
 //! (12 bytes each when raw, otherwise three bytes scaled to 0..16, 0..8, 0..16) and the
 //! triangles, three bytes each (at most 128).
 use libfuzzer_sys::fuzz_target;
@@ -110,10 +111,14 @@ fn reference_tile(
         })?;
         t.charge((cfg.width as u64) * (cfg.height as u64), 0)?;
         let mut hf = t.stage(|ws| {
-            Heightfield::new(ws, cfg.width, cfg.height, cfg.bmin, cfg.bmax, cfg.cs, cfg.ch)
+            Heightfield::new(
+                ws, cfg.width, cfg.height, cfg.bmin, cfg.bmax, cfg.cs, cfg.ch,
+            )
         })?;
         if !tris.is_empty() {
-            t.stage(|ws| hf.rasterize_triangles(ws, input.verts, &tris, &areas, cfg.walkable_climb))?;
+            t.stage(|ws| {
+                hf.rasterize_triangles(ws, input.verts, &tris, &areas, cfg.walkable_climb)
+            })?;
         }
         if c.filter_low_hanging {
             t.stage(|ws| hf.filter_low_hanging_walkable_obstacles(ws, cfg.walkable_climb))?;
@@ -172,7 +177,12 @@ fn reference_tile(
             )
         })?;
         let (mut mesh, report) = t.stage(|ws| {
-            PolyMesh::build_with_report(ws, &contours, cfg.max_verts_per_poly, c.strict_triangulation)
+            PolyMesh::build_with_report(
+                ws,
+                &contours,
+                cfg.max_verts_per_poly,
+                c.strict_triangulation,
+            )
         })?;
         t.charge(mesh.areas.len() as u64, 0)?;
         for (a, f) in mesh.areas.iter_mut().zip(&mut mesh.flags) {
@@ -192,12 +202,13 @@ fn reference_tile(
             }
         }
         let detail = t.stage(|ws| {
-            PolyMeshDetail::build(
+            PolyMeshDetail::build_with_fixes(
                 ws,
                 &mesh,
                 &chf,
                 cfg.detail_sample_dist,
                 cfg.detail_sample_max_error,
+                c.fixes,
             )
         })?;
         if mesh.npolys == 0 {
@@ -213,9 +224,11 @@ fn reference_tile(
         params.nvp = mesh.nvp;
         params.detail_meshes = &detail.meshes;
         params.detail_verts = &detail.verts;
-        params.detail_verts_count = i32::try_from(detail.verts.len() / 3).map_err(|_| Error::SizeOverflow)?;
+        params.detail_verts_count =
+            i32::try_from(detail.verts.len() / 3).map_err(|_| Error::SizeOverflow)?;
         params.detail_tris = &detail.tris;
-        params.detail_tri_count = i32::try_from(detail.tris.len() / 4).map_err(|_| Error::SizeOverflow)?;
+        params.detail_tri_count =
+            i32::try_from(detail.tris.len() / 4).map_err(|_| Error::SizeOverflow)?;
         params.tile_x = x;
         params.tile_y = y;
         params.bmin = mesh.bmin;
@@ -336,6 +349,9 @@ fuzz_target!(|data: &[u8]| {
     cfg.strict_triangulation = features & 0x10 != 0;
     if features & 0x20 != 0 {
         cfg.recast.detail_sample_dist = 0.0;
+        if data[4] & 1 != 0 {
+            cfg.fixes = navmesh_rs::UpstreamFixes::ZERO_SAMPLE_DIST;
+        }
     }
     cfg.tile_limits.max_bytes = 8 << 20;
     cfg.tile_limits.max_work = 2_000_000;
@@ -343,7 +359,8 @@ fuzz_target!(|data: &[u8]| {
         // Spread the limits over the scale at which individual stages start to fail.
         cfg.tile_limits.max_bytes =
             (1 + usize::from(data[5] >> 4)) << (8 + usize::from(data[4] >> 4) % 14);
-        cfg.tile_limits.max_work = (1 + u64::from(data[4] & 15)) << (4 + u64::from(data[5] & 15) % 18);
+        cfg.tile_limits.max_work =
+            (1 + u64::from(data[4] & 15)) << (4 + u64::from(data[5] & 15) % 18);
     }
     let setup = Limits {
         max_bytes: 8 << 20,

@@ -138,7 +138,8 @@ Measured or read at the pin. Each item names what the port has to do.
    `updateSlicedFindPath` uses `getNode(ref, 0)`. On tiled meshes they return different corridors
    for the same request (measured: 30 of 64 pairs on the tiled dungeon, 17/64 on tiled nav_test,
    8/64 on the tiled small terrain, 2/32 on the seams case; 0 on all seven solo cases).
-   Parity is per function, never sliced-against-unsliced.
+   Parity is per function, never sliced-against-unsliced. `UpstreamFixes::SLICED_CROSS_SIDE`
+   makes the sliced search key like `findPath` (see "Corrections behind `UpstreamFixes`").
 6. **Random numbers** are caller-supplied (`float (*frand)()` in `findRandomPoint*`); the library
    holds no RNG state. The crowd has no randomness.
 7. **Allocation** goes through `rcAlloc`/`dtAlloc` hooks; results do not depend on addresses.
@@ -171,12 +172,57 @@ From the upstream tracker (109 open issues at the time of reading; 37 labelled `
 - `#501` obstacle stuck in `DT_OBSTACLE_REMOVING`; `#779` large tile size in the tile cache builds
   an incorrect navmesh (u8 layer dimensions).
 - `#445` `findStraightPath` overflowing caller arrays; `#438` sliced path finder bug report.
-- `#729` behaviour change inside the `#672` ledge-filter refactor (see Pin).
+- `#729` behaviour change inside the `#672` ledge-filter refactor (see Pin): analysed below, not
+  a defect.
 - `#421` request for double precision.
 
 Policy: where upstream has undefined behaviour or a crash, the port returns a typed error and
 the record notes the divergence; where upstream returns a wrong but defined result, the port
 matches it by default and an opt-in fix flag may correct it (see `docs/DESIGN.md`).
+
+## Corrections behind `UpstreamFixes`
+
+Every correction is a flag of `navmesh_rs::UpstreamFixes`, off in `UpstreamFixes::NONE` (the
+default on `BakeConfig`, `NavMeshQuery`, `Crowd` and `ObstacleAvoidanceQuery`). With no flag set
+the port reproduces the pin; `nav-port ... --fixes all|<names>` writes the corrected records, and
+`reference/determinism-fixes.golden` holds the digests that change under `all`.
+
+| Flag | Defect at the pin | With the flag |
+|---|---|---|
+| `SLICED_CROSS_SIDE` | `updateSlicedFindPath` keys nodes with `getNode(ref, 0)`; `findPath` keys by `(ref, crossSide)` (determinism item 5) | sliced search keys by `(ref, crossSide)`; plain and sliced agree. Also applies to the crowd's path queue |
+| `NEAREST_NEIGHBOURS` | `dtProximityGrid::queryItems` stops at `maxIds`, and the crowd passes a 32-entry buffer (`MAX_NEIS`): an agent with more than 32 candidates in range keeps the nearest of the first 32 in grid order, not the nearest overall (`#641`) | every candidate in range is collected (the grid walk is charged to the workspace) and the six nearest kept, ordered by (squared distance, agent slot) |
+| `ADAPTIVE_PATTERN` | even `adaptive_divs`: the last sample of each ring is written to slot `npat + 1` and slot `npat` is read unwritten (see "Adaptive sampling" in `docs/VERIFICATION.md`) | the sample is written to slot `npat`; every division count has a full ring |
+| `ZERO_SAMPLE_DIST` | `detailSampleDist == 0` leaves the hull empty and `triangulateHull` does not terminate (`#650`). The port terminates: a polygon with no hull gets no detail triangles | the hull is the polygon's own vertices, triangulated like any hull (what a zero sample distance asks for) |
+
+### `#729` / `#672` (ledge-span filter): not a defect, no flag
+
+`#672` rewrote `rcFilterLedgeSpans`; `#729` reports that the navmesh changed and says it is "not
+clear whether there are any correctness problems". The diff of `#672` (read from the pull
+request) differs from the old filter in four places. Three are equivalent and one is a
+deliberate boundary change:
+
+1. Out-of-bounds neighbour: old `minh = min(minh, -walkableClimb - bot)` and continue, new
+   `minh = -walkableClimb - 1` and stop. A span's `smax` is at least 1 (the rasterizer clamps
+   `smax` to `smin + 1` or more), so `bot >= 1` and `-walkableClimb - bot < -walkableClimb`
+   always: both mark the span a ledge.
+2. Gap below the first neighbour span: old `min(top, ntop) - max(bot, -walkableClimb)` with
+   `minh = -walkableClimb - bot`; new `min(top, ntop) - bot` with `minh = -walkableClimb - 1`.
+   The operands are equal for `bot >= 1` and both results are below `-walkableClimb`; only the
+   comparison differs, see (4).
+3. New `break` out of the neighbour-span loop on a drop below `-walkableClimb`: `minh` is
+   already below `-walkableClimb`, so the span is a ledge either way.
+4. Clearance test `> walkableHeight` became `>= walkableHeight` in all three places. This is the
+   only change in output: a neighbour column whose free gap is exactly `walkableHeight` cells.
+
+(4) makes the filter agree with the rest of the pipeline. `rcBuildCompactHeightfield` connects
+two spans when `top - bot >= walkableHeight` (`src/recast/compact.rs:178`) and
+`rcFilterWalkableLowHeightSpans` removes a span only when its clearance is `< walkableHeight`
+(`src/recast/heightfield.rs:556`). A gap of exactly `walkableHeight` is therefore traversable
+everywhere else, and the old `>` was the outlier: it ignored such a neighbour when looking for a
+drop. The corrected reading is the new code, so there is no wrong behaviour to opt out of;
+`tests/recast.rs::ledge_filter_treats_a_gap_of_exactly_walkable_height_as_traversable` pins the
+boundary. The `#729` reporter's own observation (one extra path point, a voxel that is no longer
+walkable) matches (4).
 
 ## Licence and attribution
 

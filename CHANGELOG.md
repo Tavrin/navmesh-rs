@@ -6,6 +6,27 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `UpstreamFixes`, a bit set of opt-in corrections for wrong but defined upstream behaviour.
+  `UpstreamFixes::NONE` is the default everywhere and reproduces upstream exactly. It is
+  carried by `BakeConfig::fixes`, `NavMeshQuery::set_fixes`, `PathQueue::set_fixes`,
+  `Crowd::set_fixes` and `ObstacleAvoidanceQuery::set_fixes`. Flags:
+  - `SLICED_CROSS_SIDE`: sliced A* keys nodes by (polygon, cross side) like the plain
+    search, so both return the same corridor on tiled meshes.
+  - `NEAREST_NEIGHBOURS`: the crowd keeps the nearest neighbours of an agent instead of the
+    nearest of the first 32 candidates in grid order.
+  - `ADAPTIVE_PATTERN`: adaptive velocity sampling with an even division count writes its
+    last ring sample in the right slot.
+  - `ZERO_SAMPLE_DIST`: a detail sample distance of zero builds the detail mesh from the
+    polygon hull instead of leaving polygons without detail triangles (upstream loops
+    forever there). Use `PolyMeshDetail::build_with_fixes`.
+- `CrowdAgent::neighbours`, the neighbours kept by the last update.
+- `nav-port --fixes` writes corrected records; `reference/determinism-fixes.golden` holds
+  the digests that change with every correction on.
+- Upstream issue 729 (ledge-filter rewrite) was analysed and is not a defect; the evidence
+  is in `reference/UPSTREAM.md`.
+
 ## [0.1.5] - 2026-11-03
 
 ### Fixed
