@@ -722,16 +722,22 @@ impl<'a> NavMeshQuery<'a> {
             None
         };
         let link = find(ft, fp, to.0)?;
+        // A link's edge index comes from the tile bytes: a landing link (edge 255)
+        // on a polygon that is not the connection's ground polygon, or a polygon of
+        // the wrong type, must end the lookup instead of indexing past the vertices.
         if fp.poly_type() == POLYTYPE_OFFMESH_CONNECTION {
-            let v = v3(&ft.verts[fp.verts[link.edge as usize] as usize * 3..]);
+            let v = v3(&ft.verts[*fp.verts.get(link.edge as usize)? as usize * 3..]);
             return Some((v, v));
         }
         if tp.poly_type() == POLYTYPE_OFFMESH_CONNECTION {
             let l = find(tt, tp, from.0)?;
-            let v = v3(&tt.verts[tp.verts[l.edge as usize] as usize * 3..]);
+            let v = v3(&tt.verts[*tp.verts.get(l.edge as usize)? as usize * 3..]);
             return Some((v, v));
         }
         let e = link.edge as usize;
+        if e >= fp.vert_count as usize {
+            return None;
+        }
         let v0 = fp.verts[e] as usize * 3;
         let v1 = fp.verts[(e + 1) % fp.vert_count as usize] as usize * 3;
         let mut left = v3(&ft.verts[v0..]);

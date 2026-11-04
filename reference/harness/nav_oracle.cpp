@@ -551,6 +551,8 @@ struct BuildOut {
     unsigned char* navData = nullptr;
     int navDataSize = 0;
     bool ok = false;
+    rcPolyMesh* pmesh = nullptr;       // kept when recording, owned by Baked afterwards
+    rcPolyMeshDetail* dmesh = nullptr;
 };
 
 rcConfig makeConfig(const Case& c) {
@@ -661,8 +663,14 @@ done:
     rcFreeHeightField(hf);
     rcFreeCompactHeightfield(chf);
     rcFreeContourSet(cset);
-    rcFreePolyMesh(pmesh);
-    rcFreePolyMeshDetail(dmesh);
+    if (record && out.ok) {
+        // Recording runs keep the meshes for the merge records (recordMergedMeshes).
+        out.pmesh = pmesh;
+        out.dmesh = dmesh;
+    } else {
+        rcFreePolyMesh(pmesh);
+        rcFreePolyMeshDetail(dmesh);
+    }
     return out;
 }
 
@@ -679,7 +687,14 @@ struct Baked {
     std::vector<TileKey> tileOrder;
     std::vector<std::vector<unsigned char>> tileBytes; // dtCreateNavMeshData output copies, before addTile
     TileCacheState* tc = nullptr;                     // tilecache mode only
+    // Recast meshes of a recording solo/tiled bake, one per built tile in row-major
+    // order, with the tile grid coordinates (merge records).
+    std::vector<rcPolyMesh*> keptPoly;
+    std::vector<rcPolyMeshDetail*> keptDetail;
+    std::vector<std::pair<int, int>> keptTile;
     ~Baked() {
+        for (rcPolyMesh* m : keptPoly) rcFreePolyMesh(m);
+        for (rcPolyMeshDetail* m : keptDetail) rcFreePolyMeshDetail(m);
         freeTileCacheState(tc);
         dtFreeNavMesh(nav);
     }
@@ -742,6 +757,7 @@ bool bake(const Case& c, const Geometry& g, bool record, int threads, Baked& out
         rcCalcGridSize(cfg.bmin, cfg.bmax, cfg.cs, &cfg.width, &cfg.height);
         rcContext ctx(false);
         BuildOut b = buildOne(&ctx, c, g, cfg, g.tris, 0, 0, record, "");
+        if (b.pmesh) { out.keptPoly.push_back(b.pmesh); out.keptDetail.push_back(b.dmesh); out.keptTile.push_back({0, 0}); }
         if (!b.ok || !b.navData) return false;
         out.tileOrder.push_back({0, 0, 0});
         out.tileBytes.emplace_back(b.navData, b.navData + b.navDataSize);
@@ -796,6 +812,13 @@ bool bake(const Case& c, const Geometry& g, bool record, int threads, Baked& out
         for (auto& th2 : pool) th2.join();
     }
     // Tiles are added in row-major order regardless of build order, so poly refs are stable.
+    for (size_t i = 0; i < coords.size(); ++i) {
+        if (results[i].pmesh) {
+            out.keptPoly.push_back(results[i].pmesh);
+            out.keptDetail.push_back(results[i].dmesh);
+            out.keptTile.push_back(coords[i]);
+        }
+    }
     for (size_t i = 0; i < coords.size(); ++i) {
         if (!results[i].ok) return false;
         if (!results[i].navData) continue;
@@ -1047,6 +1070,22 @@ bool bakeTileCache(const Case& c, const Geometry& g, bool record, Baked& out) {
                     Record r(lname);
                     r.s.u32((uint32_t)dataSize);
                     r.s.put(data, (size_t)dataSize);
+                }
+                if (record) {
+                    // dtTileCacheHeaderSwapEndian: native -> big-endian, back, and a bad magic.
+                    char ename[64];
+                    snprintf(ename, sizeof(ename), "layer_%d_%d_%d.layer_endian", x, y, i);
+                    Record r(ename);
+                    std::vector<unsigned char> d(data, data + dataSize);
+                    const bool ok1 = dtTileCacheHeaderSwapEndian(d.data(), (int)d.size());
+                    r.s.u8(ok1);
+                    r.s.put(d.data(), 56);
+                    std::vector<unsigned char> back = d;
+                    dtTileCacheHeaderSwapEndian(back.data(), (int)back.size());
+                    r.s.u8(back == std::vector<unsigned char>(data, data + dataSize));
+                    std::vector<unsigned char> bad(data, data + dataSize);
+                    bad[3] ^= 0x01;
+                    r.s.u8(dtTileCacheHeaderSwapEndian(bad.data(), (int)bad.size()));
                 }
                 if (dtStatusFailed(st.cache->addTile(data, dataSize, DT_COMPRESSEDTILE_FREE_DATA, 0))) {
                     dtFree(data);
@@ -1426,6 +1465,142 @@ dtNavMesh* cloneNavMesh(const Baked& b) {
     return nav;
 }
 
+uint64_t fnv1a64(const unsigned char* p, size_t n) {
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h;
+}
+
+// rcCopyPolyMesh, rcMergePolyMeshes and rcMergePolyMeshDetails over the meshes of
+// a solo or tiled bake (reference/RECORDS.md, "poly_mesh_copy" .. "merged_detail_mesh_block").
+void recordMergedMeshes(const Baked& b) {
+    if (b.keptPoly.empty()) return;
+    rcContext ctx(false);
+    {
+        rcPolyMesh* copy = rcAllocPolyMesh();
+        if (rcCopyPolyMesh(&ctx, *b.keptPoly[0], *copy)) {
+            Record r("poly_mesh_copy");
+            streamPolyMesh(r.s, *copy);
+            r.counts["polys"] = copy->npolys;
+        }
+        rcFreePolyMesh(copy);
+    }
+    // All meshes, then the up-to-2x2 block at the tile grid origin.
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<rcPolyMesh*> pm;
+        std::vector<rcPolyMeshDetail*> dm;
+        for (size_t i = 0; i < b.keptPoly.size(); ++i) {
+            if (pass == 1 && (b.keptTile[i].first >= 2 || b.keptTile[i].second >= 2)) continue;
+            pm.push_back(b.keptPoly[i]);
+            dm.push_back(b.keptDetail[i]);
+        }
+        if (pm.empty()) continue;
+        const char* suffix = pass == 0 ? "" : "_block";
+        rcPolyMesh* merged = rcAllocPolyMesh();
+        if (rcMergePolyMeshes(&ctx, pm.data(), (int)pm.size(), *merged)) {
+            Record r(std::string("merged_poly_mesh") + suffix);
+            streamPolyMesh(r.s, *merged);
+            r.counts["meshes"] = (long long)pm.size();
+            r.counts["polys"] = merged->npolys;
+        }
+        rcFreePolyMesh(merged);
+        rcPolyMeshDetail* md = rcAllocPolyMeshDetail();
+        if (rcMergePolyMeshDetails(&ctx, dm.data(), (int)dm.size(), *md)) {
+            Record r(std::string("merged_detail_mesh") + suffix);
+            streamDetail(r.s, *md);
+            r.counts["tris"] = md->ntris;
+        }
+        rcFreePolyMeshDetail(md);
+    }
+}
+
+// dtNavMeshHeaderSwapEndian / dtNavMeshDataSwapEndian on every tile's bytes
+// (little-endian host: native -> big-endian), with the round trip and two
+// rejected uses.
+void recordTileEndian(const Baked& b) {
+    if (b.tileBytes.empty()) return;
+    Record r("tile_endian");
+    r.s.u32((uint32_t)b.tileBytes.size());
+    for (size_t i = 0; i < b.tileBytes.size(); ++i) {
+        const std::vector<unsigned char>& src = b.tileBytes[i];
+        r.s.i32(b.tileOrder[i].x); r.s.i32(b.tileOrder[i].y); r.s.i32(b.tileOrder[i].layer);
+        r.s.u32((uint32_t)src.size());
+        std::vector<unsigned char> d = src; // to big-endian: data first, then the header
+        const bool dataOk = dtNavMeshDataSwapEndian(d.data(), (int)d.size());
+        const bool headerOk = dtNavMeshHeaderSwapEndian(d.data(), (int)d.size());
+        r.s.u8(dataOk); r.s.u8(headerOk);
+        r.s.put(d.data(), 100);
+        const uint64_t h = fnv1a64(d.data(), d.size());
+        r.s.u32((uint32_t)h); r.s.u32((uint32_t)(h >> 32));
+        std::vector<unsigned char> back = d; // and back: header first, then the data
+        dtNavMeshHeaderSwapEndian(back.data(), (int)back.size());
+        dtNavMeshDataSwapEndian(back.data(), (int)back.size());
+        r.s.u8(back == src);
+        std::vector<unsigned char> foreign = d; // data swap needs a native header
+        r.s.u8(dtNavMeshDataSwapEndian(foreign.data(), (int)foreign.size()));
+        std::vector<unsigned char> bad = src;
+        bad[3] ^= 0x01;
+        r.s.u8(dtNavMeshHeaderSwapEndian(bad.data(), (int)bad.size()));
+    }
+}
+
+// Tile state store/restore on a copy of the baked navmesh (the edits must not leak
+// into the later queries): sizes, blobs, edits, restores and four rejected blobs.
+void recordTileState(const Baked& b) {
+    dtNavMesh* nav = cloneNavMesh(b);
+    if (!nav) return;
+    Record r("tile_state");
+    const dtNavMesh* cnav = nav; // getTile(int) is public only on the const overload
+    std::vector<int> slots;
+    for (int i = 0; i < nav->getMaxTiles(); ++i) {
+        const dtMeshTile* t = cnav->getTile(i);
+        if (t && t->header) slots.push_back(i);
+    }
+    r.s.u32((uint32_t)slots.size());
+    for (int slot : slots) {
+        dtMeshTile* tile = const_cast<dtMeshTile*>(cnav->getTile(slot));
+        const dtPolyRef base = nav->getPolyRefBase(tile);
+        const int n = tile->header->polyCount;
+        const int size = nav->getTileStateSize(tile);
+        r.s.i32(tile->header->x); r.s.i32(tile->header->y); r.s.i32(tile->header->layer); r.s.i32(n);
+        r.s.u32((uint32_t)size);
+        // The pad byte of each polygon entry is uninitialised upstream: zero the buffers.
+        auto store = [&](std::vector<unsigned char>& buf) {
+            buf.assign((size_t)size, 0);
+            return nav->storeTileState(tile, buf.data(), size);
+        };
+        std::vector<unsigned char> a, edited, c, d, e;
+        const dtStatus s1 = store(a);
+        std::vector<unsigned char> small((size_t)size, 0);
+        const dtStatus s2 = nav->storeTileState(tile, small.data(), size - 1);
+        r.s.u32(s1); r.s.u32(s2);
+        r.s.put(a.data(), a.size());
+        for (int i = 0; i < n; ++i) {
+            nav->setPolyFlags(base | (dtPolyRef)i, (unsigned short)(0x5a5a ^ (i * 131)));
+            nav->setPolyArea(base | (dtPolyRef)i, (unsigned char)((i * 7 + 3) & 0x3f));
+        }
+        store(edited);
+        r.s.put(edited.data(), edited.size());
+        r.s.u32(nav->restoreTileState(tile, a.data(), size));
+        store(c);
+        r.s.put(c.data(), c.size());
+        r.s.u32(nav->restoreTileState(tile, edited.data(), size));
+        store(d);
+        r.s.put(d.data(), d.size());
+        std::vector<unsigned char> badMagic = a, badVersion = a, otherTile = a;
+        badMagic[0] ^= 0x01;
+        badVersion[4] ^= 0x01;
+        otherTile[8] ^= 0x01;
+        r.s.u32(nav->restoreTileState(tile, a.data(), size - 1));
+        r.s.u32(nav->restoreTileState(tile, badMagic.data(), size));
+        r.s.u32(nav->restoreTileState(tile, badVersion.data(), size));
+        r.s.u32(nav->restoreTileState(tile, otherTile.data(), size));
+        store(e);
+        r.s.put(e.data(), e.size());
+    }
+    dtFreeNavMesh(nav);
+}
+
 // Upstream's defined verdicts on malformed or conflicting tile data, on a fresh
 // navmesh with the baked navmesh's parameters. Only inputs whose upstream
 // behaviour is defined are used (header checks that run before any section is
@@ -1766,6 +1941,9 @@ int main(int argc, char** argv) {
                     if (!copy) { fprintf(stderr, "navmesh copy failed\n"); ok = false; }
                     else { recordCrowd(c, copy, b, CROWD_TILE_SWAP, 0); dtFreeNavMesh(copy); }
                 }
+                recordMergedMeshes(b);
+                recordTileEndian(b);
+                recordTileState(b);
                 recordMalformedTiles(b);
                 recordObstacles(c, b); // last: it rebuilds tiles of the baked navmesh
             }

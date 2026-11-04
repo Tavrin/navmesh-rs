@@ -355,6 +355,25 @@ impl Crowd {
     pub fn agent(&self, id: AgentId) -> Option<&CrowdAgent> {
         self.agents.get(id.0).filter(|a| a.active)
     }
+    /// The active agents in slot order (`dtCrowd::getActiveAgents`, without the
+    /// copy into a caller array).
+    pub fn active_agents(&self) -> impl Iterator<Item = &CrowdAgent> {
+        self.agents.iter().filter(|a| a.active)
+    }
+    /// Half extents of the box used to place agents on the navmesh
+    /// (`dtCrowd::getQueryHalfExtents`).
+    pub fn query_half_extents(&self) -> V3 {
+        self.extents
+    }
+    /// The proximity grid the last update filled with the active agents
+    /// (`dtCrowd::getGrid`).
+    pub fn grid(&self) -> &ProximityGrid {
+        &self.grid
+    }
+    /// The path queue that serves the agents' path requests (`dtCrowd::getPathQueue`).
+    pub fn path_queue(&self) -> &PathQueue {
+        &self.pathq
+    }
     fn agent_mut(&mut self, id: AgentId) -> Result<&mut CrowdAgent, Error> {
         self.agents
             .get_mut(id.0)

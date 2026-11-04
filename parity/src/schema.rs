@@ -22,13 +22,21 @@ pub const KINDS: &[&str] = &[
     "contours",
     "poly_mesh",
     "detail_mesh",
+    "poly_mesh_copy",
+    "merged_poly_mesh",
+    "merged_poly_mesh_block",
+    "merged_detail_mesh",
+    "merged_detail_mesh_block",
     "heightfield_layers",
     "layer_data",
+    "layer_endian",
     "layer_grid",
     "layer_regions",
     "layer_contours",
     "layer_poly_mesh",
     "navmesh_tiles",
+    "tile_endian",
+    "tile_state",
     "q_random_point",
     "q_nearest_poly",
     "q_query_polygons",
@@ -83,6 +91,11 @@ pub const RECAST_KINDS: &[&str] = &[
     "contours",
     "poly_mesh",
     "detail_mesh",
+    "poly_mesh_copy",
+    "merged_poly_mesh",
+    "merged_poly_mesh_block",
+    "merged_detail_mesh",
+    "merged_detail_mesh_block",
     "heightfield_layers",
 ];
 
@@ -97,6 +110,8 @@ pub fn is_recast(kind: &str) -> bool {
 pub fn is_detour_phase(kind: &str) -> bool {
     is_recast(kind)
         || kind == "navmesh_tiles"
+        || kind == "tile_endian"
+        || kind == "tile_state"
         || kind == "malformed_tiles"
         || kind.starts_with("q_")
 }
@@ -140,8 +155,18 @@ pub fn decode(kind: &str, c: &mut Cursor) -> DecodeResult<()> {
         "distance_field" => compact(c, true, false)?,
         "regions" => compact(c, false, true)?,
         "contours" => contours(c)?,
-        "poly_mesh" => poly_mesh(c)?,
-        "detail_mesh" => detail_mesh(c)?,
+        "poly_mesh" | "poly_mesh_copy" | "merged_poly_mesh" | "merged_poly_mesh_block" => {
+            poly_mesh(c)?
+        }
+        "detail_mesh" | "merged_detail_mesh" | "merged_detail_mesh_block" => detail_mesh(c)?,
+        "tile_endian" => tile_endian(c)?,
+        "tile_state" => tile_state(c)?,
+        "layer_endian" => {
+            c.u8("swap_ok")?;
+            c.bytes("be_header", 56)?;
+            c.u8("roundtrip_equal")?;
+            c.u8("bad_magic_accepted").map(drop)?
+        }
         "heightfield_layers" => heightfield_layers(c)?,
         "layer_data" => layer_data(c)?,
         "layer_grid" => layer_grid(c)?,
@@ -581,6 +606,55 @@ fn navmesh_tiles(c: &mut Cursor) -> DecodeResult<()> {
         c.i32("layer")?;
         let len = c.count_u32("len", 1)?;
         c.group("data", |c| dnav(c, len))
+    })
+}
+
+/// `tile_endian`: per tile, upstream's byte-order conversion of the tile bytes.
+fn tile_endian(c: &mut Cursor) -> DecodeResult<()> {
+    let n = c.count_u32("tile_count", 28)?;
+    c.array("tiles", n, |c, _| {
+        c.i32("x")?;
+        c.i32("y")?;
+        c.i32("layer")?;
+        c.u32("len")?;
+        c.u8("data_swap_ok")?;
+        c.u8("header_swap_ok")?;
+        c.bytes("be_header", 100)?;
+        c.u32("digest_lo")?;
+        c.u32("digest_hi")?;
+        c.u8("roundtrip_equal")?;
+        c.u8("data_swap_on_foreign_header_ok")?;
+        c.u8("header_swap_on_bad_magic_ok").map(drop)
+    })
+}
+
+/// `tile_state`: per tile, `getTileStateSize`, `storeTileState` and
+/// `restoreTileState` statuses and blobs (see `reference/RECORDS.md`).
+fn tile_state(c: &mut Cursor) -> DecodeResult<()> {
+    let n = c.count_u32("tile_count", 44)?;
+    c.array("tiles", n, |c, _| {
+        c.i32("x")?;
+        c.i32("y")?;
+        c.i32("layer")?;
+        c.i32("poly_count")?;
+        let size = c.count_u32("size", 1)?;
+        c.u32("store_status")?;
+        c.u32("store_small_status")?;
+        c.bytes("stored", size)?;
+        c.bytes("stored_after_edit", size)?;
+        c.u32("restore_original_status")?;
+        c.bytes("after_restore_original", size)?;
+        c.u32("restore_edited_status")?;
+        c.bytes("after_restore_edited", size)?;
+        for name in [
+            "restore_short_status",
+            "restore_magic_status",
+            "restore_version_status",
+            "restore_other_tile_status",
+        ] {
+            c.u32(name)?;
+        }
+        c.bytes("after_rejected", size).map(drop)
     })
 }
 

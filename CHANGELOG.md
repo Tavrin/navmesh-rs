@@ -26,6 +26,45 @@ All notable changes to this project are documented in this file. The format foll
   the digests that change with every correction on.
 - Upstream issue 729 (ledge-filter rewrite) was analysed and is not a defect; the evidence
   is in `reference/UPSTREAM.md`.
+- `PolyMesh::merge`, `PolyMesh::copy` and `PolyMeshDetail::merge`
+  (`rcMergePolyMeshes`, `rcCopyPolyMesh`, `rcMergePolyMeshDetails`), compared with the
+  C++ driver on the corpus: a copy of the first mesh, and merges of all tile meshes and of
+  the tiles in the 2 x 2 block at the grid origin. Inputs upstream would read out of bounds
+  (a vertex index past the mesh, differing `nvp`, a result over 65,535 vertices or polygons)
+  are typed errors.
+- `NavMesh::tile_state_size`, `store_tile_state` and `restore_tile_state`
+  (`getTileStateSize`, `storeTileState`, `restoreTileState`): polygon flags and areas per
+  tile, byte-identical blobs, untrusted blobs checked completely before the tile changes
+  (`Error::InvalidTileState(TileStateError)`: too short, wrong magic, wrong version, other
+  tile).
+- Big-endian tile data: `detour::nav_mesh_header_swap_endian` and
+  `nav_mesh_data_swap_endian` (`dtNavMeshHeaderSwapEndian`, `dtNavMeshDataSwapEndian`) and
+  `tilecache::tile_cache_header_swap_endian` (`dtTileCacheHeaderSwapEndian`). Output is
+  byte-identical to upstream's on every corpus tile and layer; the counts in a header are
+  checked against the buffer before anything is swapped. `nav_mesh_swap_off_mesh_user_ids`
+  (not in recastnavigation) converts the off-mesh `user_id` that upstream's body swap skips.
+- `Heightfield::rasterize_triangles_u16` and `rasterize_triangle_soup` (the other two
+  overloads of `rcRasterizeTriangles`), `detour::detail_tri_edge_flags`
+  (`dtGetDetailTriEdgeFlags`), and `Crowd::active_agents`, `query_half_extents`, `grid` and
+  `path_queue` (`getActiveAgents`, `getQueryHalfExtents`, `getGrid`, `getPathQueue`).
+- Record kinds `poly_mesh_copy`, `merged_poly_mesh[_block]`, `merged_detail_mesh[_block]`,
+  `tile_state`, `tile_endian` and `layer_endian` in the oracle driver, the port driver and
+  the comparator; fuzz targets `tile_state` and `tile_endian`.
+- `docs/VERIFICATION.md` lists the upstream public API that is intentionally not ported.
+
+### Fixed
+
+- `NavMeshQuery::portal_points` (and so `find_path` and the other searches that take a
+  portal) indexed a polygon's six vertices with the edge of a link read from tile bytes. A
+  tile that the reader accepts but whose BV tree reaches a polygon typed as an off-mesh
+  connection gets a landing link with edge 255 on it, and the lookup panicked with an
+  out-of-bounds index. Found by the new `tile_endian` fuzz target; the same tile bytes
+  reached it in 0.1.0 to 0.1.5. The lookup now ends with a typed error. Results for every
+  valid tile are unchanged.
+
+### Changed
+
+- `Error` has a new variant, `InvalidTileState` (the enum is `#[non_exhaustive]`).
 
 ## [0.1.5] - 2026-11-03
 

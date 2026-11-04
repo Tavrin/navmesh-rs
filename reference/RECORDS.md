@@ -122,11 +122,17 @@ or points for the first two) and hold one entry per pair; `status` is the raw `d
 | `contours` | per contour: region, area, simplified and raw vertices (4 ints each) |
 | `poly_mesh` | vertices (u16×3), per polygon: vertex and neighbour slots, region, flags, area |
 | `detail_mesh` | sub-meshes (u32×4), vertices (f32×3), triangles (u8×4) |
+| `poly_mesh_copy` | solo and tiled: `rcCopyPolyMesh` of the first built tile's polygon mesh, in the `poly_mesh` layout |
+| `merged_poly_mesh`, `merged_poly_mesh_block` | solo and tiled: `rcMergePolyMeshes` of every tile's polygon mesh (row-major, empty tiles included), and of the tiles with x < 2 and y < 2; `poly_mesh` layout |
+| `merged_detail_mesh`, `merged_detail_mesh_block` | `rcMergePolyMeshDetails` of the same two selections; `detail_mesh` layout |
 | `heightfield_layers` | tile cache: `rcBuildHeightfieldLayers` output, per layer bounds, extents, height range and the height, area and connection grids |
 | `layer_data` | tile cache: the layer bytes added to the cache (`dtBuildTileCacheLayer` output) |
 | `layer_grid` | tile cache: the decompressed layer (header fields, heights, areas, connections) |
 | `layer_regions`, `layer_contours`, `layer_poly_mesh` | tile cache: `dtBuildTileCacheRegions`, `dtBuildTileCacheContours` and `dtBuildTileCachePolyMesh` output; the poly mesh after the area and flag mapping |
+| `layer_endian` | tile cache, per layer: `dtTileCacheHeaderSwapEndian` on the layer bytes (ok flag, the 56 swapped header bytes), whether swapping back restores the bytes, and whether a header with a corrupted magic is accepted |
 | `navmesh_tiles` | tile count; per tile in add order: tile x, y, layer, byte length, `dtCreateNavMeshData` bytes |
+| `tile_endian` | per tile of `navmesh_tiles`: `dtNavMeshDataSwapEndian` then `dtNavMeshHeaderSwapEndian` (little-endian to big-endian): ok flags, the 100 swapped header bytes, FNV-1a 64 of the whole swapped tile (low, high `u32`), whether header swap then data swap restores the bytes, whether the data swap accepts a big-endian header, whether the header swap accepts a corrupted magic |
+| `tile_state` | per resident tile of a copy of the navmesh: x, y, layer, polygon count, `getTileStateSize`; `storeTileState` status and, into a buffer one byte short, status; the stored blob; the blob after every polygon's flags and area were set to fixed patterns; `restoreTileState` of the original blob (status, blob read back), of the edited blob (status, blob read back), then the statuses of four rejected restores (one byte short, wrong magic, wrong version, other tile ref) and the blob read back after them. Buffers are zeroed first because upstream leaves the pad byte of each polygon entry uninitialised |
 | `q_random_point` | `findRandomPoint` status, ref, point, for `queries + 1` points |
 | `q_nearest_poly` | `findNearestPoly` from each point offset by (0.37, 1, -0.21), extents (2, 4, 2): status, ref, point, over-poly flag |
 | `q_query_polygons` | `queryPolygons` over the same box: status, refs (max 64) |
@@ -200,10 +206,10 @@ record's kind walks both payloads and names the field that holds the first diffe
 example `tiles[3].data.polys[17].neis[2]: 5 vs 6`). Every payload is decoded even when both sides
 agree (`--no-validate` skips that), so a payload that does not match its kind's layout fails.
 `--crowd-tolerance` applies the crowd rule above to `crowd_*` records. `--recast` compares only
-the Recast record kinds (`geometry` through `detail_mesh`, and `heightfield_layers`), so a port
+the Recast record kinds (`geometry` through `detail_mesh`, the copy and merge kinds, and `heightfield_layers`), so a port
 file holding those stages can be compared with a full oracle file. `--crowd` selects only the eight crowd trajectory kinds, including their full corridors.
 `--detour` adds
-`navmesh_tiles`, `malformed_tiles` and every `q_*` kind (the Recast and Detour phases, without
+`navmesh_tiles`, `tile_endian`, `tile_state`, `malformed_tiles` and every `q_*` kind (the Recast and Detour phases, without
 crowd, tile-cache layer and obstacle records). Two files that both state
 `polyref_bits` may state different widths: each file is decoded at its own width (absent: 32) and
 records that carry poly refs are compared by decoded value, while every other record compares

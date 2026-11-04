@@ -541,3 +541,23 @@ fn contour_build_requires_successful_region_build() {
     ws.set_limits(Limits::default());
     assert!(build_contours(&mut ws, &l, 4, 1.3).is_err());
 }
+
+#[test]
+fn layer_headers_convert_between_byte_orders() {
+    let native = data(3);
+    let mut big = native.clone();
+    tile_cache_header_swap_endian(&mut big).unwrap();
+    assert_eq!(&big[..4], &LAYER_MAGIC.to_be_bytes());
+    assert_eq!(&big[8..12], &3i32.to_be_bytes());
+    assert_eq!(&big[LAYER_HEADER_SIZE..], &native[LAYER_HEADER_SIZE..]);
+    assert!(
+        LayerHeader::decode(&big).is_err(),
+        "decoding wants little-endian"
+    );
+    tile_cache_header_swap_endian(&mut big).unwrap();
+    assert_eq!(big, native);
+    let mut bad = native.clone();
+    bad[4] ^= 1;
+    assert!(tile_cache_header_swap_endian(&mut bad).is_err());
+    assert!(tile_cache_header_swap_endian(&mut native[..55].to_vec()).is_err());
+}

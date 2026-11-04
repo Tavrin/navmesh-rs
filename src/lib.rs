@@ -154,7 +154,7 @@ mod budget;
 mod common;
 mod fixes;
 pub use budget::{Budget, Budgeted, Progress};
-pub use common::{Error, Limits, TileDataError, Usage, Workspace};
+pub use common::{Error, Limits, TileDataError, TileStateError, Usage, Workspace};
 pub use fixes::UpstreamFixes;
 
 #[cfg(feature = "recast")]

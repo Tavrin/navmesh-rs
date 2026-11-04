@@ -28,6 +28,8 @@ pub enum Error {
     InvalidRef,
     /// Navmesh tile bytes are malformed.
     InvalidTileData(TileDataError),
+    /// Stored tile state (polygon flags and areas) was rejected.
+    InvalidTileState(TileStateError),
     /// A tile already occupies the tile location.
     TileSlotOccupied,
     /// The navmesh has no free tile slot (or the requested slot is in use).
@@ -41,6 +43,21 @@ pub enum Error {
     },
     /// An output buffer is too small.
     BufferTooSmall,
+}
+
+/// Why stored tile state was rejected on restore.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TileStateError {
+    /// The buffer is shorter than the tile's state needs.
+    TooShort,
+    /// The magic number is not `'DNMS'`.
+    WrongMagic,
+    /// The version is not 1.
+    WrongVersion,
+    /// The state was stored for a different tile (or a different incarnation of the
+    /// same slot): its tile ref does not equal the tile's current ref.
+    WrongTile,
 }
 
 /// Why navmesh tile bytes were rejected.
@@ -79,6 +96,7 @@ impl fmt::Display for Error {
             Error::Failed => f.write_str("query failed"),
             Error::InvalidRef => f.write_str("invalid reference"),
             Error::InvalidTileData(r) => write!(f, "invalid tile data: {r:?}"),
+            Error::InvalidTileState(r) => write!(f, "invalid tile state: {r:?}"),
             Error::TileSlotOccupied => f.write_str("tile location already occupied"),
             Error::NoFreeTile => f.write_str("no free tile slot"),
             Error::PartialTriangulation {

@@ -26,11 +26,13 @@
     clippy::neg_cmp_op_on_partial_ord,
     clippy::manual_clamp,
     clippy::needless_late_init,
+    clippy::chunks_exact_to_as_chunks,
     // `PolyRef` is u32 or u64 by feature; its casts are no-ops at one width.
     clippy::unnecessary_cast
 )]
 
 mod builder;
+mod endian;
 pub(crate) mod math;
 mod navmesh;
 mod node;
@@ -40,6 +42,9 @@ mod resumable;
 mod tile;
 
 pub use builder::{NavMeshCreateParams, create_nav_mesh_data, create_nav_mesh_data_f32};
+pub use endian::{
+    nav_mesh_data_swap_endian, nav_mesh_header_swap_endian, nav_mesh_swap_off_mesh_user_ids,
+};
 pub use navmesh::{NavMesh, NavMeshParams};
 pub use query::{
     DefaultFilter, NavMeshQuery, QueryFilter, RaycastHit, SegmentWall, StraightPathPoint,
@@ -50,7 +55,7 @@ pub use resumable::{
 };
 pub use tile::{BvNode, Link, MeshHeader, MeshTile, OffMeshConnection, Poly, PolyDetail};
 
-use crate::{Error, TileDataError};
+use crate::{Error, TileDataError, TileStateError};
 
 /// A polygon reference: salt, tile index and polygon index packed as upstream does.
 #[cfg(feature = "polyref64")]
@@ -71,6 +76,11 @@ pub const NAVMESH_MAGIC: i32 =
     (b'D' as i32) << 24 | (b'N' as i32) << 16 | (b'A' as i32) << 8 | b'V' as i32;
 /// Tile data version.
 pub const NAVMESH_VERSION: i32 = 7;
+/// Tile state magic (`'DNMS'`).
+pub const NAVMESH_STATE_MAGIC: i32 =
+    (b'D' as i32) << 24 | (b'N' as i32) << 16 | (b'M' as i32) << 8 | b'S' as i32;
+/// Tile state version.
+pub const NAVMESH_STATE_VERSION: i32 = 1;
 /// Neighbour flag for an edge on a tile border.
 pub const EXT_LINK: u16 = 0x8000;
 /// End of a link list.
@@ -99,6 +109,17 @@ pub const FINDPATH_ANY_ANGLE: u32 = 0x02;
 pub const RAYCAST_USE_COSTS: u32 = 0x01;
 /// Detail triangle edge flag: the edge lies on the polygon boundary.
 pub const DETAIL_EDGE_BOUNDARY: i32 = 0x01;
+/// Flags of one edge of a detail triangle (`dtGetDetailTriEdgeFlags`): the two bits
+/// for the edge that starts at vertex `edge_index` (0 for AB, 1 for BC, 2 for CA)
+/// of the triangle whose fourth byte is `tri_flags`. Bit 0 of the result is
+/// [`DETAIL_EDGE_BOUNDARY`]. An `edge_index` of 4 or more gives 0 (upstream
+/// computes the same for 4 to 15 and shifts out of range beyond).
+pub const fn detail_tri_edge_flags(tri_flags: u8, edge_index: usize) -> u8 {
+    if edge_index >= 4 {
+        return 0;
+    }
+    (tri_flags >> (edge_index * 2)) & 0x3
+}
 /// Any-angle raycast length limit, as a multiple of the agent radius.
 pub const RAY_CAST_LIMIT_PROPORTIONS: f32 = 50.0;
 
@@ -159,6 +180,8 @@ pub fn status_of(e: &Error) -> Status {
                 Error::Failed => 0,
                 Error::InvalidTileData(TileDataError::WrongMagic) => Status::WRONG_MAGIC,
                 Error::InvalidTileData(TileDataError::WrongVersion) => Status::WRONG_VERSION,
+                Error::InvalidTileState(TileStateError::WrongMagic) => Status::WRONG_MAGIC,
+                Error::InvalidTileState(TileStateError::WrongVersion) => Status::WRONG_VERSION,
                 Error::TileSlotOccupied => Status::ALREADY_OCCUPIED,
                 Error::NoFreeTile | Error::AllocationFailed | Error::LimitExceeded => {
                     Status::OUT_OF_MEMORY

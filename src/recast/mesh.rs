@@ -259,6 +259,239 @@ impl PolyMesh {
         mesh.flags = ws.vec(mesh.npolys as usize, 0u16)?;
         Ok((mesh, report))
     }
+
+    /// Checks that the counts are non-negative and the arrays hold at least what
+    /// the counts say; returns `(nverts, npolys, nvp)`.
+    fn checked_layout(&self) -> Result<(usize, usize, usize), Error> {
+        let nverts = usize::try_from(self.nverts)
+            .map_err(|_| Error::InvalidInput("negative vertex count"))?;
+        let npolys = usize::try_from(self.npolys)
+            .map_err(|_| Error::InvalidInput("negative polygon count"))?;
+        let nvp = usize::try_from(self.nvp)
+            .ok()
+            .filter(|n| (1..=0xffff).contains(n))
+            .ok_or(Error::InvalidInput("vertices per polygon"))?;
+        let vert_len = nverts.checked_mul(3).ok_or(Error::SizeOverflow)?;
+        let poly_len = npolys
+            .checked_mul(nvp)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or(Error::SizeOverflow)?;
+        if self.verts.len() < vert_len
+            || self.polys.len() < poly_len
+            || self.regs.len() < npolys
+            || self.areas.len() < npolys
+            || self.flags.len() < npolys
+        {
+            return Err(Error::InvalidInput(
+                "polygon mesh arrays shorter than counts",
+            ));
+        }
+        Ok((nverts, npolys, nvp))
+    }
+
+    /// Copies the mesh into new, exactly sized arrays (`rcCopyPolyMesh`).
+    ///
+    /// `maxpolys` of the copy is the polygon count, as upstream sets it. Arrays
+    /// that are longer than the counts say (the over-allocation a build leaves)
+    /// are trimmed; arrays that are shorter are rejected as
+    /// [`Error::InvalidInput`], where upstream would read out of bounds.
+    pub fn copy(&self, ws: &mut Workspace) -> Result<PolyMesh, Error> {
+        ws.begin();
+        let (nverts, npolys, nvp) = self.checked_layout()?;
+        let vert_len = nverts * 3;
+        let poly_len = npolys * nvp * 2;
+        ws.work(u64::try_from(vert_len + poly_len + npolys * 3).map_err(|_| Error::SizeOverflow)?)?;
+        let mut verts = ws.vec_with_capacity::<u16>(vert_len)?;
+        verts.extend_from_slice(&self.verts[..vert_len]);
+        let mut polys = ws.vec_with_capacity::<u16>(poly_len)?;
+        polys.extend_from_slice(&self.polys[..poly_len]);
+        let mut regs = ws.vec_with_capacity::<u16>(npolys)?;
+        regs.extend_from_slice(&self.regs[..npolys]);
+        let mut areas = ws.vec_with_capacity::<u8>(npolys)?;
+        areas.extend_from_slice(&self.areas[..npolys]);
+        let mut flags = ws.vec_with_capacity::<u16>(npolys)?;
+        flags.extend_from_slice(&self.flags[..npolys]);
+        Ok(PolyMesh {
+            verts,
+            polys,
+            regs,
+            flags,
+            areas,
+            nverts: self.nverts,
+            npolys: self.npolys,
+            maxpolys: self.npolys,
+            nvp: self.nvp,
+            bmin: self.bmin,
+            bmax: self.bmax,
+            cs: self.cs,
+            ch: self.ch,
+            border_size: self.border_size,
+            max_edge_error: self.max_edge_error,
+        })
+    }
+
+    /// Merges polygon meshes that share one grid into one mesh
+    /// (`rcMergePolyMeshes`), for example the per-tile meshes of a tiled build.
+    ///
+    /// The meshes must agree on `nvp`; cell size, cell height and the `nvp` of the
+    /// result come from the first mesh. Vertices within the same cell column and
+    /// two cells of height are welded, neighbour links are rebuilt across the
+    /// seams, and a tile's portal flags survive only on the sides that are also
+    /// the outer boundary of the merged bounds. The result's `border_size` and
+    /// `max_edge_error` are 0 and `maxpolys` is 0, as upstream leaves them.
+    ///
+    /// An empty list gives an empty mesh. Differences from upstream, which would
+    /// read out of bounds or wrap: a polygon vertex index at or past its mesh's
+    /// vertex count, `nvp` that differs between meshes, a cell offset outside
+    /// `0..=65535`, or a result with more than 65,535 vertices or polygons is an
+    /// error ([`Error::InvalidInput`], [`Error::FormatLimit`]).
+    pub fn merge(ws: &mut Workspace, meshes: &[&PolyMesh]) -> Result<PolyMesh, Error> {
+        ws.begin();
+        let mut mesh = PolyMesh::default();
+        let Some(first) = meshes.first() else {
+            return Ok(mesh);
+        };
+        mesh.nvp = first.nvp;
+        mesh.cs = first.cs;
+        mesh.ch = first.ch;
+        mesh.bmin = first.bmin;
+        mesh.bmax = first.bmax;
+        if !(mesh.cs > 0.0 && mesh.cs.is_finite()) {
+            return Err(Error::InvalidInput("cell size"));
+        }
+        let mut max_verts = 0usize;
+        let mut max_polys = 0usize;
+        let mut max_verts_per_mesh = 0usize;
+        let mut nvp_u = 0usize;
+        for m in meshes {
+            let (nv, np, nvp) = m.checked_layout()?;
+            if m.nvp != first.nvp {
+                return Err(Error::InvalidInput("meshes differ in vertices per polygon"));
+            }
+            nvp_u = nvp;
+            if !m.bmin.iter().chain(&m.bmax).all(|x| x.is_finite()) {
+                return Err(Error::InvalidInput("non-finite mesh bounds"));
+            }
+            for a in 0..3 {
+                if m.bmin[a] < mesh.bmin[a] {
+                    mesh.bmin[a] = m.bmin[a];
+                }
+                if m.bmax[a] > mesh.bmax[a] {
+                    mesh.bmax[a] = m.bmax[a];
+                }
+            }
+            max_verts_per_mesh = max_verts_per_mesh.max(nv);
+            max_verts = max_verts.checked_add(nv).ok_or(Error::SizeOverflow)?;
+            max_polys = max_polys.checked_add(np).ok_or(Error::SizeOverflow)?;
+        }
+        let slots = max_polys
+            .checked_mul(2)
+            .and_then(|n| n.checked_mul(nvp_u))
+            .ok_or(Error::SizeOverflow)?;
+        ws.work(u64::try_from(slots.saturating_add(max_verts)).map_err(|_| Error::SizeOverflow)?)?;
+        mesh.verts = ws.vec(max_verts.checked_mul(3).ok_or(Error::SizeOverflow)?, 0u16)?;
+        mesh.polys = ws.vec(slots, MESH_NULL_IDX)?;
+        mesh.regs = ws.vec(max_polys, 0u16)?;
+        mesh.areas = ws.vec(max_polys, 0u8)?;
+        mesh.flags = ws.vec(max_polys, 0u16)?;
+        let mut next_vert = ws.vec(max_verts, 0i32)?;
+        let mut first_vert = ws.vec(VERTEX_BUCKET_COUNT, -1i32)?;
+        let mut vremap = ws.vec(max_verts_per_mesh, 0u16)?;
+        let mut nverts = 0usize;
+        let mut npolys = 0usize;
+
+        let cell_offset = |d: f32, cs: f32| -> Result<u16, Error> {
+            let c = crate::common::floorf(d / cs + 0.5);
+            if (0.0..=65535.0).contains(&c) {
+                Ok(c as u16)
+            } else {
+                Err(Error::InvalidInput("mesh offset outside the merged bounds"))
+            }
+        };
+        for pmesh in meshes {
+            let ox = cell_offset(pmesh.bmin[0] - mesh.bmin[0], mesh.cs)?;
+            let oz = cell_offset(pmesh.bmin[2] - mesh.bmin[2], mesh.cs)?;
+            let is_min_x = ox == 0;
+            let is_min_z = oz == 0;
+            let is_max_x = cell_offset(mesh.bmax[0] - pmesh.bmax[0], mesh.cs).is_ok_and(|c| c == 0);
+            let is_max_z = cell_offset(mesh.bmax[2] - pmesh.bmax[2], mesh.cs).is_ok_and(|c| c == 0);
+            let is_on_border = is_min_x || is_min_z || is_max_x || is_max_z;
+
+            let pn = pmesh.nverts as usize;
+            for (j, remap) in vremap.iter_mut().enumerate().take(pn) {
+                let v = &pmesh.verts[j * 3..j * 3 + 3];
+                let x = u32::from(v[0]) + u32::from(ox);
+                let z = u32::from(v[2]) + u32::from(oz);
+                if x > 0xffff || z > 0xffff {
+                    return Err(Error::FormatLimit("merged vertex outside the 16-bit grid"));
+                }
+                *remap = add_vertex(
+                    x as u16,
+                    v[1],
+                    z as u16,
+                    &mut mesh.verts,
+                    &mut first_vert,
+                    &mut next_vert,
+                    &mut nverts,
+                );
+            }
+            if nverts > 0xffff {
+                return Err(Error::FormatLimit(
+                    "merged mesh has more than 65535 vertices",
+                ));
+            }
+            for j in 0..pmesh.npolys as usize {
+                let tgt_base = npolys * 2 * nvp_u;
+                let src = &pmesh.polys[j * 2 * nvp_u..(j + 1) * 2 * nvp_u];
+                mesh.regs[npolys] = pmesh.regs[j];
+                mesh.areas[npolys] = pmesh.areas[j];
+                mesh.flags[npolys] = pmesh.flags[j];
+                npolys += 1;
+                let tgt = &mut mesh.polys[tgt_base..tgt_base + 2 * nvp_u];
+                for k in 0..nvp_u {
+                    if src[k] == MESH_NULL_IDX {
+                        break;
+                    }
+                    let s = usize::from(src[k]);
+                    if s >= pn {
+                        return Err(Error::InvalidInput("polygon vertex index out of range"));
+                    }
+                    tgt[k] = vremap[s];
+                }
+                if is_on_border {
+                    for k in nvp_u..nvp_u * 2 {
+                        if src[k] & 0x8000 != 0 && src[k] != 0xffff {
+                            let keep = match src[k] & 0xf {
+                                0 => is_min_x,
+                                1 => is_max_z,
+                                2 => is_max_x,
+                                3 => is_min_z,
+                                _ => false,
+                            };
+                            if keep {
+                                tgt[k] = src[k];
+                            }
+                        }
+                    }
+                }
+            }
+            if npolys > 0xffff {
+                return Err(Error::FormatLimit(
+                    "merged mesh has more than 65535 polygons",
+                ));
+            }
+        }
+        mesh.nverts = nverts as i32;
+        mesh.npolys = npolys as i32;
+        build_mesh_adjacency(ws, &mut mesh.polys, npolys, nverts, nvp_u)?;
+        // Welding leaves unused tail room; keep exactly what the counts say.
+        mesh.verts.truncate(nverts * 3);
+        mesh.polys.truncate(npolys * 2 * nvp_u);
+        mesh.regs.truncate(npolys);
+        mesh.areas.truncate(npolys);
+        mesh.flags.truncate(npolys);
+        Ok(mesh)
+    }
 }
 
 const VERTEX_BUCKET_COUNT: usize = 1 << 12;
