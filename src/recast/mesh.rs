@@ -7,6 +7,7 @@ use crate::{Error, Workspace};
 
 /// Partial ear-clipping counts (not in recastnavigation).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TriangulationReport {
     /// Contours producing fewer than n-2 triangles.
     pub failed_contours: usize,

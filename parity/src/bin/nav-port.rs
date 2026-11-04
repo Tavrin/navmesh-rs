@@ -6,6 +6,7 @@
 //! nav-port bake  <case-file> --records FILE
 //! nav-port digest <case-file>              # record digests, for the determinism check
 //! nav-port bake|digest <case-file> --fixes all|none|<flag,flag>   # upstream corrections (default none)
+//! nav-port verify-connectivity <case-file> # labels and coverage vs raw-link flood fill
 //! nav-port bench <case-file> [--repeat N]
 //! nav-port verify-parallel <case-file>       # requires parallel feature
 //! nav-port bench-tiles <case-file> --threads N [--repeat N]
@@ -28,6 +29,8 @@ use navmesh_rs::tilecache::{
     self as tc, MeshProcess, ObstacleShape, RawCompressor, TileCache, TileCacheParams,
 };
 use navmesh_rs::{Error, Limits, Workspace};
+#[path = "../connectivity_check.rs"]
+mod connectivity_check;
 mod tilecache_records {
     include!("../tilecache_records.rs");
 }
@@ -2211,7 +2214,7 @@ fn parse_fixes(list: &str) -> Result<navmesh_rs::UpstreamFixes, String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | bench <case> [--repeat N] | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
+    let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | bench <case> [--repeat N] | verify-connectivity <case> | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
     let (cmd, case_path) = match (args.first(), args.get(1)) {
         (Some(a), Some(b)) => (a.as_str(), b.as_str()),
         _ => return Err(usage.into()),
@@ -2293,6 +2296,13 @@ fn run() -> Result<(), String> {
                 t0.elapsed().as_secs_f64() * 1000.0
             );
             Ok(())
+        }
+        "verify-connectivity" => {
+            let baked = bake(&case, &g, &mut Sink { writer: None }).map_err(|e| e.to_string())?;
+            if baked.tiles.is_empty() {
+                return Ok(());
+            }
+            connectivity_check::verify(assemble(&baked).map_err(|e| e.to_string())?)
         }
         "bench" => {
             let repeat: usize = opt("--repeat").and_then(|v| v.parse().ok()).unwrap_or(1);

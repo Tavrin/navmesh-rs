@@ -155,3 +155,10 @@ path = "fuzz_targets/residency_record.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "connectivity_ops"
+path = "fuzz_targets/connectivity_ops.rs"
+test = false
+doc = false
+bench = false

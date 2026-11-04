@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in per-job and per-tile bake reports (`JobOptions::reports`, `BakeJob::report`):
+  coverage, span-filter transitions, discarded small regions, area histograms,
+  triangulation, local islands and retained tile failures.
+- `connectivity`: epoch-scoped local/world weak-component labels with incremental
+  affected-component relabeling, directed seed coverage and budgeted typed path
+  diagnoses, including filter cuts, unloaded frontiers and resource exhaustion.
+- Optional `serde` serialization for reports; plain report structs remain available
+  with `no_std` and `alloc`. The diagnostic field contract starts at schema version 1.
+- `connectivity_ops` model-checking fuzz target.
+
 ## [0.2.0] - 2026-11-04
 
 ### Added

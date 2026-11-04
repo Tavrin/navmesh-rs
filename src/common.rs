@@ -6,6 +6,7 @@ use core::fmt;
 /// Why a call failed.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Error {
     /// A parameter is out of its valid range (the message names it).
     InvalidParameter(&'static str),
@@ -57,6 +58,7 @@ pub enum Error {
 /// Why stored tile state was rejected on restore.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum TileStateError {
     /// The buffer is shorter than the tile's state needs.
     TooShort,
@@ -73,6 +75,7 @@ pub enum TileStateError {
 /// Why navmesh tile bytes were rejected.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum TileDataError {
     /// The magic number is not `'DNAV'`.
     WrongMagic,
@@ -223,6 +226,7 @@ pub struct Workspace {
     /// Set only by the crate's own pipelines while every compact field they pass
     /// to a stage was built by this crate and not exposed to caller edits since.
     compact_trusted: bool,
+    pub(crate) regions_removed_small: u32,
     /// Checked at every work charge when present.
     cancel: Option<CancelToken>,
 }
@@ -239,6 +243,7 @@ impl Workspace {
             limits,
             usage: Usage::default(),
             compact_trusted: false,
+            regions_removed_small: 0,
             cancel: None,
         }
     }

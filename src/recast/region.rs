@@ -690,6 +690,7 @@ fn merge_and_filter_regions(
             }
         }
         if span_count < min_region_area && !connects_to_border {
+            ws.regions_removed_small = ws.regions_removed_small.saturating_add(trace.len() as u32);
             for &t in &trace {
                 regions[t].span_count = 0;
                 regions[t].id = 0;
@@ -1149,6 +1150,9 @@ fn merge_and_filter_layer_regions(
             let reg = regions[i].id;
             for r in regions.iter_mut() {
                 if r.id == reg {
+                    if reg != 0 {
+                        ws.regions_removed_small = ws.regions_removed_small.saturating_add(1);
+                    }
                     r.id = 0;
                 }
             }

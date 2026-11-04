@@ -192,6 +192,11 @@ impl<'a> NavMeshQuery<'a> {
         self.fixes = fixes;
     }
 
+    /// Configured search node capacity.
+    pub fn max_nodes(&self) -> u16 {
+        self.node_pool.nodes.len() as u16
+    }
+
     /// The corrections this query applies.
     pub fn fixes(&self) -> UpstreamFixes {
         self.fixes
@@ -1012,6 +1017,36 @@ impl<'a> NavMeshQuery<'a> {
                 .filter(|n| n.flags & NODE_CLOSED != 0)
                 .map(|n| n.id),
         )
+    }
+
+    pub(crate) fn diagnostic_frontier(&self, budget: &mut Budget) -> Option<Vec<TileKey>> {
+        if !self.nav.has_unloaded() {
+            return Some(Vec::new());
+        }
+        let mut out = Vec::new();
+        for node in self.node_pool.used() {
+            if !budget.spend(1) {
+                return None;
+            }
+            if node.flags & NODE_CLOSED == 0 {
+                continue;
+            }
+            let Ok((tile, poly)) = self.nav.tile_and_poly_by_ref(node.id) else {
+                continue;
+            };
+            let ip = self.nav.decode_poly_id_poly(node.id) as usize;
+            for edge in 0..usize::from(poly.vert_count) {
+                if !budget.spend(1) {
+                    return None;
+                }
+                if let EdgeKind::UnloadedBorder(key) = self.nav.edge_kind(tile, ip, edge) {
+                    out.push(key);
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Some(out)
     }
 
     /// [`NavMeshQuery::find_path`] that also returns the frontier (not in
