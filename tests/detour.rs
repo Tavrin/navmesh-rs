@@ -745,6 +745,8 @@ fn dijkstra_takes_geometric_detour_with_zero_cost_links() {
 /// Tile bytes that `NavMesh::new_single` accepts, where a polygon typed as an off-mesh
 /// connection carries a landing link (edge 255) that is out of range for its vertices.
 /// Path queries over every polygon pair must end the lookup instead of indexing past them.
+/// The bytes are a 64-bit reference tile (16-byte links), so the test needs `polyref64`.
+#[cfg(feature = "polyref64")]
 #[test]
 fn landing_link_edge_on_a_misplaced_off_mesh_polygon_is_not_indexed() {
     #[rustfmt::skip]
