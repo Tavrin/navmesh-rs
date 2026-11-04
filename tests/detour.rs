@@ -546,6 +546,16 @@ fn global_off_mesh_links_resolve_in_any_tile_and_survive_remove_and_re_add() {
                 nav.add_tile(far_link_tile(x)).unwrap();
             }
             assert!(far_path_found(&nav, 0.0, 10.0) && far_path_found(&nav, 10.0, 0.0));
+            let saved_ref = nav.tile_ref(nav.tiles_at(removed, 0, 1)[0]);
+            let unloaded = nav.unload_tile(saved_ref).expect("unload global endpoint");
+            assert!(!far_path_found(&nav, 0.0, 10.0));
+            let prepared = detour::prepare_tile(&params, nav.limits(), unloaded.bytes)
+                .expect("prepare global endpoint");
+            assert_eq!(
+                nav.commit_with_state(prepared, &unloaded.state),
+                Ok(saved_ref)
+            );
+            assert!(far_path_found(&nav, 0.0, 10.0) && far_path_found(&nav, 10.0, 0.0));
             remove_at(&mut nav, removed);
             nav.add_tile(far_link_tile(removed)).unwrap();
             assert!(

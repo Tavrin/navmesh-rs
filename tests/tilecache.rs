@@ -561,3 +561,87 @@ fn layer_headers_convert_between_byte_orders() {
     assert!(tile_cache_header_swap_endian(&mut bad).is_err());
     assert!(tile_cache_header_swap_endian(&mut native[..55].to_vec()).is_err());
 }
+
+#[test]
+fn layers_with_obstacles_stream_out_and_back_with_their_obstacles() {
+    use navmesh_rs::detour::RefState;
+    let mut c = TileCache::new(
+        params(4),
+        RawCompressor,
+        DefaultMeshProcess,
+        Limits::default(),
+    )
+    .expect("valid streaming fixture");
+    let mut n = nav(4);
+    let a = c.add_tile(data(0)).expect("valid streaming fixture");
+    let b = c.add_tile(data(1)).expect("valid streaming fixture");
+    c.build_nav_mesh_tile(a, &mut n)
+        .expect("valid streaming fixture");
+    c.build_nav_mesh_tile(b, &mut n)
+        .expect("valid streaming fixture");
+    // One obstacle across the seam carves both layers.
+    let plain = c
+        .build_tile_data(b)
+        .expect("valid streaming fixture")
+        .expect("valid streaming fixture");
+    let o = c
+        .add_obstacle(ObstacleShape::Box {
+            bmin: [5.0, 0.0, 2.0],
+            bmax: [12.0, 3.0, 6.0],
+        })
+        .expect("valid streaming fixture");
+    drain(&mut c, &mut n);
+    let carved = c
+        .build_tile_data(b)
+        .expect("valid streaming fixture")
+        .expect("valid streaming fixture");
+    assert_ne!(carved, plain);
+    assert_eq!(
+        c.remove_tile(b),
+        Err(Error::InvalidParameter("tile has obstacle work"))
+    );
+    let nav_b = n.tile_ref(n.tile_index_at(1, 0, 0).expect("valid streaming fixture"));
+
+    // Unload both sides: the obstacle stays, associated with layer a only.
+    let bytes = c.unload_tile(b).expect("valid streaming fixture");
+    n.unload_tile(nav_b).expect("valid streaming fixture");
+    assert_eq!(
+        c.obstacle(o).expect("valid streaming fixture").state(),
+        ObstacleState::Processed
+    );
+    assert_eq!(
+        n.ref_state(nav_b),
+        RefState::Unloaded(navmesh_rs::detour::TileKey { x: 1, y: 0 })
+    );
+
+    // Load again: the obstacle is re-associated, the rebuild reproduces the carved
+    // tile, and the navmesh tile returns with the same refs.
+    let b2 = c.load_tile(bytes).expect("valid streaming fixture");
+    drain(&mut c, &mut n);
+    assert_eq!(
+        c.build_tile_data(b2)
+            .expect("valid streaming fixture")
+            .expect("valid streaming fixture"),
+        carved
+    );
+    assert_eq!(n.ref_state(nav_b), RefState::Valid);
+    // Removing the obstacle now updates both layers.
+    c.remove_obstacle(o).expect("valid streaming fixture");
+    drain(&mut c, &mut n);
+    assert!(c.obstacle(o).is_none());
+    assert_eq!(
+        c.build_tile_data(b2)
+            .expect("valid streaming fixture")
+            .expect("valid streaming fixture"),
+        plain
+    );
+    let bytes = c.unload_tile(b2).expect("unload without obstacles");
+    let old = n.tile_ref(n.tile_index_at(1, 0, 0).expect("resident tile"));
+    n.unload_tile(old).expect("unload navmesh tile");
+    c.load_tile(bytes).expect("reload without obstacles");
+    drain(&mut c, &mut n);
+    assert!(
+        n.tile_index_at(1, 0, 0).is_some(),
+        "an obstacle-free reload is rebuilt too"
+    );
+}

@@ -1009,9 +1009,59 @@ fn assemble(b: &Baked) -> Result<NavMesh, Error> {
             for (_, _, _, d) in &b.tiles {
                 nav.add_tile(d.clone())?;
             }
+            if std::env::var_os("NAV_PORT_STREAMED").is_some() {
+                restream(&mut nav, params)?;
+            }
             Ok(nav)
         }
     }
+}
+
+/// `NAV_PORT_STREAMED=1`: unloads every tile in slot order and commits them again,
+/// prepared off the navmesh, in the same order. Every record must stay equal to
+/// the oracle's (the streaming invariant: identical content keeps refs and links).
+/// With `NAV_PORT_STREAMED=timing`, prints the wall time of each `prepare_tile` and
+/// `commit_with_state` (p50, p99, max) and the resident bytes per tile to stderr.
+fn restream(nav: &mut NavMesh, params: &NavMeshParams) -> Result<(), Error> {
+    let timing = std::env::var("NAV_PORT_STREAMED").is_ok_and(|v| v == "timing");
+    let mut unloaded = Vec::new();
+    for i in 0..nav.max_tiles() as usize {
+        if nav.tile(i).is_some() {
+            unloaded.push(nav.unload_tile(nav.tile_ref(i))?);
+        }
+    }
+    let (mut prep, mut comm, mut bytes) = (Vec::new(), Vec::new(), Vec::new());
+    for u in unloaded {
+        let t0 = std::time::Instant::now();
+        let t = detour::prepare_tile(params, nav.limits(), u.bytes)?;
+        let t1 = std::time::Instant::now();
+        bytes.push(t.resident_bytes());
+        let commit_start = std::time::Instant::now();
+        nav.commit_with_state(t, &u.state)?;
+        let commit_elapsed = commit_start.elapsed().as_nanos();
+        prep.push((t1 - t0).as_nanos());
+        comm.push(commit_elapsed);
+    }
+    if timing && !prep.is_empty() {
+        let q = |v: &mut Vec<u128>, p: usize| {
+            v.sort_unstable();
+            v[(v.len() - 1) * p / 100] as f64 / 1000.0
+        };
+        bytes.sort_unstable();
+        eprintln!(
+            "restream: {} tiles; prepare_tile us p50 {:.1} p99 {:.1} max {:.1}; commit us p50 {:.1} p99 {:.1} max {:.1}; resident bytes/tile p50 {} max {}",
+            prep.len(),
+            q(&mut prep, 50),
+            q(&mut prep, 99),
+            q(&mut prep, 100),
+            q(&mut comm, 50),
+            q(&mut comm, 99),
+            q(&mut comm, 100),
+            bytes[bytes.len() / 2],
+            bytes[bytes.len() - 1],
+        );
+    }
+    Ok(())
 }
 
 /// The oracle's xorshift32 point generator.
@@ -1408,9 +1458,11 @@ fn record_tile_state(b: &Baked, sink: &mut Sink) -> Result<(), Error> {
         let mut small = vec![0u8; size];
         let r = nav.store_tile_state(tref, &mut small[..size - 1]);
         p.u32(s1).u32(st(&r, |_| Status::OK)).bytes(&a);
-        for i in 0..n as PolyRef {
-            nav.set_poly_flags(base | i, (0x5a5au32 ^ (i as u32).wrapping_mul(131)) as u16)?;
-            nav.set_poly_area(base | i, ((i as u32 * 7 + 3) & 0x3f) as u8)?;
+        for i in 0..n {
+            let r = base | i as PolyRef;
+            let index = i as u32;
+            nav.set_poly_flags(r, (0x5a5au32 ^ index.wrapping_mul(131)) as u16)?;
+            nav.set_poly_area(r, ((index * 7 + 3) & 0x3f) as u8)?;
         }
         let (_, edited) = store(&nav)?;
         p.bytes(&edited);
@@ -1461,7 +1513,20 @@ fn record_malformed(b: &Baked, nav: &NavMesh, sink: &mut Sink) {
     let add =
         |p: &mut Payload, fresh: &mut NavMesh, code: u32, d: Vec<u8>, last: PolyRef| -> PolyRef {
             // Upstream's addTile(lastRef): the stale-ref restore of case 8.
-            let r = if last == 0 {
+            let r = if last == 0 && std::env::var_os("NAV_PORT_STREAMED").is_some() {
+                // Check acceptance through preparation independently. Preserve
+                // add_tile's diagnostic precedence in the oracle record: an
+                // occupied location can hide a later byte-validation error.
+                let mut streamed = fresh.clone();
+                let prepared = detour::prepare_tile(fresh.params(), fresh.limits(), d.clone())
+                    .and_then(|t| streamed.commit(t));
+                let added = fresh.add_tile(d);
+                assert_eq!(prepared.is_ok(), added.is_ok());
+                if let (Ok(a), Ok(b)) = (&prepared, &added) {
+                    assert_eq!(a, b);
+                }
+                added
+            } else if last == 0 {
                 fresh.add_tile(d)
             } else {
                 fresh.restore_tile_allow_stale(d, last)

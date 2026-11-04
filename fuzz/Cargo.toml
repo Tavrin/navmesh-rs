@@ -119,3 +119,24 @@ path = "fuzz_targets/tile_endian.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "stream_ops"
+path = "fuzz_targets/stream_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "prepared_tile"
+path = "fuzz_targets/prepared_tile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "residency_record"
+path = "fuzz_targets/residency_record.rs"
+test = false
+doc = false
+bench = false

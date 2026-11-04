@@ -597,6 +597,87 @@ adds links for pairs of tiles that upstream does not resolve.
 - The records were produced on one machine; a second machine and a CI job that rebuilds the
   driver are not set up.
 
+## Tile streaming
+
+Streaming (`SlotPolicy`, `prepare_tile`, `commit*`, `unload_tile`, `ref_state`, `epoch`,
+residency records) is not in recastnavigation, so it has no oracle of its own. What is
+checked, and how:
+
+| Claim | Evidence |
+|---|---|
+| A ref is `Valid` iff its slot holds committed content with the hash it was issued for | `tests/streaming.rs` (`identical_reload_...`, soak against a model), fuzz `stream_ops` (model check after every operation) |
+| No sequence makes a `Stale` ref valid again (unload, other content, removal, forgotten reservation, residency restore) | same tests and fuzz target; salts only grow and `Stale` means an older salt |
+| `prepare_tile` + `commit` accept and reject exactly what `add_tile` does | fuzz `prepared_tile` (same verdict and error, same ref and tile), `tests/streaming.rs`, malformed-tile records through the prepared path (below) |
+| A navmesh whose tiles were all unloaded and committed again answers exactly as the one-shot build | `nav-parity diff` with `NAV_PORT_STREAMED=1` over the corpus (below) and `streamed_navmesh_answers_like_a_one_shot_build` (keyed slots) |
+| Resumable searches and sliced A* never read refs of a tile unloaded under them | `resumable_searches_stop_when_a_touched_tile_goes`, fuzz `stream_ops` |
+| Residency records are untrusted input | fuzz `residency_record`, every truncation and byte flip in `tests/streaming.rs` |
+| State cannot be applied to different content with a coincidentally equal initial ref | fresh-mesh, truncated-footer, trailing-byte and damaged-footer regressions in `state_and_budgeted_commits_are_all_or_nothing`; damaged-hash operations in fuzz `stream_ops` |
+| Keyed stacked layers break query ties like canonical sequential installation | `keyed_layer_ties_match_canonical_sequential_queries`, before and after eviction/reload |
+
+`NAV_PORT_STREAMED=1` unloads every tile of a tiled case and commits it again
+from `prepare_tile` with its saved state before all query records. Malformed-tile
+cases independently assert identical acceptance through the prepared path while
+recording `add_tile`'s oracle-compatible diagnostic precedence. A byte error and
+an occupied location can coexist; preparation cannot inspect the live mesh.
+Fresh validation receipts are retained separately from the public source tree.
+
+The complete 21-case corpus passes in both reference widths: **76,544 records
+equal in plain mode and 76,544 equal after streaming**, with no mismatches.
+The existing 3,116 determinism digests and 27 corrected-record digests match the
+unchanged golden files. The generated 8 x 8 grid soak runs 4,000 model operations
+per slot policy and reference width (16,000 total), including 573 unloads and
+492 identical reloads per configuration. Four pinned residency digests cover
+these streaming scenarios. Both-width tests, all-feature and no-std Clippy with
+warnings denied, formatting, rustdoc and public-text checks return zero.
+
+Streaming timings use a release build with 64-bit polygon references and Rust
+1.99.1 on an x86-64 AMD Ryzen 9 7945HX. Three process runs produce six restream
+samples per configuration on the generated large terrain. Values below are the
+range of each sample's p99;
+these are shared-machine observations, not an isolated throughput guarantee.
+
+| Tile side (cells) | Tiles | Prepare p50 / p99 (µs) | Commit with state p50 / p99 (µs) | Largest commit (µs) | Resident bytes/tile median / max |
+|---|---:|---|---|---:|---|
+| 64 | 2,681 | 2.4 / 3.6 | 2.4 / 3.6–4.7 | 29.7 | 1,940 / 9,348 |
+| 256 | 195 | 3.6–4.7 / 8.3 | 4.8–5.9 / 9.5–11.9 | 40.4 | 10,116 / 27,132 |
+
+The registered 256-cell commit p99 target of at most 100 µs is met in every
+sample. The owner-thread measurement includes saved-state validation/restoration.
+
+Deliberate shapes: a tile-cache layer streams back with `TileCache::load_tile`, not
+`add_tile`, so `add_tile` keeps upstream's behaviour (an added layer does not pick up
+existing obstacles). The nearest-polygon diagnostic for an unloaded column is
+`NavMesh::unloaded_column_at`, a separate call. A crowd agent whose target is unloaded when
+the request is made waits where it stands; one whose target unloads on the way walks the
+resident part of its corridor. A route cut by an unloaded intermediate corridor
+column waits at its resident prefix too; sliced searches that reach a known
+unloaded border report it and the crowd waits for that column before replanning.
+
+Decisions and reversal costs:
+
+- Keep the DNAV salt/slot/polygon encoding and default sequential order. A new
+  ref format would change tile links and stored refs; changing this after release
+  requires a format migration. Salt wrap and deliberate hash collisions remain
+  the documented limits of this representation.
+- Keyed grids allocate slot pages on demand, retaining history after eviction.
+  Residency capacity remains caller-configured. Column traversal visits descending
+  layers, matching sequential lookup after canonical ascending-layer installation.
+  Page size is an internal choice; traversal order is part of query determinism.
+- Parse, hash and build internal links during preparation; commit rebases those
+  links and connects resident neighbours. Locking and snapshots remain caller
+  choices; a future installer can call `commit_budgeted` from `detour` without
+  changing `bake::TileInstaller`.
+- Residency version 2 records polygon layout as well as ref width and slot
+  policy. Restore is single-use even before commit, preventing history rewind.
+  Changing the blob later requires a versioned decoder.
+- Unload state adds a versioned 16-byte content-hash footer to the ordinary tile
+  state prefix. `commit_with_state` requires that identity even on a fresh mesh;
+  ordinary `store_tile_state` bytes remain unchanged. Future unload-state format
+  changes need a versioned decoder too.
+- Tile-cache `load_tile` restores obstacle associations and always queues a
+  rebuild, including obstacle-free layers. `add_tile` retains oracle behaviour;
+  merging these entry points would change existing callers' update timing.
+
 ## Mesh merging, tile state and byte order
 
 Seven record kinds (see `reference/RECORDS.md`) compare these upstream functions with the port on

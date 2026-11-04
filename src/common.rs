@@ -43,6 +43,11 @@ pub enum Error {
     },
     /// An output buffer is too small.
     BufferTooSmall,
+    /// A tile lies outside a keyed navmesh's grid (not in recastnavigation).
+    TileOutsideGrid,
+    /// A resumable or sliced search was continued after a tile it had touched was
+    /// unloaded or removed (not in recastnavigation); restart the search.
+    MeshChanged,
 }
 
 /// Why stored tile state was rejected on restore.
@@ -57,6 +62,7 @@ pub enum TileStateError {
     WrongVersion,
     /// The state was stored for a different tile (or a different incarnation of the
     /// same slot): its tile ref does not equal the tile's current ref.
+    /// Streaming unload blobs also reject a mismatching content hash.
     WrongTile,
 }
 
@@ -107,6 +113,8 @@ impl fmt::Display for Error {
                 "partial triangulation: {failed_contours} contours, {missing_triangles} missing triangles"
             ),
             Error::BufferTooSmall => f.write_str("buffer too small"),
+            Error::TileOutsideGrid => f.write_str("tile outside the keyed grid"),
+            Error::MeshChanged => f.write_str("navmesh changed under the search"),
         }
     }
 }

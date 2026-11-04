@@ -52,6 +52,36 @@ pub fn sample_tile() -> Vec<u8> {
     .unwrap_or_default()
 }
 
+/// Tile bytes of a 10 x 10 quad at tile `(x, y)` of a 10-unit grid whose four
+/// sides are portals, so neighbouring quads link. `variant` changes the polygon
+/// flags (and so the content hash) without changing the geometry.
+pub fn grid_quad(x: i32, y: i32, variant: u8) -> Vec<u8> {
+    const N: u16 = 0xffff;
+    let polys = [0, 1, 2, 3, N, N, 0x8000, 0x8001, 0x8002, 0x8003, N, N];
+    let (ox, oz) = (x as f32 * 10.0, y as f32 * 10.0);
+    detour::create_nav_mesh_data(&NavMeshCreateParams {
+        verts: &[0u16, 0, 0, 0, 0, 10, 10, 0, 10, 10, 0, 0],
+        vert_count: 4,
+        polys: &polys,
+        poly_flags: &[1 + u16::from(variant)],
+        poly_areas: &[0],
+        poly_count: 1,
+        nvp: 6,
+        tile_x: x,
+        tile_y: y,
+        bmin: [ox, 0.0, oz],
+        bmax: [ox + 10.0, 1.0, oz + 10.0],
+        walkable_height: 2.0,
+        walkable_radius: 0.5,
+        walkable_climb: 0.5,
+        cs: 1.0,
+        ch: 1.0,
+        build_bv_tree: true,
+        ..Default::default()
+    })
+    .unwrap_or_default()
+}
+
 /// Runs a few queries between points derived from the first tile's bounds.
 pub fn exercise_queries(nav: &NavMesh) {
     let Some(t) = (0..nav.max_tiles() as usize).find_map(|i| nav.tile(i)) else {

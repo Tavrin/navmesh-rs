@@ -92,6 +92,11 @@ impl NodePool {
     }
 
     /// A new empty pool with this pool's node and hash sizes.
+    /// The nodes in use.
+    pub fn used(&self) -> &[Node] {
+        &self.nodes[..self.count.min(self.nodes.len())]
+    }
+
     pub fn same_shape(&self) -> Result<NodePool, Error> {
         NodePool::new(self.max_nodes, self.first.len())
     }

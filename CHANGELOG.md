@@ -51,6 +51,43 @@ All notable changes to this project are documented in this file. The format foll
   `tile_state`, `tile_endian` and `layer_endian` in the oracle driver, the port driver and
   the comparator; fuzz targets `tile_state` and `tile_endian`.
 - `docs/VERIFICATION.md` lists the upstream public API that is intentionally not ported.
+- Tile streaming with stable polygon refs (not in recastnavigation):
+  - `SlotPolicy` and `NavMesh::with_policy`: `Sequential` (upstream's free list, the
+    default) or `Keyed`, where tile (x, y, layer) always takes the same slot of a grid, so
+    refs do not depend on load order or session. Keyed slot pages are allocated as tiles
+    reach them.
+  - `prepare_tile` parses, validates, hashes and builds internal links on any thread (`PreparedTile`);
+    `NavMesh::commit`, `commit_budgeted` (all or nothing against `commit_cost`, returns
+    `Committed`) and `commit_with_state` link it on the owner thread.
+  - `NavMesh::unload_tile` evicts a tile but keeps its slot and salt and returns
+    `UnloadedTile` (bytes, tile state, `content_hash`). Committing the same content makes
+    every ref into it valid again; other content increments the salt. `forget_unloaded`
+    drops the reservation.
+    The unload state carries a versioned hash footer, so `commit_with_state` rejects
+    other content even in a fresh mesh with a matching initial ref. The ordinary
+    `store_tile_state` format is unchanged.
+  - `NavMesh::ref_state` returns `RefState::{Valid, Unloaded(TileKey), Stale, Invalid}`;
+    a stale ref never becomes valid again (except through `restore_tile_allow_stale`).
+  - `NavMesh::mark_known`, `is_column_unloaded`, `unloaded_column_at`, `has_unloaded`;
+    `NavMeshQuery::find_path_report` returns the unloaded columns the search reached, and
+    `find_path` sets the new `Status::UNLOADED_BORDER` with a partial result there.
+    `RaycastHit::edge` (`EdgeKind::{None, Wall, UnloadedBorder, WorldEdge}`).
+  - `NavMesh::epoch` and `changed_since`, a structural change counter with a log of the
+    last `REMOVAL_LOG_CAPACITY` (256) removals. Resumable searches and sliced A* now fail
+    with `Error::MeshChanged` (`Status::MESH_CHANGED`) when a tile they touched was
+    unloaded or removed since the last step, instead of reading stale refs; additions are
+    allowed.
+  - `NavMesh::residency` / `restore_residency` and `ResidencyRecord::{to_bytes,
+    from_bytes}` (validated untrusted blob): refs saved with a record stay valid in a later
+    session when the same tiles are committed.
+  - Crowd: `TargetState::WaitingForTile` and `CrowdAgent::waiting_tile`. An agent whose
+    target or intermediate corridor tile is unloaded follows the resident part of its corridor to the
+    border and replans when the tile returns; `request_move_target` accepts an unloaded
+    target.
+  - `TileCache::unload_tile` (allowed with obstacle associations) and `load_tile`
+    (re-associates live obstacles over the layer and queues its rebuild).
+  - `nav-port` with `NAV_PORT_STREAMED=1` unloads and recommits every tile before the
+    queries; fuzz targets `stream_ops`, `prepared_tile`, `residency_record`.
 
 ### Fixed
 
@@ -65,6 +102,15 @@ All notable changes to this project are documented in this file. The format foll
 ### Changed
 
 - `Error` has a new variant, `InvalidTileState` (the enum is `#[non_exhaustive]`).
+- Breaking: `RaycastHit` is `#[non_exhaustive]` and has a new field `edge`; build values
+  with `RaycastHit::default()`.
+- `Error` has new variants `TileOutsideGrid` and `MeshChanged`; `TargetState` has
+  `WaitingForTile`; `Status` has detail bits `UNLOADED_BORDER` and `MESH_CHANGED`.
+- Resumable searches and sliced A* check the navmesh between steps (see above). Before,
+  resuming after a tile removal was documented as unsupported and read stale refs.
+- `NavMesh` keeps each tile behind a `Box` and its slots in pages; `NavMesh::with_limits`
+  is `with_policy(.., SlotPolicy::Sequential)`. Refs, links and every parity record are
+  unchanged.
 
 ## [0.1.5] - 2026-11-03
 
