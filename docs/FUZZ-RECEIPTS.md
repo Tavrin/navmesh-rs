@@ -560,3 +560,10 @@ merged in (the merge touched the bake path and error variants only); `crowd_upda
 | `trusted_bake` | 12 | 135,046 | 6,030 | cap reached (still gaining a few edges per chunk, as in the 0.1.2 campaign) |
 
 No crash, timeout, leak or assertion failure in any chunk.
+
+## `connectivity_ops`, 2026-11-05
+
+Bounded edit sequences on a keyed grid; incremental weak labels and directed coverage must equal
+independent flood fills of the resident links, including atomic budget refusal. Started from an empty
+corpus, `-rss_limit_mb=512`, `-max_len=4096`, AddressSanitizer: five 600 s chunks on one core,
+674475 executions, coverage 2,251 → 2,297 → 2,304 → 2,313 → 2,313 (the fifth chunk added none). No crash.

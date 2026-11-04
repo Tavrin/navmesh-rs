@@ -22,6 +22,8 @@ pub struct JobOptions {
     /// [`BakeJob::run_parallel_chunk`]. `0` means twice the worker count. A serial
     /// [`BakeJob::step`] always has one tile in flight.
     pub max_in_flight: usize,
+    /// Collect per-tile bake telemetry; disabled by default.
+    pub reports: bool,
 }
 
 /// One finished tile of a [`BakeJob`] (not in recastnavigation).
@@ -59,6 +61,7 @@ struct Plan<'p, S> {
     cfg: &'p BakeConfig,
     grid: &'p GridLayout,
     config_hash: u64,
+    reports: bool,
 }
 
 impl<S: GeometrySource> Plan<'_, S> {
@@ -91,7 +94,7 @@ impl<S: GeometrySource> Plan<'_, S> {
     ) -> Result<TileTask<'static>, Error> {
         let tile_cfg = self.grid.tile_config(self.cfg, key)?;
         let (verts, areas, mode) = fetched.triangles.into_parts();
-        Ok(TileTask::new(
+        let mut task = TileTask::new(
             self.cfg,
             &tile_cfg,
             key.x,
@@ -101,26 +104,46 @@ impl<S: GeometrySource> Plan<'_, S> {
             VolumeRef::from_sink(fetched.volumes),
             OffMesh::Owned(fetched.off_mesh),
             Some(cancel.clone()),
-        ))
+        );
+        if self.reports {
+            task.enable_report();
+        }
+        Ok(task)
     }
 
     /// Fetches and bakes one tile from start to end.
-    fn bake_tile(&self, key: TileKey, cancel: &CancelToken) -> Result<TileOutput, BakeError> {
+    fn bake_tile(
+        &self,
+        key: TileKey,
+        cancel: &CancelToken,
+    ) -> (Result<TileOutput, BakeError>, Option<super::TileReport>) {
         let at = |error: Error| BakeError {
             tile: Some([key.x, key.z]),
             error,
         };
-        let fetched = self.fetch(key, cancel).map_err(at)?;
-        let hash = fetched.input_hash;
-        let mut task = self.task(key, fetched, cancel).map_err(at)?;
-        loop {
-            match task.advance().map_err(at)? {
-                Advance::More => {}
-                Advance::Done(data, triangulation) => {
-                    return Ok(output(key, hash, data, triangulation));
+        let mut report = None;
+        let result = (|| {
+            let fetched = self.fetch(key, cancel).map_err(at)?;
+            let hash = fetched.input_hash;
+            let mut task = self.task(key, fetched, cancel).map_err(at)?;
+            loop {
+                match task.advance() {
+                    Ok(Advance::More) => {}
+                    Ok(Advance::Done(data, triangulation)) => {
+                        report = task.report;
+                        return Ok(output(key, hash, data, triangulation));
+                    }
+                    Err(error) => {
+                        if let Some(stats) = &mut task.report {
+                            stats.fail(&error);
+                        }
+                        report = task.report;
+                        return Err(at(error));
+                    }
                 }
             }
-        }
+        })();
+        (result, report)
     }
 }
 
@@ -217,6 +240,7 @@ pub struct BakeJob<'s, S: GeometrySource> {
     failed: Option<BakeError>,
     skipped: usize,
     opts: JobOptions,
+    reports: super::BakeReport,
 }
 
 impl<'s, S: GeometrySource> BakeJob<'s, S> {
@@ -259,6 +283,7 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
             failed: None,
             skipped: 0,
             opts,
+            reports: super::BakeReport::default(),
         })
     }
 
@@ -268,7 +293,15 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
             cfg: &self.cfg,
             grid: &self.grid,
             config_hash: self.config_hash,
+            reports: self.opts.reports,
         }
+    }
+
+    /// Measurements for completed tiles and the first failed tile; independent of delivery.
+    /// Empty unless [`JobOptions::reports`] was enabled. Skipped and unstarted tiles
+    /// produce no report. The caller can attach installed-world reachability to a clone.
+    pub fn report(&self) -> &super::BakeReport {
+        &self.reports
     }
 
     /// A token that stops the job from any thread. Cancelling ends the job: later
@@ -409,11 +442,18 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
             Ok(Advance::More) => Ok(task.work_used() - before),
             Ok(Advance::Done(data, triangulation)) => {
                 let cost = task.work_used() - before;
+                if let Some(report) = task.report.take() {
+                    self.reports.tiles.push(report);
+                }
                 self.current = None;
                 self.ready.push_back(output(key, hash, data, triangulation));
                 Ok(cost)
             }
             Err(error) => {
+                if let Some(mut report) = task.report.take() {
+                    report.fail(&error);
+                    self.reports.tiles.push(report);
+                }
                 self.current = None;
                 Err(self.fail(BakeError {
                     tile: Some([key.x, key.z]),
@@ -424,6 +464,19 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
     }
 
     fn fail(&mut self, error: BakeError) -> BakeError {
+        if self.opts.reports
+            && let Some([x, z]) = error.tile
+            && self
+                .reports
+                .tiles
+                .last()
+                .is_none_or(|r| r.key.x != x || r.key.z != z)
+            && let Ok(cfg) = self.grid.tile_config(&self.cfg, TileKey { x, z })
+        {
+            let mut report = super::TileReport::new(x, z, cfg.width, cfg.height, cfg.border_size);
+            report.fail(&error.error);
+            self.reports.tiles.push(report);
+        }
         self.current = None;
         self.failed = Some(error.clone());
         error
@@ -462,8 +515,18 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
         self.next = end;
         for result in results {
             match result {
-                Ok(tile) => self.ready.push_back(tile),
-                Err(e) => return Err(self.fail(e)),
+                (Ok(tile), report) => {
+                    if let Some(report) = report {
+                        self.reports.tiles.push(report);
+                    }
+                    self.ready.push_back(tile);
+                }
+                (Err(e), report) => {
+                    if let Some(report) = report {
+                        self.reports.tiles.push(report);
+                    }
+                    return Err(self.fail(e));
+                }
             }
         }
         Ok(if self.next >= self.keys.len() {
@@ -512,8 +575,35 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
     /// not yet taken, the tiles in flight and their working storage, as for
     /// [`tiles`](super::tiles).
     fn admit(&self, in_flight: usize) -> Result<(), BakeError> {
+        let report_bytes = self
+            .reports
+            .tiles
+            .iter()
+            .try_fold(0usize, |n, r| {
+                n.checked_add(core::mem::size_of::<super::TileReport>())
+                    .and_then(|n| {
+                        r.islands
+                            .len()
+                            .checked_mul(core::mem::size_of::<crate::connectivity::IslandSummary>())
+                            .and_then(|v| n.checked_add(v))
+                    })
+            })
+            .ok_or(BakeError {
+                tile: None,
+                error: Error::SizeOverflow,
+            })?;
+        let mut cfg = self.cfg;
+        if cfg.max_total_bytes != usize::MAX {
+            cfg.max_total_bytes =
+                cfg.max_total_bytes
+                    .checked_sub(report_bytes)
+                    .ok_or(BakeError {
+                        tile: None,
+                        error: Error::LimitExceeded,
+                    })?;
+        }
         let retained = self.ready.len().saturating_add(in_flight);
-        super::check_total_bytes(&self.cfg, 0, retained, in_flight)
+        super::check_total_bytes(&cfg, 0, retained, in_flight)
             .map_err(|error| BakeError { tile: None, error })
     }
 }

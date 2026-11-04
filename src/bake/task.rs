@@ -218,6 +218,7 @@ pub(super) struct TileTask<'a> {
     /// Consumed by the first stage.
     source: Option<TriSource<'a>>,
     state: State,
+    pub(super) report: Option<super::TileReport>,
 }
 
 impl<'a> TileTask<'a> {
@@ -250,7 +251,18 @@ impl<'a> TileTask<'a> {
             off_mesh,
             source: Some(source),
             state: State::Finished,
+            report: None,
         }
+    }
+
+    pub(super) fn enable_report(&mut self) {
+        self.report = Some(super::TileReport::new(
+            self.x,
+            self.y,
+            self.cfg.width,
+            self.cfg.height,
+            self.cfg.border_size,
+        ));
     }
 
     /// Work units charged so far, across all stages.
@@ -308,6 +320,16 @@ impl<'a> TileTask<'a> {
             }
             State::Filter { mut hf, which } => {
                 let cfg = self.cfg;
+                if self.report.is_some() {
+                    self.tw.stage(|ws| {
+                        ws.work(
+                            (hf.width as u64 * hf.height as u64)
+                                .saturating_add(hf.span_count_for_report() as u64)
+                                .saturating_mul(2),
+                        )
+                    })?;
+                }
+                let before = self.report.as_ref().map(|_| hf.walkable_span_count());
                 match which {
                     0 if self.c.filter_low_hanging => self.tw.stage(|ws| {
                         hf.filter_low_hanging_walkable_obstacles(ws, cfg.walkable_climb)
@@ -319,6 +341,15 @@ impl<'a> TileTask<'a> {
                         .tw
                         .stage(|ws| hf.filter_walkable_low_height_spans(ws, cfg.walkable_height))?,
                     _ => {}
+                }
+                if let (Some(before), Some(report)) = (before, &mut self.report) {
+                    let after = hf.walkable_span_count();
+                    match which {
+                        0 => report.spans_removed.low_hanging = after.saturating_sub(before) as u32,
+                        1 => report.spans_removed.ledge = before.saturating_sub(after) as u32,
+                        2 => report.spans_removed.low_height = before.saturating_sub(after) as u32,
+                        _ => {}
+                    }
                 }
                 self.state = if which < 2 {
                     State::Filter {
@@ -364,6 +395,7 @@ impl<'a> TileTask<'a> {
             }
             State::Regions { mut chf } => {
                 let cfg = self.cfg;
+                self.tw.ws.regions_removed_small = 0;
                 match self.c.partition {
                     Partition::Watershed => self.tw.trusted_stage(|ws| {
                         recast::build_regions(
@@ -392,6 +424,24 @@ impl<'a> TileTask<'a> {
                         )
                     })?,
                 }
+                if let Some(report) = &mut self.report {
+                    report.regions_removed_small = self.tw.ws.regions_removed_small;
+                    self.tw
+                        .stage(|ws| ws.work(chf.cells.len() as u64 + chf.spans.len() as u64))?;
+                    let b = cfg.border_size.max(0) as usize;
+                    let w = chf.width as usize;
+                    let h = chf.height as usize;
+                    for z in b..h.saturating_sub(b) {
+                        for x in b..w.saturating_sub(b) {
+                            let c = &chf.cells[x + z * w];
+                            if (c.index as usize..c.index as usize + c.count as usize)
+                                .any(|i| chf.areas[i] != recast::NULL_AREA && chf.spans[i].reg != 0)
+                            {
+                                report.walkable_columns += 1;
+                            }
+                        }
+                    }
+                }
                 self.state = State::Contours { chf };
                 Ok(Advance::More)
             }
@@ -415,6 +465,9 @@ impl<'a> TileTask<'a> {
                 let (mesh, report) = self.tw.stage(|ws| {
                     PolyMesh::build_with_report(ws, &contours, cfg.max_verts_per_poly, strict)
                 })?;
+                if let Some(stats) = &mut self.report {
+                    stats.triangulation = report;
+                }
                 self.state = State::Fix { chf, mesh, report };
                 Ok(Advance::More)
             }
@@ -459,6 +512,9 @@ impl<'a> TileTask<'a> {
                     )
                 })?;
                 if mesh.npolys == 0 {
+                    if let Some(stats) = &mut self.report {
+                        self.tw.stage(|ws| stats.finish(None, report, ws))?;
+                    }
                     return Ok(Advance::Done(None, report));
                 }
                 self.state = State::Dnav {
@@ -474,6 +530,9 @@ impl<'a> TileTask<'a> {
                 report,
             } => {
                 let data = self.dnav(&mesh, &detail)?;
+                if let Some(stats) = &mut self.report {
+                    self.tw.stage(|ws| stats.finish(Some(&data), report, ws))?;
+                }
                 Ok(Advance::Done(Some(data), report))
             }
         }
@@ -638,5 +697,73 @@ impl VolumeRef<'static> {
                 area: v.area,
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    fn filter_task(hf: Heightfield, which: u8) -> TileTask<'static> {
+        let mut cfg = BakeConfig::default();
+        cfg.recast.width = hf.width;
+        cfg.recast.height = hf.height;
+        cfg.recast.border_size = 0;
+        cfg.recast.walkable_height = 3;
+        cfg.recast.walkable_climb = 2;
+        let mut task = TileTask::new(
+            &cfg,
+            &cfg.recast,
+            0,
+            0,
+            Cow::Borrowed(&[]),
+            TriSource::Fetched {
+                areas: Vec::new(),
+                mode: AreaMode::Auto,
+            },
+            Vec::new(),
+            OffMesh::Borrowed(NavMeshCreateParams::default()),
+            None,
+        );
+        task.source = None;
+        task.state = State::Filter { hf, which };
+        task.enable_report();
+        task
+    }
+
+    #[test]
+    fn low_hanging_reports_promotions() {
+        let mut ws = Workspace::new();
+        let mut hf = Heightfield::new(&mut ws, 1, 1, [0.0; 3], [1.0, 10.0, 1.0], 1.0, 1.0).unwrap();
+        hf.add_span(&mut ws, 0, 0, 0, 1, 63, 0).unwrap();
+        hf.add_span(&mut ws, 0, 0, 2, 3, 0, 0).unwrap();
+        let mut task = filter_task(hf, 0);
+        task.advance().unwrap();
+        assert_eq!(task.report.unwrap().spans_removed.low_hanging, 1);
+    }
+
+    #[test]
+    fn ledge_reports_cleared_spans() {
+        let mut ws = Workspace::new();
+        let mut hf = Heightfield::new(&mut ws, 3, 3, [0.0; 3], [3.0, 10.0, 3.0], 1.0, 1.0).unwrap();
+        for z in 0..3 {
+            for x in 0..3 {
+                hf.add_span(&mut ws, x, z, 0, 1, 63, 0).unwrap();
+            }
+        }
+        let mut task = filter_task(hf, 1);
+        task.advance().unwrap();
+        assert_eq!(task.report.unwrap().spans_removed.ledge, 8);
+    }
+
+    #[test]
+    fn low_height_reports_cleared_spans() {
+        let mut ws = Workspace::new();
+        let mut hf = Heightfield::new(&mut ws, 1, 1, [0.0; 3], [1.0, 10.0, 1.0], 1.0, 1.0).unwrap();
+        hf.add_span(&mut ws, 0, 0, 0, 1, 63, 0).unwrap();
+        hf.add_span(&mut ws, 0, 0, 2, 3, 0, 0).unwrap();
+        let mut task = filter_task(hf, 2);
+        task.advance().unwrap();
+        assert_eq!(task.report.unwrap().spans_removed.low_height, 1);
     }
 }

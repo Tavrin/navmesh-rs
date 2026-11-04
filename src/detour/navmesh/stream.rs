@@ -91,6 +91,7 @@ impl SlotPolicy {
 
 /// A tile column: tile coordinates `x` and `y` (all layers).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TileKey {
     /// Tile x.
     pub x: i32,

@@ -109,6 +109,10 @@ impl Heightfield {
         }
     }
 
+    pub(crate) fn span_count_for_report(&self) -> usize {
+        self.pool.len()
+    }
+
     /// Number of spans whose area is not [`NULL_AREA`] (`rcGetHeightFieldSpanCount`).
     pub fn walkable_span_count(&self) -> usize {
         (0..self.heads.len())

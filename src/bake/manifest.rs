@@ -75,6 +75,7 @@ pub(super) fn digest_bytes(bytes: &[u8]) -> u64 {
 /// Ordered row-major, by `z` then `x`, the order of [`super::tiles`] and of every
 /// manifest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub struct TileKey {
     /// Column index along x.
     pub x: i32,

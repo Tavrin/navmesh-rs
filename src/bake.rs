@@ -40,6 +40,9 @@ mod source;
 mod task;
 
 pub use install::{TileInstaller, install_cost};
+mod report;
+pub use report::{BakeReport, FilterCounts, TileReport};
+
 pub use job::{BakeJob, JobOptions, TileOutput};
 pub use manifest::{
     BAKE_REVISION, BakeManifest, DirtyTiles, GridLayout, MANIFEST_VERSION, ManifestDelta,

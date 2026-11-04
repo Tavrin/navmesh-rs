@@ -56,6 +56,7 @@
 //! - `tilecache` (default): cached layers and dynamic obstacles; implies Recast and Detour.
 //! - `std` (default): floating-point functions from the platform libm.
 //! - `parallel`: rayon-backed tile baking (opt-in; bake functions remain available without it).
+//! - `serde`: serialization of diagnostic reports (opt-in, supports alloc without std).
 //! - `libm`: floating-point functions from the `libm` crate; required without `std`.
 //! - `polyref64` (default): 64-bit poly refs (upstream's `DT_POLYREF64`); without it
 //!   refs are 32-bit. The width is part of the tile byte format.
@@ -182,3 +183,6 @@ pub mod tilecache;
 
 #[cfg(all(feature = "recast", feature = "detour"))]
 pub mod bake;
+
+#[cfg(feature = "detour")]
+pub mod connectivity;

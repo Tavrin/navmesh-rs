@@ -1,5 +1,6 @@
 //! The navmesh (`dtNavMesh`): tile slots, poly refs and links.
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use super::math::*;
@@ -17,6 +18,17 @@ pub use stream::{
     Committed, EdgeKind, PreparedTile, REMOVAL_LOG_CAPACITY, RefState, ResidencyRecord, SlotPolicy,
     TileKey, UnloadedTile, content_hash, prepare_tile,
 };
+
+// An owner token survives moves. A cloned mesh gets a new token because the two
+// owners can make different edits at the same epoch.
+#[derive(Debug)]
+struct MeshIdentity(Arc<()>);
+
+impl Clone for MeshIdentity {
+    fn clone(&self) -> Self {
+        Self(Arc::new(()))
+    }
+}
 
 /// Size of the tile state header: `int` magic, `int` version, tile ref.
 const TILE_STATE_HEADER_SIZE: usize = 8 + (PolyRef::BITS / 8) as usize;
@@ -170,6 +182,7 @@ impl core::ops::IndexMut<usize> for SlotTable {
 /// (`stream` items: [`SlotPolicy`], [`prepare_tile`], [`NavMesh::ref_state`]).
 #[derive(Clone, Debug)]
 pub struct NavMesh {
+    identity: MeshIdentity,
     params: NavMeshParams,
     lut_mask: i32,
     pos_lookup: Vec<i32>,
@@ -614,6 +627,7 @@ impl NavMesh {
             .map_err(|_| Error::AllocationFailed)?;
         pos_lookup.resize(lut as usize, -1);
         Ok(NavMesh {
+            identity: MeshIdentity(Arc::new(())),
             params: *params,
             lut_mask: lut - 1,
             pos_lookup,
@@ -628,6 +642,10 @@ impl NavMesh {
             global_off_mesh: false,
             stream: stream::StreamState::new(policy)?,
         })
+    }
+
+    pub(crate) fn report_identity(&self) -> &Arc<()> {
+        &self.identity.0
     }
 
     /// The limits the tile reader applies.
@@ -1735,6 +1753,12 @@ impl NavMesh {
                 self.disconnect_global_pair(ti, j);
             }
         }
+    }
+
+    /// Allocated slot candidates, including parked/free slots; sparse keyed grids
+    /// visit allocated pages only. The observer charges each candidate itself.
+    pub(crate) fn allocated_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.slots.indices()
     }
 
     /// Slots holding a tile, ascending.
