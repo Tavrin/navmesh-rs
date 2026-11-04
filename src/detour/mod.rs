@@ -45,7 +45,10 @@ pub use builder::{NavMeshCreateParams, create_nav_mesh_data, create_nav_mesh_dat
 pub use endian::{
     nav_mesh_data_swap_endian, nav_mesh_header_swap_endian, nav_mesh_swap_off_mesh_user_ids,
 };
-pub use navmesh::{NavMesh, NavMeshParams};
+pub use navmesh::{
+    Committed, EdgeKind, NavMesh, NavMeshParams, PreparedTile, REMOVAL_LOG_CAPACITY, RefState,
+    ResidencyRecord, SlotPolicy, TileKey, UnloadedTile, content_hash, prepare_tile,
+};
 pub use query::{
     DefaultFilter, NavMeshQuery, QueryFilter, RaycastHit, SegmentWall, StraightPathPoint,
 };
@@ -150,6 +153,12 @@ impl Status {
     pub const PARTIAL_RESULT: u32 = 1 << 6;
     /// A tile already occupies the location.
     pub const ALREADY_OCCUPIED: u32 = 1 << 7;
+    /// The goal was not reached and the search touched an edge facing a known,
+    /// unloaded tile column (not in recastnavigation).
+    pub const UNLOADED_BORDER: u32 = 1 << 8;
+    /// A search was continued after a tile it had touched was unloaded or removed
+    /// (not in recastnavigation).
+    pub const MESH_CHANGED: u32 = 1 << 9;
 
     /// Plain success.
     pub const OK: Status = Status(Self::SUCCESS);
@@ -187,6 +196,7 @@ pub fn status_of(e: &Error) -> Status {
                     Status::OUT_OF_MEMORY
                 }
                 Error::BufferTooSmall => Status::BUFFER_TOO_SMALL,
+                Error::MeshChanged => Status::MESH_CHANGED,
                 _ => Status::INVALID_PARAM,
             },
     )

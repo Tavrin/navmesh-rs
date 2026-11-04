@@ -958,6 +958,125 @@ fn endian_seeds(out: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+/// `stream_ops` seeds: for both slot policies, a full load, unload and identical
+/// reload, a rebake, removals, a residency round trip and queries in between; and
+/// a few deterministic pseudo-random sequences.
+fn stream_seeds(out: &Path) -> Result<usize, String> {
+    let mut written = 0;
+    let mut put = |name: String, bytes: Vec<u8>| -> Result<(), String> {
+        std::fs::write(out.join(name), bytes).map_err(|e| e.to_string())?;
+        written += 1;
+        Ok(())
+    };
+    for mode in 0u8..8 {
+        let mut v = vec![mode];
+        for k in 0u8..16 {
+            v.extend([0, k, 7, k]);
+        }
+        for k in [5u8, 6, 9, 10] {
+            v.extend([2, k]);
+        }
+        v.extend([8, 0, 9, 0, 10, 0, 10, 4]);
+        for k in [5u8, 6] {
+            v.extend([0, k]);
+        }
+        v.extend([
+            0,
+            9 | 0x10,
+            5,
+            10,
+            5,
+            10 | 0x20,
+            3,
+            1,
+            7,
+            1,
+            4,
+            10,
+            6,
+            2,
+            11,
+            0,
+            8,
+            0,
+        ]);
+        put(format!("stream-scripted-m{mode}"), v)?;
+        let mut s = 0x9e37_79b9u32.wrapping_mul(u32::from(mode) + 1);
+        let mut v = vec![mode];
+        for _ in 0..200 {
+            s ^= s << 13;
+            s ^= s >> 17;
+            s ^= s << 5;
+            v.extend([(s >> 8) as u8, (s >> 16) as u8]);
+        }
+        put(format!("stream-random-m{mode}"), v)?;
+    }
+    Ok(written)
+}
+
+/// `residency_record` seeds: records saved from streamed navmeshes of both
+/// policies, empty and with resident, unloaded and removed tiles.
+fn residency_seeds(out: &Path) -> Result<usize, String> {
+    use navmesh_rs::Limits;
+    use navmesh_rs::detour::{NavMesh, NavMeshParams, SlotPolicy, TileKey, prepare_tile};
+    let params = NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: 10.0,
+        tile_height: 10.0,
+        max_tiles: 64,
+        max_polys: 16,
+    };
+    let mut written = 0;
+    for (name, policy) in [
+        ("seq", SlotPolicy::Sequential),
+        (
+            "keyed",
+            SlotPolicy::Keyed {
+                origin: [0, 0],
+                width: 4,
+                height: 4,
+                max_layers: 1,
+            },
+        ),
+    ] {
+        let mut nav =
+            NavMesh::with_policy(&params, Limits::UNLIMITED, policy).map_err(|e| e.to_string())?;
+        std::fs::write(
+            out.join(format!("res-{name}-empty")),
+            nav.residency().to_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut refs = Vec::new();
+        for k in 0..16 {
+            let t = prepare_tile(
+                &params,
+                Limits::UNLIMITED,
+                navmesh_fuzz::grid_quad(k % 4, k / 4, 0),
+            )
+            .map_err(|e| e.to_string())?;
+            refs.push(nav.commit(t).map_err(|e| e.to_string())?);
+        }
+        for &r in &refs[..4] {
+            nav.unload_tile(r).map_err(|e| e.to_string())?;
+        }
+        nav.remove_tile(refs[8]).map_err(|e| e.to_string())?;
+        nav.forget_unloaded(TileKey { x: 0, y: 0 }, 0)
+            .map_err(|e| e.to_string())?;
+        std::fs::write(
+            out.join(format!("res-{name}-mixed")),
+            nav.residency().to_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut exhausted = nav.residency().to_bytes();
+        exhausted[116..120].copy_from_slice(&65535u32.to_le_bytes());
+        exhausted[144] ^= 1; // Force changed content on the exhausted reservation.
+        std::fs::write(out.join(format!("res-{name}-exhausted")), exhausted)
+            .map_err(|e| e.to_string())?;
+        written += 3;
+    }
+    Ok(written)
+}
+
 /// Seeds for `strict_triangulation`: convex contours (complete triangulation),
 /// a bow-tie and random-coordinate contours (incomplete), out-of-range
 /// coordinates, and every polygon-size selector.
@@ -1011,6 +1130,8 @@ fn main() -> ExitCode {
                 | "bake-job"
                 | "tilestate"
                 | "endian"
+                | "stream"
+                | "residency"
         )
     );
     if args.len() < if no_inputs { 2 } else { 3 } {
@@ -1036,6 +1157,8 @@ fn main() -> ExitCode {
         "strict" => strict_seeds(out),
         "tilestate" => tilestate_seeds(out),
         "endian" => endian_seeds(out),
+        "stream" => stream_seeds(out),
+        "residency" => residency_seeds(out),
         "tilecache" => tilecache_seeds(out),
         "parallel" => parallel_seeds(out),
         "bake-job" => bake_job_seeds(out),

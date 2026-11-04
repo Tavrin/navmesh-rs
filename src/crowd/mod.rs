@@ -10,8 +10,8 @@
 use crate::common::sqrtf;
 use crate::detour::math::*;
 use crate::detour::{
-    DefaultFilter, NavMesh, NavMeshQuery, PolyRef, QueryFilter, STRAIGHTPATH_END,
-    STRAIGHTPATH_OFFMESH_CONNECTION, Status, StraightPathPoint,
+    DefaultFilter, NavMesh, NavMeshQuery, PolyRef, QueryFilter, RefState, STRAIGHTPATH_END,
+    STRAIGHTPATH_OFFMESH_CONNECTION, Status, StraightPathPoint, TileKey,
 };
 use crate::{Budget, Budgeted, Error, Limits, UpstreamFixes, Workspace};
 use alloc::vec::Vec;
@@ -99,6 +99,11 @@ pub enum TargetState {
     WaitingForPath = 5,
     /// Direct velocity control.
     Velocity = 6,
+    /// The target polygon's tile is unloaded (not in recastnavigation). The agent
+    /// follows the resident part of its corridor, whose end is moved to the point
+    /// nearest the target on the last resident polygon, and replans when the tile
+    /// is committed again; [`CrowdAgent::waiting_tile`] names the column.
+    WaitingForTile = 7,
 }
 /// Physical dimensions and steering settings for an agent.
 /// Construct with [`Self::default`] and assign the desired fields.
@@ -213,6 +218,7 @@ pub struct CrowdAgent {
     pub target_pos: V3,
     /// Whether the full search returned a partial path.
     pub partial: bool,
+    waiting_tile: Option<TileKey>,
     topology_time: f32,
     replan_time: f32,
     replan: bool,
@@ -227,6 +233,12 @@ impl CrowdAgent {
     /// the neighbour's agent slot and its squared planar distance.
     pub fn neighbours(&self) -> &[(usize, f32)] {
         &self.neis[..self.nneis]
+    }
+    /// The unloaded column holding the target polygon while the target state is
+    /// [`TargetState::WaitingForTile`] (not in recastnavigation).
+    pub fn waiting_tile(&self) -> Option<TileKey> {
+        self.waiting_tile
+            .filter(|_| self.target_state == TargetState::WaitingForTile)
     }
     // Preserve allocated storage, but no state belonging to a previous occupant.
     fn reset_slot(&mut self) {
@@ -305,6 +317,7 @@ impl Crowd {
                 target_ref: 0,
                 target_pos: [0.; 3],
                 partial: false,
+                waiting_tile: None,
                 topology_time: 0.,
                 replan_time: 0.,
                 replan: false,
@@ -474,15 +487,27 @@ impl Crowd {
         pos: V3,
     ) -> Result<(), Error> {
         finite(pos)?;
-        if !nav.is_valid_poly_ref(r) {
-            return Err(Error::InvalidRef);
-        }
+        // A polygon of an unloaded tile is accepted: the agent stops where it is
+        // and waits for the tile (`TargetState::WaitingForTile`).
+        let waiting = match nav.ref_state(r) {
+            RefState::Valid => None,
+            RefState::Unloaded(k) => Some(k),
+            _ => return Err(Error::InvalidRef),
+        };
         let a = self.agent_mut(id)?;
         a.target_ref = r;
         a.target_pos = pos;
         a.pathq = 0;
         a.replan = false;
-        a.target_state = TargetState::Requesting;
+        a.waiting_tile = waiting;
+        if waiting.is_some() {
+            a.target_state = TargetState::WaitingForTile;
+            if a.state == AgentState::Walking {
+                a.corridor.reset(a.corridor.first_poly(), a.npos)?;
+            }
+        } else {
+            a.target_state = TargetState::Requesting;
+        }
         Ok(())
     }
     /// Switches to direct velocity control.

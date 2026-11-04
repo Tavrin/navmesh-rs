@@ -9,10 +9,10 @@ use super::navmesh::{NavMesh, closest_point_on_poly_in_tile, poly_height};
 use super::node::{NODE_CLOSED, NODE_OPEN, NODE_PARENT_DETACHED, NodePool, NodeQueue, no_better};
 use super::tile::{MeshTile, Poly};
 use super::{
-    FINDPATH_ANY_ANGLE, MAX_AREAS, NULL_LINK, POLYTYPE_GROUND, POLYTYPE_OFFMESH_CONNECTION,
-    PolyRef, RAY_CAST_LIMIT_PROPORTIONS, RAYCAST_USE_COSTS, STRAIGHTPATH_ALL_CROSSINGS,
-    STRAIGHTPATH_AREA_CROSSINGS, STRAIGHTPATH_END, STRAIGHTPATH_OFFMESH_CONNECTION,
-    STRAIGHTPATH_START, Status, VERTS_PER_POLYGON,
+    EdgeKind, FINDPATH_ANY_ANGLE, MAX_AREAS, NULL_LINK, POLYTYPE_GROUND,
+    POLYTYPE_OFFMESH_CONNECTION, PolyRef, RAY_CAST_LIMIT_PROPORTIONS, RAYCAST_USE_COSTS,
+    STRAIGHTPATH_ALL_CROSSINGS, STRAIGHTPATH_AREA_CROSSINGS, STRAIGHTPATH_END,
+    STRAIGHTPATH_OFFMESH_CONNECTION, STRAIGHTPATH_START, Status, TileKey, VERTS_PER_POLYGON,
 };
 use crate::budget::spend_one;
 use crate::{Budget, Budgeted, Error, UpstreamFixes};
@@ -88,7 +88,12 @@ impl QueryFilter for DefaultFilter {
 
 /// A raycast result (`dtRaycastHit`).
 #[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub struct RaycastHit {
+    /// Why the ray stopped (not in recastnavigation): [`EdgeKind::None`] when it
+    /// reached its end, otherwise a wall, a world edge, or a border facing a known,
+    /// unloaded column.
+    pub edge: EdgeKind,
     /// Hit parameter along the ray (`f32::MAX` when the end was reached).
     pub t: f32,
     /// Normal of the hit wall.
@@ -131,6 +136,24 @@ pub(crate) struct QueryData {
     pub end_pos: [f32; 3],
     pub options: u32,
     pub raycast_limit_sqr: f32,
+    /// [`NavMesh::epoch`] when the sliced search began.
+    pub epoch: u64,
+}
+
+/// Whether a tile that a search's node pool touched was unloaded or removed since
+/// `epoch` (see [`NavMesh::changed_since`]).
+pub(crate) fn pool_changed(nav: &NavMesh, epoch: u64, pool: &NodePool) -> bool {
+    if nav.epoch() == epoch {
+        return false;
+    }
+    let mut slots: Vec<u32> = pool
+        .used()
+        .iter()
+        .map(|n| nav.decode_poly_id_tile(n.id))
+        .collect();
+    slots.sort_unstable();
+    slots.dedup();
+    nav.changed_since(epoch, &mut |s| slots.binary_search(&s).is_ok())
 }
 
 /// Query workspace over a navmesh (`dtNavMeshQuery`): it owns the node pools and
@@ -970,11 +993,53 @@ impl<'a> NavMeshQuery<'a> {
         let mut status = self.path_to_node(last_best, path, max_path);
         if self.node_pool.nodes[last_best].id != end_ref {
             status |= Status::PARTIAL_RESULT;
+            if self.nav.has_unloaded() && !self.search_frontier().is_empty() {
+                status |= Status::UNLOADED_BORDER;
+            }
         }
         if out_of_nodes {
             status |= Status::OUT_OF_NODES;
         }
         Ok(Status(status))
+    }
+
+    /// Unloaded columns facing the polygons the last A* search expanded, sorted.
+    pub(crate) fn search_frontier(&self) -> Vec<TileKey> {
+        self.nav.unloaded_frontier(
+            self.node_pool
+                .used()
+                .iter()
+                .filter(|n| n.flags & NODE_CLOSED != 0)
+                .map(|n| n.id),
+        )
+    }
+
+    /// [`NavMeshQuery::find_path`] that also returns the frontier (not in
+    /// recastnavigation): when the goal was not reached, the sorted, deduplicated
+    /// columns that are known but not resident and face a polygon the search
+    /// expanded (see [`NavMesh::mark_known`] and [`NavMesh::unload_tile`]). The
+    /// status then carries [`Status::UNLOADED_BORDER`]. Empty when the goal was
+    /// reached.
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_path_report<F: QueryFilter + ?Sized>(
+        &mut self,
+        start_ref: PolyRef,
+        end_ref: PolyRef,
+        start_pos: &[f32; 3],
+        end_pos: &[f32; 3],
+        filter: &F,
+        path: &mut Vec<PolyRef>,
+        max_path: usize,
+    ) -> Result<(Status, Vec<TileKey>), Error> {
+        let st = self.find_path(
+            start_ref, end_ref, start_pos, end_pos, filter, path, max_path,
+        )?;
+        let frontier = if st.has_detail(Status::UNLOADED_BORDER) {
+            self.search_frontier()
+        } else {
+            Vec::new()
+        };
+        Ok((st, frontier))
     }
 
     fn path_to_node(&self, end: usize, path: &mut Vec<PolyRef>, max_path: usize) -> u32 {
@@ -1042,6 +1107,7 @@ impl<'a> NavMeshQuery<'a> {
                 .map_or(0.0, |t| t.header.walkable_radius);
             self.query.raycast_limit_sqr = sqr(r * RAY_CAST_LIMIT_PROPORTIONS);
         }
+        self.query.epoch = self.nav.epoch();
         if start_ref == end_ref {
             self.query.status = Status::SUCCESS;
             return Ok(Status::OK);
@@ -1088,6 +1154,10 @@ impl<'a> NavMeshQuery<'a> {
             } else {
                 Ok((Status(st), 0))
             };
+        }
+        if pool_changed(self.nav, self.query.epoch, &self.node_pool) {
+            self.query.status = Status::FAILURE | Status::MESH_CHANGED;
+            return Err(Error::MeshChanged);
         }
         if !self.nav.is_valid_poly_ref(self.query.start_ref)
             || !self.nav.is_valid_poly_ref(self.query.end_ref)
@@ -1267,6 +1337,9 @@ impl<'a> NavMeshQuery<'a> {
             let lb = self.query.last_best_node.ok_or(Error::Failed)?;
             if self.node_pool.nodes[lb].id != self.query.end_ref {
                 self.query.status |= Status::PARTIAL_RESULT;
+                if self.nav.has_unloaded() && !self.search_frontier().is_empty() {
+                    self.query.status |= Status::UNLOADED_BORDER;
+                }
             }
             self.write_sliced_path(lb, filter, path, max_path);
         }
@@ -1311,6 +1384,12 @@ impl<'a> NavMeshQuery<'a> {
                     self.query.last_best_node.ok_or(Error::Failed)?
                 }
             };
+            if self.node_pool.nodes[node].id != self.query.end_ref
+                && self.nav.has_unloaded()
+                && !self.search_frontier().is_empty()
+            {
+                self.query.status |= Status::UNLOADED_BORDER;
+            }
             self.write_sliced_path(node, filter, path, max_path);
         }
         let details = self.query.status & DETAIL_MASK;
@@ -1651,6 +1730,7 @@ impl<'a> NavMeshQuery<'a> {
 fn failure_of(st: u32) -> Error {
     match st & DETAIL_MASK {
         0 => Error::Failed,
+        Status::MESH_CHANGED => Error::MeshChanged,
         _ => Error::InvalidParameter("sliced query"),
     }
 }

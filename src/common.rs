@@ -34,6 +34,8 @@ pub enum Error {
     TileSlotOccupied,
     /// The navmesh has no free tile slot (or the requested slot is in use).
     NoFreeTile,
+    /// Advancing a tile slot salt would reuse an old reference generation.
+    SaltExhausted,
     /// Ear clipping was incomplete in strict mode (not in recastnavigation).
     PartialTriangulation {
         /// Number of incomplete contours encountered.
@@ -43,6 +45,11 @@ pub enum Error {
     },
     /// An output buffer is too small.
     BufferTooSmall,
+    /// A tile lies outside a keyed navmesh's grid (not in recastnavigation).
+    TileOutsideGrid,
+    /// A resumable or sliced search was continued after a tile it had touched was
+    /// unloaded or removed (not in recastnavigation); restart the search.
+    MeshChanged,
     /// The call was stopped by its [`CancelToken`] (not in recastnavigation).
     Cancelled,
 }
@@ -55,10 +62,11 @@ pub enum TileStateError {
     TooShort,
     /// The magic number is not `'DNMS'`.
     WrongMagic,
-    /// The version is not 1.
+    /// The version does not match the state format being read.
     WrongVersion,
     /// The state was stored for a different tile (or a different incarnation of the
     /// same slot): its tile ref does not equal the tile's current ref.
+    /// Streaming unload blobs also reject a mismatching content hash.
     WrongTile,
 }
 
@@ -100,6 +108,7 @@ impl fmt::Display for Error {
             Error::InvalidTileData(r) => write!(f, "invalid tile data: {r:?}"),
             Error::InvalidTileState(r) => write!(f, "invalid tile state: {r:?}"),
             Error::TileSlotOccupied => f.write_str("tile location already occupied"),
+            Error::SaltExhausted => f.write_str("tile slot salt exhausted"),
             Error::NoFreeTile => f.write_str("no free tile slot"),
             Error::PartialTriangulation {
                 failed_contours,
@@ -109,6 +118,8 @@ impl fmt::Display for Error {
                 "partial triangulation: {failed_contours} contours, {missing_triangles} missing triangles"
             ),
             Error::BufferTooSmall => f.write_str("buffer too small"),
+            Error::TileOutsideGrid => f.write_str("tile outside the keyed grid"),
+            Error::MeshChanged => f.write_str("navmesh changed under the search"),
             Error::Cancelled => f.write_str("cancelled"),
         }
     }

@@ -530,7 +530,12 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
         if self.tiles[i].head != NONE || self.queued[i] {
             return Err(Error::InvalidParameter("tile has obstacle work"));
         }
-        let h = self.tiles[i].header.as_ref().unwrap();
+        let (b, prev) = self.removal_chain(i)?;
+        Ok(self.remove_checked(i, b, prev))
+    }
+
+    fn removal_chain(&mut self, i: usize) -> Result<(usize, usize), Error> {
+        let h = self.tiles[i].header.as_ref().ok_or(Error::InvalidRef)?;
         let b = hash(h.tx, h.ty, self.buckets.len() - 1);
         let mut k = self.buckets[b];
         let mut prev = NONE;
@@ -539,12 +544,16 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             prev = k;
             k = self.tiles[k].next;
         }
+        Ok((b, prev))
+    }
+
+    fn remove_checked(&mut self, i: usize, b: usize, prev: usize) -> Vec<u8> {
         if prev == NONE {
             self.buckets[b] = self.tiles[i].next;
         } else {
             self.tiles[prev].next = self.tiles[i].next;
         }
-        let data = self.tiles[i].data.take().unwrap();
+        let data = self.tiles[i].data.take().unwrap_or_default();
         let salt = (self.tiles[i].salt + 1) & self.salt_mask;
         self.tiles[i] = TileSlot {
             salt: salt.max(1),
@@ -553,8 +562,164 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             ..TileSlot::default()
         };
         self.free_tiles.push(i);
-        Ok(data)
+        data
     }
+    /// Evicts a layer for streaming (not in recastnavigation) and returns its bytes.
+    /// Unlike [`TileCache::remove_tile`], a layer with obstacle associations may
+    /// go: the obstacles stay in world space and only their association with this
+    /// layer is dropped; [`TileCache::load_tile`] restores it. Refused while
+    /// obstacle requests or rebuilds are pending (drain [`TileCache::update`]
+    /// first). The navmesh tile built from the layer is the caller's to unload.
+    pub fn unload_tile(&mut self, r: CompressedTileRef) -> Result<Vec<u8>, Error> {
+        self.ws.begin();
+        let i = self.tile_index(r)?;
+        if !self.requests.is_empty() || self.queue_pos < self.queue.len() {
+            return Err(Error::InvalidParameter(
+                "tile mutation during obstacle work",
+            ));
+        }
+        let mut count = 0;
+        let mut a = self.tiles[i].head;
+        while a != NONE {
+            work(&mut self.ws, 1)?;
+            count += 1;
+            a = self.associations[a].next;
+        }
+        work(&mut self.ws, count)?;
+        if self.queued[i] {
+            return Err(Error::InvalidParameter("tile has obstacle work"));
+        }
+        let (b, prev) = self.removal_chain(i)?;
+        let mut a = self.tiles[i].head;
+        while a != NONE {
+            let next = self.associations[a].next;
+            self.drop_association(a);
+            a = next;
+        }
+        Ok(self.remove_checked(i, b, prev))
+    }
+
+    /// Removes association `a` from its tile's list and from its obstacle's touched
+    /// set, keeping the obstacle's entries dense (`touched[..count]` at
+    /// associations `obstacle * 8 ..`).
+    fn drop_association(&mut self, a: usize) {
+        let e = self.associations[a];
+        let o = e.obstacle;
+        self.unlink(a);
+        let Some(ob) = self.obstacles.get_mut(o).and_then(|x| x.as_mut()) else {
+            return;
+        };
+        let j = a - o * MAX_TOUCHED;
+        let last = ob.count.saturating_sub(1);
+        if ob.count == 0 || j > last {
+            return;
+        }
+        if j != last {
+            ob.touched[j] = ob.touched[last];
+            let from = o * MAX_TOUCHED + last;
+            let m = self.associations[from];
+            if m.tile != NONE {
+                if m.prev == NONE {
+                    self.tiles[m.tile].head = a;
+                } else {
+                    self.associations[m.prev].next = a;
+                }
+                if m.next != NONE {
+                    self.associations[m.next].prev = a;
+                }
+            }
+            self.associations[a] = m;
+            self.associations[from] = Association::default();
+        }
+        ob.touched[last] = NONE;
+        ob.count = last;
+    }
+
+    /// Adds a layer for streaming (not in recastnavigation): [`TileCache::add_tile`]
+    /// plus re-association of every live obstacle overlapping the layer, and the
+    /// layer queued for rebuild so [`TileCache::update`] builds its navmesh tile
+    /// with them. Allowed while rebuilds are queued, refused while obstacle
+    /// requests are pending. [`Error::BufferTooSmall`] (nothing added) when an
+    /// overlapping obstacle already touches the maximum number of layers.
+    pub fn load_tile(&mut self, data: Vec<u8>) -> Result<CompressedTileRef, Error> {
+        if !self.requests.is_empty() {
+            return Err(Error::InvalidParameter(
+                "tile mutation during obstacle work",
+            ));
+        }
+        // Run add_tile's checks against a drained queue, then restore it.
+        let (queue, pos) = (core::mem::take(&mut self.queue), self.queue_pos);
+        self.queue_pos = 0;
+        let overlaps = (|| {
+            let l = layer::decode(&mut self.ws, &self.compressor, &data)?;
+            let h = l.header;
+            work(&mut self.ws, self.obstacles.len())?;
+            let mut v = self.ws.vec_with_capacity(self.obstacles.len())?;
+            for (o, ob) in self.obstacles.iter().enumerate() {
+                let Some(ob) = ob else { continue };
+                if ob.state == ObstacleState::Removing {
+                    continue;
+                }
+                let (a, b) = ob.shape.bounds();
+                if self.layer_overlaps(&h, &a, &b) {
+                    if ob.count >= MAX_TOUCHED {
+                        return Err(Error::BufferTooSmall);
+                    }
+                    v.push(o);
+                }
+            }
+            Ok(v)
+        })();
+        let added = overlaps.and_then(|v| self.add_tile(data).map(|r| (r, v)));
+        self.queue = queue;
+        self.queue_pos = pos;
+        let (r, overlaps) = added?;
+        let i = self.tile_index(r)?;
+        for o in overlaps {
+            let Some(ob) = self.obstacles[o].as_mut() else {
+                continue;
+            };
+            let j = ob.count;
+            ob.touched[j] = i;
+            ob.count += 1;
+            let a = o * MAX_TOUCHED + j;
+            let next = self.tiles[i].head;
+            self.associations[a] = Association {
+                tile: i,
+                obstacle: o,
+                prev: NONE,
+                next,
+                pending: false,
+            };
+            if next != NONE {
+                self.associations[next].prev = a;
+            }
+            self.tiles[i].head = a;
+        }
+        if !self.queued[i] {
+            self.queue.push(i);
+            self.queued[i] = true;
+        }
+        Ok(r)
+    }
+
+    /// Whether the box `a..b` overlaps the used area of a layer (the test of
+    /// upstream's `queryTiles`).
+    fn layer_overlaps(&self, h: &LayerHeader, a: &[f32; 3], b: &[f32; 3]) -> bool {
+        let cs = self.params.cs;
+        let lo = [
+            h.bmin[0] + f32::from(h.minx) * cs,
+            h.bmin[1],
+            h.bmin[2] + f32::from(h.miny) * cs,
+        ];
+        let hi = [
+            h.bmin[0] + (f32::from(h.maxx) + 1.0) * cs,
+            h.bmax[1],
+            h.bmin[2] + (f32::from(h.maxy) + 1.0) * cs,
+        ];
+        (0..3).all(|j| a[j] <= hi[j] && b[j] >= lo[j])
+    }
+
     /// All layers at a coordinate, in upstream's reverse insertion order.
     pub fn tiles_at(&mut self, x: i32, y: i32) -> Result<Vec<CompressedTileRef>, Error> {
         self.ws.begin();

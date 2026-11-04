@@ -54,6 +54,36 @@ pub fn sample_tile() -> Vec<u8> {
     .unwrap_or_default()
 }
 
+/// Tile bytes of a 10 x 10 quad at tile `(x, y)` of a 10-unit grid whose four
+/// sides are portals, so neighbouring quads link. `variant` changes the polygon
+/// flags (and so the content hash) without changing the geometry.
+pub fn grid_quad(x: i32, y: i32, variant: u8) -> Vec<u8> {
+    const N: u16 = 0xffff;
+    let polys = [0, 1, 2, 3, N, N, 0x8000, 0x8001, 0x8002, 0x8003, N, N];
+    let (ox, oz) = (x as f32 * 10.0, y as f32 * 10.0);
+    detour::create_nav_mesh_data(&NavMeshCreateParams {
+        verts: &[0u16, 0, 0, 0, 0, 10, 10, 0, 10, 10, 0, 0],
+        vert_count: 4,
+        polys: &polys,
+        poly_flags: &[1 + u16::from(variant)],
+        poly_areas: &[0],
+        poly_count: 1,
+        nvp: 6,
+        tile_x: x,
+        tile_y: y,
+        bmin: [ox, 0.0, oz],
+        bmax: [ox + 10.0, 1.0, oz + 10.0],
+        walkable_height: 2.0,
+        walkable_radius: 0.5,
+        walkable_climb: 0.5,
+        cs: 1.0,
+        ch: 1.0,
+        build_bv_tree: true,
+        ..Default::default()
+    })
+    .unwrap_or_default()
+}
+
 /// Runs a few queries between points derived from the first tile's bounds.
 pub fn exercise_queries(nav: &NavMesh) {
     let Some(t) = (0..nav.max_tiles() as usize).find_map(|i| nav.tile(i)) else {
@@ -299,4 +329,206 @@ pub fn run_recast_with(input: &RecastInput, limits: Limits) -> Result<(Reached, 
     let (nav, _) = NavMesh::new_single(tile)?;
     exercise_queries(&nav);
     Ok((Reached::NavMesh, digest))
+}
+
+/// Exercise exhausted history, canonical stacked global links and refused cache
+/// eviction; input bytes vary geometry, link direction and the work threshold.
+pub fn streaming_boundaries(data: &[u8]) {
+    use navmesh_rs::detour::{
+        NavMeshParams, RefState, ResidencyRecord, SlotPolicy, TileKey, prepare_tile,
+    };
+    use navmesh_rs::tilecache::{
+        DefaultMeshProcess, LayerHeader, ObstacleShape, RawCompressor, TileCache, TileCacheParams,
+        build_layer,
+    };
+    let arg = data.first().copied().unwrap_or(0);
+    let params = NavMeshParams {
+        orig: [0.; 3],
+        tile_width: 10.,
+        tile_height: 10.,
+        max_tiles: 32,
+        max_polys: 16,
+    };
+    let bytes = grid_quad(0, 0, arg & 3);
+    let mut nav = NavMesh::new(&params).expect("mesh");
+    let t = prepare_tile(&params, Limits::UNLIMITED, bytes.clone()).expect("tile");
+    nav.commit(t).expect("commit");
+    let mut rec = nav.residency().to_bytes();
+    rec[52..56].copy_from_slice(&65535u32.to_le_bytes());
+    let mut nav = NavMesh::new(&params).expect("mesh");
+    nav.restore_residency(&ResidencyRecord::from_bytes(&rec).expect("record"))
+        .expect("history");
+    let r = nav
+        .commit(prepare_tile(&params, Limits::UNLIMITED, bytes).expect("tile"))
+        .expect("reload");
+    let before = nav.residency().to_bytes();
+    let epoch = nav.epoch();
+    assert_eq!(nav.remove_tile(r), Err(Error::SaltExhausted));
+    assert_eq!(nav.epoch(), epoch);
+    assert_eq!(nav.residency().to_bytes(), before);
+    assert_eq!(nav.ref_state(r), RefState::Valid);
+    assert_eq!(
+        nav.ref_state(nav.encode_poly_id(65534, 0, 0)),
+        RefState::Stale
+    );
+    let u = nav.unload_tile(r).expect("unload");
+    let before = nav.residency().to_bytes();
+    let mut changed = u.bytes.clone();
+    changed.extend_from_slice(data);
+    changed.push(arg);
+    let t = prepare_tile(&params, Limits::UNLIMITED, changed).expect("trailing bytes");
+    assert_eq!(nav.commit(t.clone()), Err(Error::SaltExhausted));
+    assert_eq!(
+        nav.commit_with_state(t, &u.state),
+        Err(Error::SaltExhausted)
+    );
+    assert_eq!(
+        nav.forget_unloaded(TileKey { x: 0, y: 0 }, 0),
+        Err(Error::SaltExhausted)
+    );
+    assert_eq!(nav.residency().to_bytes(), before);
+
+    let directions = [arg & 1];
+    let tile = |x, layer, height, owner| {
+        let ox = x as f32 * 10.;
+        detour::create_nav_mesh_data(&NavMeshCreateParams {
+            verts: &[0, 0, 0, 0, 0, 10, 10, 0, 10, 10, 0, 0],
+            vert_count: 4,
+            polys: &[0, 1, 2, 3, 0xffff, 0xffff, 0, 0, 0, 0, 0, 0],
+            poly_flags: &[1],
+            poly_areas: &[0],
+            poly_count: 1,
+            nvp: 6,
+            tile_x: x,
+            tile_layer: layer,
+            bmin: [ox, height, 0.],
+            bmax: [ox + 10., height + 1., 10.],
+            walkable_height: 2.,
+            walkable_radius: 0.5,
+            walkable_climb: 0.5,
+            cs: 1.,
+            ch: 1.,
+            off_mesh_con_verts: if owner {
+                &[5., 0., 5., 105., 0., 5.]
+            } else {
+                &[]
+            },
+            off_mesh_con_rad: if owner { &[1.] } else { &[] },
+            off_mesh_con_flags: if owner { &[1] } else { &[] },
+            off_mesh_con_areas: if owner { &[0] } else { &[] },
+            off_mesh_con_dir: if owner { &directions } else { &[] },
+            off_mesh_con_count: i32::from(owner),
+            ..Default::default()
+        })
+        .expect("tile")
+    };
+    let tiles = [
+        tile(0, 0, 0., true),
+        tile(10, 0, 0., false),
+        tile(10, 1, (arg & 15) as f32 / 32., false),
+    ];
+    let make = |order: [usize; 3]| {
+        let mut n = NavMesh::with_policy(
+            &params,
+            Limits::UNLIMITED,
+            SlotPolicy::Keyed {
+                origin: [0, 0],
+                width: 11,
+                height: 1,
+                max_layers: 2,
+            },
+        )
+        .expect("mesh");
+        n.set_global_off_mesh_links(true);
+        for i in order {
+            n.commit(prepare_tile(&params, Limits::UNLIMITED, tiles[i].clone()).expect("tile"))
+                .expect("commit");
+        }
+        n
+    };
+    let snapshot = |n: &NavMesh| {
+        let mut out = Vec::new();
+        for x in [0, 10] {
+            for layer in 0..2 {
+                if let Some(i) = n.tile_index_at(x, 0, layer) {
+                    let t = n.tile(i).expect("tile");
+                    let mut links = Vec::new();
+                    for p in &t.polys {
+                        let mut k = p.first_link;
+                        while k != detour::NULL_LINK {
+                            let l = t.links[k as usize];
+                            links.push((l.r#ref, l.edge, l.side));
+                            k = l.next;
+                        }
+                    }
+                    out.push((t.verts.clone(), links));
+                }
+            }
+        }
+        out
+    };
+    let a = make([0, 1, 2]);
+    let b = make([0, 2, 1]);
+    assert_eq!(snapshot(&a), snapshot(&b));
+
+    let mut c = TileCache::new(
+        TileCacheParams::new(8, 8, 1., 0.2, 4, 8),
+        RawCompressor,
+        DefaultMeshProcess,
+        Limits::UNLIMITED,
+    )
+    .expect("cache");
+    let mut refs = Vec::new();
+    for x in 0..4 {
+        let mut h = LayerHeader::new(8, 8);
+        h.tx = x;
+        h.bmin = [x as f32 * 8., 0., 0.];
+        h.bmax = [x as f32 * 8. + 8., 4., 8.];
+        h.hmax = 20;
+        let mut cons = vec![0; 64];
+        for y in 0..8 {
+            for x in 0..8 {
+                cons[x + y * 8] = u8::from(x > 0)
+                    | (u8::from(y < 7) * 2)
+                    | (u8::from(x < 7) * 4)
+                    | (u8::from(y > 0) * 8);
+            }
+        }
+        let bytes = build_layer(
+            &mut Workspace::new(),
+            &RawCompressor,
+            &h,
+            &[1; 64],
+            &[63; 64],
+            &cons,
+        )
+        .expect("layer");
+        refs.push(c.add_tile(bytes).expect("add layer"));
+    }
+    let mut n = NavMesh::new(&NavMeshParams {
+        tile_width: 8.,
+        tile_height: 8.,
+        max_polys: 256,
+        ..params
+    })
+    .expect("mesh");
+    let o = c
+        .add_obstacle(ObstacleShape::Cylinder {
+            pos: [4., 0., 4.],
+            radius: 1.,
+            height: 3.,
+        })
+        .expect("obstacle");
+    while !c.update(0.1, &mut n).expect("update") {}
+    let carved = c.build_tile_data(refs[0]).expect("carved");
+    c.set_limits(Limits {
+        max_work: u64::from(arg % 5),
+        ..Limits::UNLIMITED
+    });
+    assert_eq!(c.unload_tile(refs[0]), Err(Error::LimitExceeded));
+    c.set_limits(Limits::UNLIMITED);
+    assert_eq!(c.build_tile_data(refs[0]).expect("carved"), carved);
+    c.remove_obstacle(o).expect("remove");
+    while !c.update(0.1, &mut n).expect("update") {}
+    assert_ne!(c.build_tile_data(refs[0]).expect("uncarved"), carved);
 }

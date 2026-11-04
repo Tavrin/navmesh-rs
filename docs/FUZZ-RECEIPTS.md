@@ -518,3 +518,45 @@ to 0.1.5, not only through the new conversion functions. Fixed in this change (a
 ends the portal lookup); the input is the regression test
 `landing_link_edge_on_a_misplaced_off_mesh_polygon_is_not_indexed` in `tests/detour.rs`. The
 chunks above ran on the fixed build.
+
+## Streaming identity, eviction and link-order fixes, 2026-11-04
+
+The coordinator owns fuzz execution for this change. No libFuzzer campaign is
+run here, and no new coverage, CPU-time or crash-free qualification is claimed.
+The extended `stream_ops`, `prepared_tile`, and `residency_record` targets cover
+exhausted salt history, trailing-byte content identity, saved-state rejection,
+canonical stacked landing permutations and refused cache eviction with live
+obstacle associations. The seed writer includes an exhausted reservation with
+a deliberately changed digest.
+
+Build-only receipts (all exit 0): `cargo build --bin seeds`, then
+`cargo +nightly fuzz build stream_ops`, `cargo +nightly fuzz build prepared_tile`,
+and `cargo +nightly fuzz build residency_record`. Stable Rust 1.99.1 and nightly
+1.101.0 were used. These commands compile the targets and do not execute them.
+The compiled targets and source manifest are retained separately for the
+coordinator. Source snapshot SHA-256: `ea5ec32c7c921921eee7d302a2fdd82933866a4652fd107741f350b34684647b`.
+
+| Target | Executed here | Build exit code |
+|---|---|---|
+| `stream_ops` | No | 0 |
+| `prepared_tile` | No | 0 |
+| `residency_record` | No | 0 |
+
+## 0.2.0 pre-release campaigns, 2026-11-04
+
+Rule: 600 s chunks on one core per target, reusing the corpus; a target stops when a chunk adds
+no coverage after at least 600 s, capped at 7,200 s; `-rss_limit_mb=512`, AddressSanitizer with
+`ASAN_OPTIONS=quarantine_size_mb=16`, `-max_len` twice the largest corpus file (at least 4,096).
+The three streaming targets ran on the streaming branch with its review fixes, before main was
+merged in (the merge touched the bake path and error variants only); `crowd_update` and
+`trusted_bake` ran on the merged tree.
+
+| Target | Chunks | Executions | Final coverage | Verdict |
+|---|---:|---:|---:|---|
+| `stream_ops` | 2 | 139,873 | 5,118 | coverage flat |
+| `prepared_tile` | 3 | 22,043,582 | 2,788 | coverage flat |
+| `residency_record` | 6 | 135,836,243 | 1,720 | coverage flat |
+| `crowd_update` | 2 | 434,106 | 2,450 | coverage flat |
+| `trusted_bake` | 12 | 135,046 | 6,030 | cap reached (still gaining a few edges per chunk, as in the 0.1.2 campaign) |
+
+No crash, timeout, leak or assertion failure in any chunk.

@@ -2,6 +2,28 @@
 use super::*;
 use AgentState as S;
 use TargetState as T;
+
+/// Cuts an agent's corridor at its first polygon that is not resident and moves
+/// the corridor's end to the point nearest the target on the last resident one.
+fn trim_to_resident(a: &mut CrowdAgent, q: &NavMeshQuery<'_>) -> Result<(), Error> {
+    let nav = q.nav();
+    let path = a.corridor.path();
+    let Some(keep) = path.iter().position(|&p| !nav.is_valid_poly_ref(p)) else {
+        return Ok(());
+    };
+    if keep == 0 {
+        let first = a.corridor.first_poly();
+        return a.corridor.reset(first, a.npos);
+    }
+    let prefix: Vec<PolyRef> = path[..keep].to_vec();
+    let target = q
+        .closest_point_on_poly(prefix[keep - 1], &a.target_pos)
+        .map_or(a.npos, |c| c.0);
+    a.corridor.set_corridor(target, &prefix)?;
+    a.boundary.reset();
+    Ok(())
+}
+
 impl Crowd {
     fn check_paths(&mut self, q: &NavMeshQuery<'_>, dt: f32) -> Result<(), Error> {
         for &i in &self.active {
@@ -34,6 +56,54 @@ impl Crowd {
             }
             if matches!(a.target_state, T::None | T::Velocity) {
                 continue;
+            }
+            // Streaming (not in recastnavigation): a target whose tile is unloaded
+            // is waited for, not dropped.
+            if a.target_state != T::Failed {
+                if let Some(k) = a
+                    .waiting_tile
+                    .filter(|_| a.target_state == T::WaitingForTile)
+                {
+                    if q.nav().is_column_unloaded(k.x, k.y) {
+                        trim_to_resident(a, q)?;
+                        continue;
+                    }
+                }
+                if let Some(k) =
+                    a.corridor
+                        .path()
+                        .iter()
+                        .find_map(|&r| match q.nav().ref_state(r) {
+                            RefState::Unloaded(k) => Some(k),
+                            _ => None,
+                        })
+                {
+                    a.target_state = T::WaitingForTile;
+                    a.waiting_tile = Some(k);
+                    a.pathq = 0;
+                    a.replan = false;
+                    trim_to_resident(a, q)?;
+                    continue;
+                }
+                match q.nav().ref_state(a.target_ref) {
+                    RefState::Unloaded(k) => {
+                        if a.target_state != T::WaitingForTile {
+                            a.target_state = T::WaitingForTile;
+                            a.waiting_tile = Some(k);
+                            a.pathq = 0;
+                            a.replan = false;
+                        }
+                        trim_to_resident(a, q)?;
+                        continue;
+                    }
+                    _ if a.target_state == T::WaitingForTile => {
+                        // Back (or replaced): plan again; a replaced target is
+                        // relocated by the invalid-target branch below.
+                        a.target_state = T::Requesting;
+                        replan = true;
+                    }
+                    _ => {}
+                }
             }
             if !matches!(a.target_state, T::None | T::Failed) {
                 if !q.is_valid_poly_ref(a.target_ref, f) {
@@ -90,6 +160,7 @@ impl Crowd {
             if a.target_state == T::Requesting {
                 let mut res = Vec::new();
                 let mut pos = a.target_pos;
+                let mut waiting = None;
                 let result = (|| {
                     q.init_sliced_find_path(
                         a.corridor.first_poly(),
@@ -100,10 +171,13 @@ impl Crowd {
                         0,
                     )?;
                     q.update_sliced_find_path(20, f)?;
-                    if a.replan {
-                        q.finalize_sliced_find_path_partial(f, &a.corridor.path, &mut res, 32)?;
+                    let status = if a.replan {
+                        q.finalize_sliced_find_path_partial(f, &a.corridor.path, &mut res, 32)?
                     } else {
-                        q.finalize_sliced_find_path(f, &mut res, 32)?;
+                        q.finalize_sliced_find_path(f, &mut res, 32)?
+                    };
+                    if status.has_detail(Status::UNLOADED_BORDER) {
+                        waiting = q.search_frontier().first().copied();
                     }
                     if let Some(&r) = res.last() {
                         if r != a.target_ref {
@@ -120,7 +194,12 @@ impl Crowd {
                 a.corridor.set_corridor(pos, &res)?;
                 a.boundary.reset();
                 a.partial = false;
-                if res.last() == Some(&a.target_ref) {
+                if let Some(k) = waiting {
+                    a.target_state = T::WaitingForTile;
+                    a.waiting_tile = Some(k);
+                    a.pathq = 0;
+                    a.replan = false;
+                } else if res.last() == Some(&a.target_ref) {
                     a.target_state = T::Valid;
                     a.replan_time = 0.;
                 } else {

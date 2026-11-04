@@ -10,33 +10,56 @@
 //! per-polygon code.
 //!
 //! A search belongs to the navmesh it began on and must be resumed with a query over
-//! that navmesh, which must not change in between (tiles added or removed make the
-//! rest of the search read stale refs, as they would for any ref held across such a
-//! change).
+//! that navmesh. Tiles may be committed between steps (the search may then miss the
+//! new area: its result reflects the navmesh at its start plus additions). If a
+//! tile holding a polygon the search has visited was unloaded or removed since the
+//! last step, or the navmesh's removal log no longer reaches back that far, the step
+//! fails with [`Error::MeshChanged`] instead of reading stale refs; restart the
+//! search. The raycast has no node pool and fails on any unload or removal.
 
 use alloc::vec::Vec;
 
 use super::math::*;
 use super::node::{NodePool, NodeQueue};
-use super::query::{NavMeshQuery, QueryFilter, RaycastHit};
+use super::query::{NavMeshQuery, QueryFilter, RaycastHit, pool_changed};
 use super::query_local::{NeighbourhoodState, RaycastState, Region, SurfaceState, WallState};
 use super::{PolyRef, Status};
 use crate::{Budget, Error, Progress};
 
-/// The address identifying a navmesh, for checking that a search is resumed over
-/// the navmesh it began on.
-fn nav_id(q: &NavMeshQuery) -> usize {
-    core::ptr::from_ref(q.nav()).addr()
+/// The navmesh a search began on (its address) and the epoch it was last checked
+/// at.
+#[derive(Clone, Copy)]
+struct Stamp {
+    id: usize,
+    epoch: u64,
 }
 
-fn check_nav(q: &NavMeshQuery, id: usize) -> Result<(), Error> {
-    if nav_id(q) == id {
-        Ok(())
-    } else {
-        Err(Error::InvalidParameter(
-            "search resumed with a query over another navmesh",
-        ))
+fn nav_id(q: &NavMeshQuery) -> Stamp {
+    Stamp {
+        id: core::ptr::from_ref(q.nav()).addr(),
+        epoch: q.nav().epoch(),
     }
+}
+
+/// Checks that `q` is over the search's navmesh and that no tile the search
+/// touched (`pool`; any tile without one) lost its tile since the stamp's epoch,
+/// then moves the stamp to the current epoch.
+fn check_nav(q: &NavMeshQuery, stamp: &mut Stamp, pool: Option<&NodePool>) -> Result<(), Error> {
+    let now = nav_id(q);
+    if now.id != stamp.id {
+        return Err(Error::InvalidParameter(
+            "search resumed with a query over another navmesh",
+        ));
+    }
+    let changed = match pool {
+        Some(p) => pool_changed(q.nav(), stamp.epoch, p),
+        None => q.nav().changed_since(stamp.epoch, &mut |_| true),
+    };
+    if changed {
+        return Err(Error::MeshChanged);
+    }
+    stamp.epoch = now.epoch;
+    Ok(())
 }
 
 impl NavMeshQuery<'_> {
@@ -212,7 +235,7 @@ impl NavMeshQuery<'_> {
 /// A resumable `findPolysAroundCircle` or `findPolysAroundShape` (not in
 /// recastnavigation).
 pub struct PolysAroundSearch {
-    nav: usize,
+    nav: Stamp,
     pool: NodePool,
     open: NodeQueue,
     center: [f32; 3],
@@ -259,7 +282,7 @@ impl PolysAroundSearch {
         filter: &dyn QueryFilter,
         budget: &mut Budget,
     ) -> Result<Progress, Error> {
-        check_nav(q, self.nav)?;
+        check_nav(q, &mut self.nav, Some(&self.pool))?;
         if self.done {
             return Ok(Progress::Done);
         }
@@ -310,14 +333,14 @@ impl PolysAroundSearch {
         path: &mut Vec<PolyRef>,
         max_path: usize,
     ) -> Result<Status, Error> {
-        check_nav(q, self.nav)?;
+        check_nav(q, &mut { self.nav }, Some(&self.pool))?;
         q.path_from_pool(&self.pool, end_ref, path, max_path)
     }
 }
 
 /// A resumable `findDistanceToWall` (not in recastnavigation).
 pub struct DistanceToWallSearch {
-    nav: usize,
+    nav: Stamp,
     pool: NodePool,
     open: NodeQueue,
     center: [f32; 3],
@@ -333,7 +356,7 @@ impl DistanceToWallSearch {
         filter: &dyn QueryFilter,
         budget: &mut Budget,
     ) -> Result<Progress, Error> {
-        check_nav(q, self.nav)?;
+        check_nav(q, &mut self.nav, Some(&self.pool))?;
         if self.done {
             return Ok(Progress::Done);
         }
@@ -374,7 +397,7 @@ impl DistanceToWallSearch {
 
 /// A resumable `findLocalNeighbourhood` (not in recastnavigation).
 pub struct LocalNeighbourhoodSearch {
-    nav: usize,
+    nav: Stamp,
     pool: NodePool,
     center: [f32; 3],
     radius_sqr: f32,
@@ -392,7 +415,7 @@ impl LocalNeighbourhoodSearch {
         filter: &dyn QueryFilter,
         budget: &mut Budget,
     ) -> Result<Progress, Error> {
-        check_nav(q, self.nav)?;
+        check_nav(q, &mut self.nav, Some(&self.pool))?;
         if self.done {
             return Ok(Progress::Done);
         }
@@ -433,7 +456,7 @@ impl LocalNeighbourhoodSearch {
 
 /// A resumable `moveAlongSurface` (not in recastnavigation).
 pub struct SurfaceMoveSearch {
-    nav: usize,
+    nav: Stamp,
     pool: NodePool,
     state: SurfaceState,
     max_visited: usize,
@@ -447,7 +470,7 @@ impl SurfaceMoveSearch {
         filter: &dyn QueryFilter,
         budget: &mut Budget,
     ) -> Result<Progress, Error> {
-        check_nav(q, self.nav)?;
+        check_nav(q, &mut self.nav, Some(&self.pool))?;
         let state = &mut self.state;
         let exhausted = q.with_tiny_pool(&mut self.pool, |q| {
             while !state.finished() {
@@ -479,7 +502,7 @@ impl SurfaceMoveSearch {
 
 /// A resumable raycast (not in recastnavigation).
 pub struct RaycastSearch {
-    nav: usize,
+    nav: Stamp,
     state: RaycastState,
 }
 
@@ -491,7 +514,7 @@ impl RaycastSearch {
         filter: &dyn QueryFilter,
         budget: &mut Budget,
     ) -> Result<Progress, Error> {
-        check_nav(q, self.nav)?;
+        check_nav(q, &mut self.nav, None)?;
         while !self.state.finished {
             if !budget.spend(1) {
                 return Ok(Progress::Exhausted);

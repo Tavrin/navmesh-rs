@@ -414,6 +414,7 @@ impl<'a> NavMeshQuery<'a> {
             hit.path_cost += filter.cost(&last_pos, &st.cur_pos, prev, cur, next);
         }
         let Some(nt) = next else {
+            hit.edge = self.nav.edge_kind(tile, self.ip_of(cur_ref), seg_max);
             let a = seg_max;
             let b = if seg_max + 1 < nv { seg_max + 1 } else { 0 };
             let dx = verts[b * 3] - verts[a * 3];
