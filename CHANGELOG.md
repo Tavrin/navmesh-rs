@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-04
+
+### Fixed
+
+- A polygon typed as an off-mesh connection, with an out-of-range landing link edge in
+  accepted tile bytes, made path queries panic with an out-of-bounds index in
+  `portal_points`. The lookup now ends instead. Affects 0.1.0 to 0.1.5.
+
 ## [0.1.5] - 2026-11-03
 
 ### Fixed
@@ -140,7 +148,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...v0.1.3
