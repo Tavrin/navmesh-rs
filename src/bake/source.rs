@@ -3,10 +3,10 @@
 use alloc::vec::Vec;
 
 use super::Input;
-use super::manifest::Fnv64;
-use crate::Error;
-use crate::common::{fmax, fmin};
+use super::manifest::{Fnv64, GridLayout};
+use crate::common::{floorf, fmax, fmin};
 use crate::recast;
+use crate::{Error, Workspace};
 
 /// Identifies a triangle within a [`GeometrySource`]; fetches return ascending ids.
 pub type TriangleId = u64;
@@ -35,7 +35,9 @@ pub type ItemId = u64;
 /// undefined behaviour.
 ///
 /// [`Input`] implements this trait, with the selection and order of
-/// [`tiles`](super::tiles), so a borrowed mesh is a source too.
+/// [`tiles`](super::tiles), so a borrowed mesh is a source too. It reads the whole mesh
+/// for every fetch; for a large mesh, [`Input::indexed`] returns the same source with a
+/// spatial index.
 pub trait GeometrySource: Sync {
     /// Pushes every triangle whose xz bounds overlap `[bmin, bmax]`.
     fn triangles(
@@ -160,7 +162,9 @@ impl TriangleSink {
         if !self.window.overlaps(lo, hi) {
             return Ok(());
         }
-        charge(&mut self.used, self.window.cap, 9 * 4 + 2)?;
+        // The cost of a triangle in the tile's index list and area list, as `tiles` charges
+        // it, so a job and `tiles` meet the same byte limit at the same triangle count.
+        charge(&mut self.used, self.window.cap, 3 * 4 + 1)?;
         reserve(&mut self.verts, 9)?;
         reserve(&mut self.areas, 1)?;
         reserve(&mut self.auto, 1)?;
@@ -481,6 +485,302 @@ impl GeometrySource for Input<'_> {
         }
         for i in 0..n {
             let v = &p.off_mesh_con_verts[i * 6..i * 6 + 6];
+            out.push(
+                i as ItemId,
+                [v[0], v[1], v[2]],
+                [v[3], v[4], v[5]],
+                p.off_mesh_con_rad[i],
+                p.off_mesh_con_flags[i],
+                p.off_mesh_con_areas[i],
+                p.off_mesh_con_dir[i] != 0,
+                p.off_mesh_con_user_id.get(i).copied().unwrap_or(0),
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A uniform grid over the xz plane that lists, for each cell, the items that touch it.
+///
+/// Items are registered in every cell their bounds cover (clamped to the grid), so a
+/// query finds every item that overlaps its box; the sinks make the exact test.
+#[derive(Clone, Copy, Debug)]
+struct Cells {
+    origin: [f32; 2],
+    extent: f32,
+    nx: i32,
+    nz: i32,
+}
+
+impl Cells {
+    /// Cell column or row of coordinate `v`, clamped into the grid. Monotone in `v`, so
+    /// an item and a query that share a point share the cell of that point.
+    fn cell(&self, v: f32, axis: usize, n: i32) -> i32 {
+        let c = floorf((v - self.origin[axis]) / self.extent) as i32; // saturating
+        c.clamp(0, n - 1)
+    }
+
+    /// Inclusive cell ranges `(x0, x1, z0, z1)` that cover `[lo, hi]`.
+    fn range(&self, lo: [f32; 2], hi: [f32; 2]) -> (i32, i32, i32, i32) {
+        (
+            self.cell(lo[0], 0, self.nx),
+            self.cell(hi[0], 0, self.nx),
+            self.cell(lo[1], 1, self.nz),
+            self.cell(hi[1], 1, self.nz),
+        )
+    }
+}
+
+/// Calls `f(id, lo, hi)` for each registration of the items of one kind: an item's xz
+/// bounds, or for a link each endpoint as a degenerate box.
+type Visit<'v> =
+    &'v dyn Fn(&mut dyn FnMut(u32, [f32; 2], [f32; 2]) -> Result<(), Error>) -> Result<(), Error>;
+
+/// Item ids per grid cell, in compressed-row form (not in recastnavigation).
+#[derive(Debug)]
+struct CellIndex {
+    cells: Cells,
+    starts: Vec<u32>,
+    ids: Vec<u32>,
+    /// `[min x, min z, max x, max z]` per id, empty for items that have none (links): a
+    /// query drops the ids whose bounds miss its box, as the sinks would.
+    bounds: Vec<[f32; 4]>,
+}
+
+impl CellIndex {
+    /// `items` is the number of ids when each id is registered once with its own bounds
+    /// (triangles, volumes), which the index then keeps for filtering.
+    fn build(
+        cells: Cells,
+        ws: &mut Workspace,
+        items: Option<usize>,
+        visit: Visit<'_>,
+    ) -> Result<Self, Error> {
+        let count = usize::try_from(i64::from(cells.nx) * i64::from(cells.nz))
+            .map_err(|_| Error::SizeOverflow)?;
+        let mut starts = ws.vec(count.checked_add(1).ok_or(Error::SizeOverflow)?, 0u32)?;
+        ws.work(count as u64)?;
+        let mut bounds = ws.vec(items.unwrap_or(0), [0.0f32; 4])?;
+        // Pass 1 counts the registrations of each cell (into `starts[cell + 1]`).
+        visit(&mut |id, lo, hi| {
+            if let Some(b) = bounds.get_mut(id as usize) {
+                *b = [lo[0], lo[1], hi[0], hi[1]];
+            }
+            let (x0, x1, z0, z1) = cells.range(lo, hi);
+            ws.work((x1 - x0 + 1) as u64 * (z1 - z0 + 1) as u64)?;
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    let at = (z as usize * cells.nx as usize + x as usize) + 1;
+                    starts[at] = starts[at].checked_add(1).ok_or(Error::SizeOverflow)?;
+                }
+            }
+            Ok(())
+        })?;
+        for i in 0..count {
+            starts[i + 1] = starts[i + 1]
+                .checked_add(starts[i])
+                .ok_or(Error::SizeOverflow)?;
+        }
+        let total = starts[count] as usize;
+        let mut cursor = ws.vec_with_capacity::<u32>(count)?;
+        cursor.extend_from_slice(&starts[..count]);
+        let mut ids = ws.vec(total, 0u32)?;
+        // Pass 2 places each id; ids arrive ascending, so each cell's list is ascending.
+        // Items with kept bounds are placed from them, without visiting the mesh again.
+        let mut place = |id: u32, lo: [f32; 2], hi: [f32; 2]| -> Result<(), Error> {
+            let (x0, x1, z0, z1) = cells.range(lo, hi);
+            for z in z0..=z1 {
+                for x in x0..=x1 {
+                    let at = z as usize * cells.nx as usize + x as usize;
+                    ids[cursor[at] as usize] = id;
+                    cursor[at] += 1;
+                }
+            }
+            Ok(())
+        };
+        if items.is_some() {
+            for (id, b) in bounds.iter().enumerate() {
+                place(id as u32, [b[0], b[1]], [b[2], b[3]])?;
+            }
+        } else {
+            visit(&mut place)?;
+        }
+        Ok(Self {
+            cells,
+            starts,
+            ids,
+            bounds,
+        })
+    }
+
+    /// The ids registered in any cell that `[lo, hi]` covers, ascending, once each; with
+    /// bounds kept, only those whose bounds overlap `[lo, hi]` (inclusive, as the sinks test).
+    fn query(&self, lo: [f32; 2], hi: [f32; 2]) -> Result<Vec<u32>, Error> {
+        let (x0, x1, z0, z1) = self.cells.range(lo, hi);
+        let mut out = Vec::new();
+        for z in z0..=z1 {
+            for x in x0..=x1 {
+                let at = z as usize * self.cells.nx as usize + x as usize;
+                let list = &self.ids[self.starts[at] as usize..self.starts[at + 1] as usize];
+                reserve(&mut out, list.len())?;
+                if self.bounds.is_empty() {
+                    out.extend_from_slice(list);
+                } else {
+                    out.extend(list.iter().copied().filter(|&id| {
+                        self.bounds.get(id as usize).is_none_or(|b| {
+                            b[0] <= hi[0] && b[2] >= lo[0] && b[1] <= hi[1] && b[3] >= lo[1]
+                        })
+                    }));
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        Ok(out)
+    }
+}
+
+/// An [`Input`] with a spatial index, a [`GeometrySource`] whose fetch cost follows the
+/// items near the tile (not in recastnavigation).
+///
+/// [`Input`] as a source reads every triangle, volume and link of the mesh for every
+/// fetch, which makes a job over a large mesh slower than [`tiles`](super::tiles), which
+/// sorts the mesh into tiles once. Build this with [`Input::indexed`] to pay that once
+/// instead. It returns the same items in the same order as `Input` for every box, so
+/// the tiles, input hashes and errors of a job are the same with either.
+#[derive(Debug)]
+pub struct IndexedInput<'a> {
+    input: Input<'a>,
+    tris: CellIndex,
+    volumes: CellIndex,
+    links: CellIndex,
+}
+
+impl<'a> Input<'a> {
+    /// Indexes this mesh by the tile grid of `grid`, for use as a [`GeometrySource`].
+    ///
+    /// The index costs memory and work proportional to the grid's tile count plus the
+    /// cells each item covers; `ws` charges and limits both. The mesh is validated as a
+    /// whole here (a fetch of [`Input`] reports a bad triangle only in the tiles that
+    /// reach it), so an invalid mesh fails now.
+    ///
+    /// # Errors
+    /// [`Error::InvalidInput`] for what the sinks reject (a bad vertex index, a
+    /// non-finite coordinate, a malformed volume or link, an area above 63, mismatched
+    /// area or link arrays), [`Error::LimitExceeded`] or [`Error::SizeOverflow`] over
+    /// `ws`'s limits.
+    pub fn indexed(
+        &self,
+        grid: &GridLayout,
+        ws: &mut Workspace,
+    ) -> Result<IndexedInput<'a>, Error> {
+        ws.begin();
+        let input = *self;
+        // Validate with sinks whose window is empty: every item is checked and dropped.
+        let never = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+        ws.work((input.tris.len() / 3 + input.volumes.len()) as u64)?;
+        input.triangles(
+            never.0,
+            never.1,
+            &mut TriangleSink::new(never.0, never.1, 0),
+        )?;
+        input.volumes(never.0, never.1, &mut VolumeSink::new(never.0, never.1, 0))?;
+        input.off_mesh(never.0, never.1, &mut OffMeshSink::new(never.0, never.1, 0))?;
+        let cells = Cells {
+            origin: [grid.origin[0], grid.origin[2]],
+            extent: grid.tile_extent,
+            nx: grid.tiles_x,
+            nz: grid.tiles_z,
+        };
+        let id = |i: usize| u32::try_from(i).map_err(|_| Error::SizeOverflow);
+        let tri_count = input.tris.len() / 3;
+        id(tri_count)?;
+        let tris = CellIndex::build(cells, ws, Some(tri_count), &|f| {
+            for (i, t) in input.tris.as_chunks::<3>().0.iter().enumerate() {
+                let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+                for &k in t {
+                    let v = vertex(input.verts, k)?;
+                    (lo, hi) = extend(lo, hi, v);
+                }
+                f(id(i)?, lo, hi)?;
+            }
+            Ok(())
+        })?;
+        let volumes = CellIndex::build(cells, ws, Some(input.volumes.len()), &|f| {
+            for (i, v) in input.volumes.iter().enumerate() {
+                let (lo, hi) = recast::calc_bounds(v.verts);
+                f(id(i)?, [lo[0], lo[2]], [hi[0], hi[2]])?;
+            }
+            Ok(())
+        })?;
+        let links = CellIndex::build(cells, ws, None, &|f| {
+            let v = input.off_mesh.off_mesh_con_verts;
+            for (i, c) in v.as_chunks::<6>().0.iter().enumerate() {
+                f(id(i)?, [c[0], c[2]], [c[0], c[2]])?;
+                f(id(i)?, [c[3], c[5]], [c[3], c[5]])?;
+            }
+            Ok(())
+        })?;
+        Ok(IndexedInput {
+            input,
+            tris,
+            volumes,
+            links,
+        })
+    }
+}
+
+fn extend(lo: [f32; 2], hi: [f32; 2], v: [f32; 3]) -> ([f32; 2], [f32; 2]) {
+    (
+        [fmin(lo[0], v[0]), fmin(lo[1], v[2])],
+        [fmax(hi[0], v[0]), fmax(hi[1], v[2])],
+    )
+}
+
+impl GeometrySource for IndexedInput<'_> {
+    fn triangles(
+        &self,
+        bmin: [f32; 3],
+        bmax: [f32; 3],
+        out: &mut TriangleSink,
+    ) -> Result<(), Error> {
+        let (input, areas) = (&self.input, self.input.areas);
+        for i in self.tris.query([bmin[0], bmin[2]], [bmax[0], bmax[2]])? {
+            let i = i as usize;
+            let tri = input
+                .tris
+                .get(i * 3..i * 3 + 3)
+                .ok_or(Error::InvalidInput("triangle index"))?;
+            let t = [
+                vertex(input.verts, tri[0])?,
+                vertex(input.verts, tri[1])?,
+                vertex(input.verts, tri[2])?,
+            ];
+            out.push(i as TriangleId, t, areas.map(|a| a[i]))?;
+        }
+        Ok(())
+    }
+
+    fn volumes(&self, bmin: [f32; 3], bmax: [f32; 3], out: &mut VolumeSink) -> Result<(), Error> {
+        for i in self.volumes.query([bmin[0], bmin[2]], [bmax[0], bmax[2]])? {
+            let v = self
+                .input
+                .volumes
+                .get(i as usize)
+                .ok_or(Error::InvalidInput("area volume"))?;
+            out.push(ItemId::from(i), v.verts, v.hmin, v.hmax, v.area)?;
+        }
+        Ok(())
+    }
+
+    fn off_mesh(&self, bmin: [f32; 3], bmax: [f32; 3], out: &mut OffMeshSink) -> Result<(), Error> {
+        let p = &self.input.off_mesh;
+        for i in self.links.query([bmin[0], bmin[2]], [bmax[0], bmax[2]])? {
+            let i = i as usize;
+            let v = p
+                .off_mesh_con_verts
+                .get(i * 6..i * 6 + 6)
+                .ok_or(Error::InvalidInput("off-mesh connections"))?;
             out.push(
                 i as ItemId,
                 [v[0], v[1], v[2]],

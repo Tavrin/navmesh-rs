@@ -42,9 +42,12 @@ mod task;
 pub use install::{TileInstaller, install_cost};
 pub use job::{BakeJob, JobOptions, TileOutput};
 pub use manifest::{
-    BAKE_REVISION, BakeManifest, GridLayout, MANIFEST_VERSION, ManifestEntry, TileKey,
+    BAKE_REVISION, BakeManifest, DirtyTiles, GridLayout, MANIFEST_VERSION, ManifestDelta,
+    ManifestEntry, TileKey,
 };
-pub use source::{GeometrySource, ItemId, OffMeshSink, TriangleId, TriangleSink, VolumeSink};
+pub use source::{
+    GeometrySource, IndexedInput, ItemId, OffMeshSink, TriangleId, TriangleSink, VolumeSink,
+};
 #[cfg(test)]
 use task::TileWorkspace;
 use task::{Advance, OffMesh, TileTask, TriSource, VolumeRef};

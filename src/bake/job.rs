@@ -5,7 +5,8 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use super::manifest::{
-    BakeManifest, GridLayout, MANIFEST_VERSION, ManifestEntry, TileKey, digest_bytes, input_hash,
+    BakeManifest, GridLayout, MANIFEST_VERSION, ManifestDelta, ManifestEntry, TileKey,
+    digest_bytes, input_hash,
 };
 use super::source::{GeometrySource, OffMeshSink, TriangleSink, VolumeSink};
 use super::task::{Advance, OffMesh, TileTask, TriSource, VolumeRef};
@@ -154,6 +155,29 @@ fn output(
 /// stages, and the longest uninterrupted piece is one stage of one tile (or one fetch).
 /// A job never touches a navmesh.
 ///
+/// **Byte limits.** [`BakeConfig::tile_limits`] and [`BakeConfig::max_total_bytes`] count
+/// bytes the way [`tiles`](super::tiles) does (the triangle lists of a tile cost the same
+/// in both), so a job over an [`Input`](super::Input) succeeds and fails with
+/// the same limits. One term differs: the Detour output bound of a tile counts the
+/// off-mesh connections of its own column here and every connection of the input in
+/// [`tiles`](super::tiles), so near the limit a job can succeed where `tiles` fails, never
+/// the reverse. `max_total_bytes` is checked before each fetch and each parallel chunk
+/// against the finished tiles not yet taken from [`next_ready`](Self::next_ready) plus the
+/// tiles in flight; take tiles out as they finish to stay within it.
+///
+/// **Cancelling.** [`cancel_token`](Self::cancel_token) ends the job at once. Every tile
+/// that [`next_ready`](Self::next_ready) returned before is whole and valid, and is listed
+/// in [`manifest_delta`](Self::manifest_delta); every other tile of the job is absent, not
+/// partial. A navmesh fed from the job therefore holds, per tile, either its old version
+/// or its new one, and the delta says which tiles are new: the window in which neighbours
+/// of the two kinds meet is the time between the cancel and the next job over the tiles
+/// still stale. Install the delivered tiles of a cancelled job (or none), apply the delta
+/// to the manifest, and run a new job over the same keys: [`skip_unchanged`](Self::skip_unchanged)
+/// drops the delivered tiles and the job settles the rest.
+/// [`TileInstaller`](super::TileInstaller) keeps the newest version of a
+/// tile and replaces the resident one, so a new job's tiles supersede the old job's
+/// whether they were installed or still queued.
+///
 /// ```
 /// use navmesh_rs::bake::{BakeConfig, BakeJob, GridLayout, Input, JobOptions};
 /// use navmesh_rs::{Budget, Progress};
@@ -281,7 +305,10 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
     /// Drops the keys whose input is unchanged since `prev` (a hash-only pass).
     ///
     /// Fetches each queued tile's column and compares its input hash with `prev`'s
-    /// entry. A `prev` baked with a different configuration or layout drops nothing.
+    /// entry. A `prev` baked with a different configuration or layout (anything but the
+    /// grid size) drops nothing and the call returns `Ok(false)`: every tile of the job is
+    /// rebaked, and [`BakeManifest::retarget`] must move the manifest before
+    /// [`BakeManifest::apply`] accepts the job's delta. Otherwise returns `Ok(true)`.
     /// Call before the first [`step`](Self::step). `ws` limits the pass.
     ///
     /// # Errors
@@ -290,7 +317,7 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
         &mut self,
         prev: &BakeManifest,
         ws: &mut Workspace,
-    ) -> Result<(), BakeError> {
+    ) -> Result<bool, BakeError> {
         self.check()?;
         if self.next != 0 || self.current.is_some() {
             return Err(BakeError {
@@ -298,8 +325,11 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
                 error: Error::InvalidParameter("skip_unchanged after the job started"),
             });
         }
-        if prev.version != MANIFEST_VERSION || prev.config_hash != self.config_hash {
-            return Ok(());
+        if prev.version != MANIFEST_VERSION
+            || prev.config_hash != self.config_hash
+            || !prev.grid.same_layout(&self.grid)
+        {
+            return Ok(false);
         }
         ws.begin();
         let plan = self.plan();
@@ -317,7 +347,7 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
         }
         self.skipped += self.keys.len() - kept.len();
         self.keys = kept;
-        Ok(())
+        Ok(true)
     }
 
     /// Runs whole stages until the budget has no work left, a tile fails or the job ends.
@@ -352,6 +382,7 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
     /// One unit of `step`: fetch the next tile, or advance the tile in flight by one stage.
     fn run_one_stage(&mut self) -> Result<u64, BakeError> {
         let Some((key, hash, task)) = &mut self.current else {
+            self.admit(1).map_err(|e| self.fail(e))?;
             let key = self.keys[self.next];
             let started = (|| {
                 let plan = self.plan();
@@ -423,6 +454,7 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
         }
         .max(1);
         let end = self.keys.len().min(self.next.saturating_add(chunk));
+        self.admit(end - self.next).map_err(|e| self.fail(e))?;
         let plan = self.plan();
         let results = map_ordered(&self.keys[self.next..end], |key| {
             plan.bake_tile(*key, &self.cancel)
@@ -469,8 +501,20 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
 
     /// Manifest entries of the tiles returned by [`next_ready`](Self::next_ready) so far,
     /// in row-major order. [`BakeManifest::apply`] merges them into the previous manifest.
-    pub fn manifest_delta(&self) -> Vec<ManifestEntry> {
-        self.delivered.clone()
+    pub fn manifest_delta(&self) -> ManifestDelta {
+        ManifestDelta {
+            config_hash: self.config_hash,
+            entries: self.delivered.clone(),
+        }
+    }
+
+    /// Checks `max_total_bytes` for `in_flight` tiles about to start: the finished tiles
+    /// not yet taken, the tiles in flight and their working storage, as for
+    /// [`tiles`](super::tiles).
+    fn admit(&self, in_flight: usize) -> Result<(), BakeError> {
+        let retained = self.ready.len().saturating_add(in_flight);
+        super::check_total_bytes(&self.cfg, 0, retained, in_flight)
+            .map_err(|error| BakeError { tile: None, error })
     }
 }
 

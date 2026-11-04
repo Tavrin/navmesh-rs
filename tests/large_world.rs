@@ -168,7 +168,10 @@ fn large_world_bake_and_rebake_latency() {
         };
         let edited = base.clone().with(edit);
         let start = Instant::now();
-        let dirty = manifest.dirty_from_boxes(&[edit.bounds()]);
+        let dirty = manifest
+            .dirty_from_boxes(&cfg, &grid, &[edit.bounds()])
+            .unwrap()
+            .keys;
         let mut job =
             BakeJob::new(&edited, &cfg, &grid, dirty.clone(), JobOptions::default()).unwrap();
         job.skip_unchanged(&manifest, &mut Workspace::new())
@@ -252,11 +255,16 @@ fn huge_world_sample_row() {
     );
     let manifest = BakeManifest::new(&cfg, &grid).unwrap();
     let start = Instant::now();
-    let dirty =
-        manifest.dirty_from_boxes(&[[110_000.0, 0.0, 110_000.0, 110_100.0, 9.0, 110_100.0]]);
+    let dirty = manifest
+        .dirty_from_boxes(
+            &cfg,
+            &grid,
+            &[[110_000.0, 0.0, 110_000.0, 110_100.0, 9.0, 110_100.0]],
+        )
+        .unwrap();
     println!(
         "dirty_from_boxes at the far corner: {} tiles in {:?}",
-        dirty.len(),
+        dirty.keys.len(),
         start.elapsed()
     );
 }

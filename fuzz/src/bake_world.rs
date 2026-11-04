@@ -9,7 +9,7 @@
 
 use navmesh_rs::bake::{
     self, AreaVolume, BakeConfig, BakeJob, BakeManifest, GeometrySource, GridLayout, Input,
-    JobOptions, ManifestEntry, OffMeshSink, Partition, TileKey, TileOutput, TriangleSink,
+    JobOptions, ManifestDelta, OffMeshSink, Partition, TileKey, TileOutput, TriangleSink,
     VolumeSink,
 };
 use navmesh_rs::{Budget, Error, Progress, Workspace};
@@ -272,6 +272,29 @@ impl Scenario {
         let n = (WORLD / extent).ceil() as i32;
         GridLayout::new([0.0, -1.0, 0.0], 8.0, n, n, &self.cfg).ok()
     }
+
+    /// The layout of [`layout`](Self::layout) and a variant of it, as `(before, after)` of
+    /// an edit that changes the layout. Bits of the driver parameter pick the variant: the
+    /// grid grows by up to two tiles along each axis (bits 4-7), the top of the height
+    /// range rises by up to three metres (bits 2-3, which changes every tile), and bit 0
+    /// swaps the two (the world shrinks, the height range drops).
+    pub fn layout_pair(&self) -> Option<(GridLayout, GridLayout)> {
+        let base = self.layout()?;
+        let p = self.param;
+        let grown = GridLayout::new(
+            base.origin,
+            base.max_y + f32::from(p >> 2 & 3),
+            base.tiles_x + i32::from((p >> 4 & 3).min(2)),
+            base.tiles_z + i32::from((p >> 6 & 3).min(2)),
+            &self.cfg,
+        )
+        .ok()?;
+        Some(if p & 1 == 1 {
+            (grown, base)
+        } else {
+            (base, grown)
+        })
+    }
 }
 
 /// The tiles of a finished job, keyed, with its manifest; `None` if any tile failed.
@@ -286,7 +309,7 @@ pub fn bake_keys(
     keys: Vec<TileKey>,
     prev: Option<&BakeManifest>,
     allowance: u64,
-) -> Option<(Vec<TileOutput>, Vec<ManifestEntry>)> {
+) -> Option<(Vec<TileOutput>, ManifestDelta)> {
     let mut job = BakeJob::new(world, cfg, grid, keys, JobOptions::default()).ok()?;
     if let Some(prev) = prev {
         job.skip_unchanged(prev, &mut Workspace::new()).ok()?;

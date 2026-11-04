@@ -1014,7 +1014,12 @@ oracle comparison covers the job's stages too.
 | A job over a borrowed mesh gives the bytes and order of `tiles` for any step budget (1 unit, 7,000, unlimited), `run_parallel` and rayon pools of 1, 4 and 16 threads; all three partitions; automatic, explicit and mixed per-triangle areas; area volumes and off-mesh links | `tests/bake_job.rs::every_driver_reproduces_tiles_for_borrowed_and_mixed_area_sources` |
 | Incremental rebake (dirty boxes, then input-hash skipping) equals a full bake of the edited world: every tile's bytes and the whole manifest, for raise, hole, wall, area volume and link edits; an unchanged world rebakes nothing; a changed configuration invalidates every tile | `tests/bake_job.rs::incremental_rebake_is_byte_identical_to_a_full_bake`; fuzz target `incremental_bake` |
 | Cancel returns no tile after it, tiles delivered before it equal the full bake, a cancel raised during a fetch is caught by the next work charge | `tests/bake_job.rs::cancel_returns_no_partial_tile_and_keeps_delivered_tiles_valid`; fuzz target `bake_job_steps` |
-| Manifest bytes are validated (magic, version, layout, exact length, strict `(z, x)` order, keys inside the grid, canonical flags, limits) | `tests/bake_job.rs::manifest_round_trips_and_untrusted_bytes_are_validated` |
+| Manifest bytes are validated (magic, version, layout, layout against the stored configuration hash, grid size against `max_work`, exact length, strict `(z, x)` order, keys inside the grid, canonical flags, limits) | `tests/bake_job.rs::manifest_round_trips_and_untrusted_bytes_are_validated` |
+| A grown or shrunk grid, or a changed layout or configuration, is detected: new tiles are dirty, a layout change is a reported full rebake, `apply` refuses a delta baked under another configuration, non-finite edit boxes are errors | `tests/bake_job.rs::growing_the_grid_dirties_the_new_tiles`, `shrinking_the_grid_reports_the_removed_tiles`, `a_layout_change_is_a_reported_full_rebake_and_a_stale_delta_is_refused`, `edit_boxes_must_be_finite`, `a_manifest_with_a_foreign_layout_is_not_used_to_skip_tiles` |
+| `TileInstaller` replaces a resident tile (old refs die), the newest queued version of a tile wins, a refused tile leaves the resident one, a tile rebaked to nothing removes it | `tests/bake_job.rs::installer_replaces_resident_tiles_and_the_newest_queued_version_wins` |
+| Cancel rule: tiles are whole, new exactly where `manifest_delta` lists them, per-call install stays one tile per unit of budget | `tests/bake_job.rs::a_cancelled_rebake_leaves_whole_old_or_new_tiles_and_the_delta_names_the_new_ones`; fuzz target `bake_job_steps` |
+| A job meets the same `tile_limits.max_bytes` as `tiles` (least passing value equal), and enforces `max_total_bytes` | `tests/bake_job.rs::byte_limits_mean_the_same_for_a_job_and_tiles` |
+| `Input::indexed` gives the tiles and input hashes of the plain `Input` source; on 180,000 triangles in 400 tiles (release, serial, a shared machine, 3 runs) a serial job over the indexed mesh took 101 to 110% of `tiles()` (107 to 115% with the one-time index build), the plain `Input` source 335 to 350%; the all-tile hash pass 12 to 14 ms against 360 to 390 ms | `tests/bake_job.rs::an_indexed_input_gives_the_tiles_and_hashes_of_the_plain_input`; fuzz target `bake_job_steps` |
 
 A fuzz run found one defect, in the fuzz model (the dirty box of a removed area volume read
 the wrong coordinate), not in the library; the input is kept as a corpus seed.
@@ -1033,6 +1038,23 @@ no edge coverage (the rule in `fuzz/README.md`), all with no crash:
 
 CPU time per target is its wall time (one worker): 90 CPU-minutes, inside the 10 to 120
 minute window.
+
+After the review fixes the two targets were extended: `incremental_bake` varies the layout
+(the grid grows or shrinks by up to two tiles per axis, the top of the height range rises
+by up to three metres, which is a full rebake) and installs the rebaked tiles over the old
+ones behind stale queued versions; `bake_job_steps` also bakes on a grown grid, from an
+indexed mesh, and cancels a rebake over a navmesh holding the previous world. Same settings
+as above, continued from the previous corpus in 600 s chunks until a chunk added no edge
+coverage:
+
+| Target | Chunks | Coverage (edges) | Result |
+|---|---|---|---|
+| `incremental_bake` | 1,800 s on the first extension, then 2 x 600 s on the final code | 8,431 to 8,432, then 8,432 | last chunk added 0 edges, no crash |
+| `bake_job_steps` | 600 s on the first extension, then 600 s on the final code | 9,799, then 9,844 (final code) | last chunk added 0 edges, no crash |
+
+The first extension runs used the code before the last two changes (the word-wide digest
+step and the per-item bounds filter of the index), which touch only the digest and the index;
+the final-code chunks cover them.
 
 ### Install cost and slicing
 

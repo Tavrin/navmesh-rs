@@ -130,10 +130,18 @@ For a world too large to hold as one triangle soup, implement `bake::GeometrySou
 answers "what is in this box", in a fixed order) and drive a `bake::BakeJob`. Each tile
 is baked from its own bordered column with the pipeline `tiles` uses, so the bytes are
 identical. The caller persists a `BakeManifest` beside the tiles; after an edit,
-`dirty_from_boxes` names the tiles the edited boxes touch and `skip_unchanged` drops those
-whose input hash did not change. Rebaking only the dirty tiles gives exactly the tiles and
+`dirty_from_boxes(&config, &grid, &boxes)` names the tiles the edited boxes touch, the tiles
+a larger grid added and, if the configuration or layout changed, every tile (`full_rebake`),
+and `skip_unchanged` drops those whose input hash did not change. `retarget` moves the
+manifest to the new grid and `apply` merges the job's `manifest_delta`, refusing a delta baked
+under another configuration. Rebaking only the dirty tiles gives exactly the tiles and
 manifest of a full bake. `step` works in slices of a `Budget`, `run_parallel` uses the rayon
-pool, and a `CancelToken` stops a job without ever returning a partial tile.
+pool, and a `CancelToken` stops a job without ever returning a partial tile. A navmesh fed
+by `TileInstaller` replaces a resident tile with its rebake and keeps the newest queued
+version of each tile; after a cancel, every tile is whole, new exactly where
+`manifest_delta` lists it. For a large `Input`, `Input::indexed` builds the spatial index
+once so each fetch costs what the tile holds, not what the mesh holds. Manifest digests are
+not collision resistant: use the manifest as a cache for trusted content.
 
 ```rust
 use navmesh_rs::bake::{BakeConfig, BakeJob, GridLayout, Input, JobOptions};

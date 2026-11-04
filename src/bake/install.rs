@@ -1,13 +1,13 @@
 //! Budgeted installation of finished tiles into a navmesh (not in recastnavigation).
 
-use alloc::collections::VecDeque;
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use super::BakeError;
 use super::job::TileOutput;
 use super::manifest::TileKey;
 use crate::detour::NavMesh;
-use crate::{Budget, Progress};
+use crate::{Budget, Error, Progress};
 
 /// Work units one tile of `len` bytes costs: one per KiB of tile data, at least one.
 ///
@@ -27,10 +27,27 @@ pub fn install_cost(len: usize) -> u64 {
 /// limits; the navmesh's own `max_tiles` (set from [`GridLayout::nav_mesh_params`]) is the
 /// residency cap and is a parameter of the navmesh, not of this type.
 ///
+/// **Rebakes.** A tile whose slot is already resident replaces it: the resident tile is
+/// removed (its refs stop validating, as for [`NavMesh::remove_tile`]) and the new one
+/// added, within one [`install`](Self::install) step. A tile without polygons
+/// removes the resident tile of its key, if any, and is otherwise a no-op. The queue keeps
+/// at most one entry per key, the newest push: an older queued version is dropped, not
+/// installed, so a superseded job's tiles can never overwrite a newer job's. Entries
+/// install in the order of their last push.
+///
+/// **Cancelled jobs.** Tiles are installed whole, one at a time. After a cancel the
+/// navmesh holds, for each tile, a complete old or a complete new version, and
+/// [`BakeJob::manifest_delta`](super::BakeJob::manifest_delta) lists the new ones.
+/// [`clear`](Self::clear) drops what is still queued and says which keys it was.
+///
 /// [`GridLayout::nav_mesh_params`]: super::GridLayout::nav_mesh_params
 #[derive(Debug, Default)]
 pub struct TileInstaller {
-    pending: VecDeque<(TileKey, Vec<u8>)>,
+    /// Queued entries in the order of their push; the key of the entry is `latest`'s.
+    queue: BTreeMap<u64, (TileKey, Option<Vec<u8>>)>,
+    /// Sequence number of the queued entry of each key.
+    latest: BTreeMap<TileKey, u64>,
+    next_seq: u64,
     installed: usize,
 }
 
@@ -40,59 +57,101 @@ impl TileInstaller {
         Self::default()
     }
 
-    /// Queues a finished tile; tiles without polygons are dropped (there is nothing to install).
+    /// Queues a finished tile, replacing a queued tile of the same key. A tile without
+    /// polygons is queued as the removal of the resident tile of its key.
     pub fn push(&mut self, tile: TileOutput) {
-        if let Some(data) = tile.data {
-            self.pending.push_back((tile.key, data));
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        if let Some(old) = self.latest.insert(tile.key, seq) {
+            self.queue.remove(&old);
         }
+        self.queue.insert(seq, (tile.key, tile.data));
     }
 
-    /// Tiles waiting to be installed.
+    /// Entries waiting to be installed (at most one per key).
     pub fn pending(&self) -> usize {
-        self.pending.len()
+        self.queue.len()
     }
 
-    /// Tiles installed so far.
+    /// Entries applied so far: tiles installed or replaced, and removals.
     pub fn installed(&self) -> usize {
         self.installed
+    }
+
+    /// Drops every queued entry and returns their keys, in row-major order. The navmesh
+    /// keeps what it holds.
+    pub fn clear(&mut self) -> Vec<TileKey> {
+        self.queue.clear();
+        core::mem::take(&mut self.latest).into_keys().collect()
     }
 
     /// Installs queued tiles, in the order queued, until `budget` has no work left.
     ///
     /// Returns [`Progress::Done`] when the queue is empty and [`Progress::Exhausted`] when
-    /// the budget ran out first. At least one tile is installed whenever the budget has
-    /// work left; the tile that crosses the limit is installed whole and the budget is
+    /// the budget ran out first. At least one entry is applied whenever the budget has
+    /// work left; the one that crosses the limit is applied whole and the budget is
     /// marked fully spent.
     ///
     /// # Errors
     /// A [`BakeError`] naming the tile whose bytes the navmesh refused (all or nothing: the
-    /// navmesh is unchanged by that tile, which leaves the queue; later tiles stay queued).
+    /// navmesh keeps the tile it held for that key, which stays resident; the entry leaves
+    /// the queue and later entries stay queued).
     pub fn install(
         &mut self,
         nav: &mut NavMesh,
         budget: &mut Budget,
     ) -> Result<Progress, BakeError> {
-        while let Some((key, data)) = self.pending.pop_front() {
+        loop {
+            if self.queue.is_empty() {
+                return Ok(Progress::Done);
+            }
             if budget.remaining() == 0 {
-                self.pending.push_front((key, data));
                 budget.exhaust();
                 return Ok(Progress::Exhausted);
             }
-            let cost = install_cost(data.len());
-            nav.add_tile(data).map_err(|error| BakeError {
+            let Some((_, (key, data))) = self.queue.pop_first() else {
+                return Ok(Progress::Done);
+            };
+            self.latest.remove(&key);
+            let cost = data.as_ref().map_or(1, |d| install_cost(d.len()));
+            apply(nav, key, data).map_err(|error| BakeError {
                 tile: Some([key.x, key.z]),
                 error,
             })?;
             self.installed += 1;
             if !budget.spend(cost) {
                 budget.exhaust();
-                return Ok(if self.pending.is_empty() {
+                return Ok(if self.queue.is_empty() {
                     Progress::Done
                 } else {
                     Progress::Exhausted
                 });
             }
         }
-        Ok(Progress::Done)
+    }
+}
+
+/// Makes `data` the tile of `key` in `nav`, or removes the tile when `data` is `None`.
+/// The resident tile is restored if the new one is refused.
+fn apply(nav: &mut NavMesh, key: TileKey, data: Option<Vec<u8>>) -> Result<(), Error> {
+    let resident = nav
+        .tile_index_at(key.x, key.z, 0)
+        .map(|i| nav.tile_ref(i))
+        .filter(|&r| r != 0);
+    let old = match resident {
+        Some(r) => Some(nav.remove_tile(r)?),
+        None => None,
+    };
+    let Some(data) = data else {
+        return Ok(());
+    };
+    match nav.add_tile(data) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if let Some(old) = old {
+                nav.add_tile(old)?;
+            }
+            Err(error)
+        }
     }
 }

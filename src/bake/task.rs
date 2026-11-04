@@ -508,10 +508,11 @@ impl<'a> TileTask<'a> {
             })?,
             TriSource::Fetched { areas, mode } => {
                 let n = areas.len();
-                let verts = self.verts.len();
+                // The vertex copy is the fetch's own storage, capped by the sink at the
+                // per-triangle price `tiles` pays for its index list; only the index and
+                // area lists are charged here, so both paths cost the same.
                 self.tw.stage(|ws| {
                     work(ws, n)?;
-                    ws.charge_bytes::<f32>(verts)?;
                     ws.charge_bytes::<u8>(n)?;
                     let mut tris =
                         ws.vec_with_capacity(n.checked_mul(3).ok_or(Error::SizeOverflow)?)?;
