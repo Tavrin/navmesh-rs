@@ -160,10 +160,10 @@ impl core::ops::IndexMut<usize> for SlotTable {
 /// Each tile slot carries a salt that is part of every ref into it; removing a
 /// tile increments the salt, so refs to the removed tile stop validating. The salt
 /// has `salt_bits` bits (16 with 64-bit refs, at least 10 with 32-bit refs) and
-/// skips 0, so after `2^salt_bits - 1` removals from the same slot the salt wraps
-/// and a ref that old validates again against whatever tile then occupies the
-/// slot. This is inherent to the `dtPolyRef` format; callers that keep refs across
-/// that many removals must drop them themselves.
+/// skips 0. At salt `2^salt_bits - 1`, a removal, forgotten reservation or
+/// replacement requiring a new salt fails with [`Error::SaltExhausted`] before
+/// mutation. Thus a slot permits at most `2^salt_bits - 2` salt advances in its
+/// lifetime (65,534 with 64-bit refs). Identical unload/reload remains possible.
 ///
 /// [`NavMesh::unload_tile`] evicts a tile without changing its salt, so refs
 /// survive an identical reload; see the streaming section of the `detour` module
@@ -199,7 +199,7 @@ struct Target {
     prev: Option<i32>,
     salt: u32,
     /// Content hash of the unloaded tile the slot is reserved for.
-    parked_hash: Option<u64>,
+    parked_hash: Option<[u8; 32]>,
 }
 
 /// Where [`NavMesh::insert_tile`] puts a tile.
@@ -1198,11 +1198,16 @@ impl NavMesh {
         &mut self,
         tile: MeshTile,
         target: Target,
-        hash: Option<u64>,
+        hash: Option<[u8; 32]>,
         internally_linked: bool,
     ) -> Result<TileRef, Error> {
         let ti = target.ti;
-        // The only fallible step (page allocation of a keyed slot) comes first.
+        let salt = if target.parked_hash.is_some_and(|old| hash != Some(old)) {
+            self.next_salt(target.salt)?
+        } else {
+            target.salt
+        };
+        // Finish fallible preflight before the slot and free list change.
         self.slots.ensure(ti)?;
         let h = &tile.header;
         let (hx, hy, hl) = (h.x, h.y, h.layer);
@@ -1216,11 +1221,7 @@ impl NavMesh {
                 self.slots[prev as usize].next = nxt;
             }
         }
-        let mut salt = target.salt;
-        if let Some(old) = target.parked_hash {
-            if hash != Some(old) {
-                salt = self.next_salt(salt);
-            }
+        if target.parked_hash.is_some() {
             self.stream.unpark(hx, hy, hl);
         }
         if !self.stream.is_keyed() {
@@ -1274,19 +1275,19 @@ impl NavMesh {
             }
         }
         if self.global_off_mesh {
-            self.connect_global_pairs(ti);
+            self.rebuild_global_links();
         }
         Ok(self.tile_ref(ti))
     }
 
     /// Removes a tile and returns the bytes it was added from (`removeTile`). The
     /// slot's salt is incremented, so refs to the removed tile no longer validate
-    /// (see the salt wrap-around note on [`NavMesh`]). All or nothing: on error the
+    /// (see the salt exhaustion limit on [`NavMesh`]). All or nothing: on error the
     /// navmesh is unchanged.
     pub fn remove_tile(&mut self, r: TileRef) -> Result<Vec<u8>, Error> {
         let ti = self.resident_slot(r)?;
+        let next = self.next_salt(self.slots[ti].salt)?;
         let tile = self.detach(ti);
-        let next = self.next_salt(self.slots[ti].salt);
         self.release_slot(ti, next);
         Ok(tile.map(|t| t.data).unwrap_or_default())
     }
@@ -1310,11 +1311,14 @@ impl NavMesh {
         }
     }
 
-    /// The salt after `salt` (skipping 0).
-    fn next_salt(&self, salt: u32) -> u32 {
+    /// The next salt, refusing reuse before any mutation.
+    fn next_salt(&self, salt: u32) -> Result<u32, Error> {
         let mask = ((1u64 << self.salt_bits) - 1) as u32;
-        let s = salt.wrapping_add(1) & mask;
-        if s == 0 { 1 } else { s }
+        if salt >= mask {
+            Err(Error::SaltExhausted)
+        } else {
+            Ok(salt + 1)
+        }
     }
 
     /// Frees slot `ti` (no tile, not reserved) with salt `salt`: back on the free
@@ -1356,6 +1360,9 @@ impl NavMesh {
         }
         let tile = self.slots[ti].tile.take();
         self.resident = self.resident.saturating_sub(1);
+        if self.global_off_mesh {
+            self.rebuild_global_links();
+        }
         if self.resident == 0 {
             self.occupied = None;
         }
@@ -1658,18 +1665,64 @@ impl NavMesh {
             .is_some_and(|t| !t.off_mesh_cons.is_empty())
     }
 
-    /// Global links of a tile that was just added, in both roles.
-    fn connect_global_pairs(&mut self, ti: usize) {
-        let mine = self.has_off_mesh_cons(ti);
-        for j in self.resident_slots() {
-            if j == ti {
-                continue;
+    /// Rebuild global pairs in lexicographic tile-key order. Prepending links
+    /// makes the greatest landing key the snapped endpoint and first link.
+    fn rebuild_global_links(&mut self) {
+        let mut resident = self.resident_slots();
+        resident.sort_unstable_by_key(|&i| {
+            let h = &self.tile_unchecked(i as u32).header;
+            (h.x, h.y, h.layer)
+        });
+        for &owner in &resident {
+            if self.has_off_mesh_cons(owner) {
+                for &landing in &resident {
+                    if landing != owner {
+                        self.disconnect_global_pair(owner, landing);
+                    }
+                }
             }
-            if self.has_off_mesh_cons(j) {
-                self.connect_global_off_mesh_links(ti, j);
+        }
+        self.reset_global_endpoints(&resident);
+        for &owner in &resident {
+            if self.has_off_mesh_cons(owner) {
+                for &landing in &resident {
+                    if landing != owner {
+                        self.connect_global_off_mesh_links(landing, owner);
+                    }
+                }
             }
-            if mine {
-                self.connect_global_off_mesh_links(j, ti);
+        }
+    }
+
+    /// Restore authored or upstream-only endpoints before global candidates are
+    /// replayed, including when the final global landing has just disappeared.
+    fn reset_global_endpoints(&mut self, resident: &[usize]) {
+        for &owner in resident {
+            let count = self.tile_unchecked(owner as u32).off_mesh_cons.len();
+            for i in 0..count {
+                let t = self.tile_unchecked(owner as u32);
+                let con = t.off_mesh_cons[i];
+                if con.side == 0xff {
+                    continue;
+                }
+                let p = [con.pos[3], con.pos[4], con.pos[5]];
+                let half = [con.rad, t.header.walkable_climb, con.rad];
+                let mut endpoint = p;
+                for &landing in resident {
+                    if self.upstream_resolves(owner, con.side, landing)
+                        && let Some((_, nearest)) = find_nearest_poly_in_tile(
+                            self.tile_unchecked(landing as u32),
+                            &p,
+                            &half,
+                        )
+                        && sqr(nearest[0] - p[0]) + sqr(nearest[2] - p[2]) <= sqr(con.rad)
+                    {
+                        endpoint = nearest;
+                    }
+                }
+                let t = self.tile_mut(owner);
+                let v = t.polys[con.poly as usize].verts[1] as usize * 3;
+                t.verts[v..v + 3].copy_from_slice(&endpoint);
             }
         }
     }
@@ -1734,6 +1787,11 @@ impl NavMesh {
     /// and the pairs upstream resolves are untouched, so the default (off) and every
     /// pair upstream handles are identical to upstream.
     ///
+    /// Global pairs are rebuilt in ascending `(x, y, layer)` order after each
+    /// commit or removal. Links are prepended, so the greatest eligible landing
+    /// key supplies the snapped endpoint and first outgoing global link. This
+    /// rule is independent of commit order, including multiple landing layers.
+    ///
     /// Endpoint snapping is upstream's: the far endpoint is moved to the nearest point
     /// on the nearest polygon of the candidate tile, which is found within the
     /// connection radius horizontally (a circle test on the distance to the snapped
@@ -1749,15 +1807,7 @@ impl NavMesh {
         let resident = self.resident_slots();
         if enabled {
             self.global_off_mesh = true;
-            for &owner in &resident {
-                if self.has_off_mesh_cons(owner) {
-                    for &landing in &resident {
-                        if landing != owner {
-                            self.connect_global_off_mesh_links(landing, owner);
-                        }
-                    }
-                }
-            }
+            self.rebuild_global_links();
         } else {
             for &owner in &resident {
                 for &landing in &resident {
@@ -1766,6 +1816,7 @@ impl NavMesh {
                     }
                 }
             }
+            self.reset_global_endpoints(&resident);
             self.global_off_mesh = false;
         }
     }

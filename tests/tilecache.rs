@@ -645,3 +645,46 @@ fn layers_with_obstacles_stream_out_and_back_with_their_obstacles() {
         "an obstacle-free reload is rebuilt too"
     );
 }
+
+#[test]
+fn failed_unload_preserves_obstacle_associations_across_hash_chain() {
+    let mut c = TileCache::new(
+        params(4),
+        RawCompressor,
+        DefaultMeshProcess,
+        Limits::UNLIMITED,
+    )
+    .expect("cache");
+    let mut n = nav(4);
+    let mut refs = Vec::new();
+    for x in 0..4 {
+        refs.push(c.add_tile(data(x)).expect("layer"));
+    }
+    let plain = c.build_tile_data(refs[0]).expect("build");
+    let o = c.add_obstacle(cylinder(4.)).expect("obstacle");
+    drain(&mut c, &mut n);
+    let carved = c.build_tile_data(refs[0]).expect("carved");
+    assert_ne!(plain, carved);
+    let r = n.tile_ref(n.tile_index_at(0, 0, 0).expect("resident"));
+    let before = n.residency().to_bytes();
+    c.set_limits(Limits {
+        max_work: 2,
+        ..Limits::UNLIMITED
+    });
+    assert_eq!(c.unload_tile(refs[0]), Err(Error::LimitExceeded));
+    assert_eq!(n.residency().to_bytes(), before);
+    assert!(n.is_valid_poly_ref(r));
+    c.set_limits(Limits::UNLIMITED);
+    assert_eq!(
+        c.build_tile_data(refs[0]).expect("retained carving"),
+        carved
+    );
+    c.remove_obstacle(o).expect("remove obstacle");
+    drain(&mut c, &mut n);
+    assert_eq!(c.build_tile_data(refs[0]).expect("plain"), plain);
+    assert_ne!(
+        n.residency().to_bytes(),
+        before,
+        "removing the obstacle queued the retained tile"
+    );
+}

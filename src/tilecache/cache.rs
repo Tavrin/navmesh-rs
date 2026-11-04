@@ -530,7 +530,12 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
         if self.tiles[i].head != NONE || self.queued[i] {
             return Err(Error::InvalidParameter("tile has obstacle work"));
         }
-        let h = self.tiles[i].header.as_ref().unwrap();
+        let (b, prev) = self.removal_chain(i)?;
+        Ok(self.remove_checked(i, b, prev))
+    }
+
+    fn removal_chain(&mut self, i: usize) -> Result<(usize, usize), Error> {
+        let h = self.tiles[i].header.as_ref().ok_or(Error::InvalidRef)?;
         let b = hash(h.tx, h.ty, self.buckets.len() - 1);
         let mut k = self.buckets[b];
         let mut prev = NONE;
@@ -539,12 +544,16 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             prev = k;
             k = self.tiles[k].next;
         }
+        Ok((b, prev))
+    }
+
+    fn remove_checked(&mut self, i: usize, b: usize, prev: usize) -> Vec<u8> {
         if prev == NONE {
             self.buckets[b] = self.tiles[i].next;
         } else {
             self.tiles[prev].next = self.tiles[i].next;
         }
-        let data = self.tiles[i].data.take().unwrap();
+        let data = self.tiles[i].data.take().unwrap_or_default();
         let salt = (self.tiles[i].salt + 1) & self.salt_mask;
         self.tiles[i] = TileSlot {
             salt: salt.max(1),
@@ -553,7 +562,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             ..TileSlot::default()
         };
         self.free_tiles.push(i);
-        Ok(data)
+        data
     }
     /// Evicts a layer for streaming (not in recastnavigation) and returns its bytes.
     /// Unlike [`TileCache::remove_tile`], a layer with obstacle associations may
@@ -577,13 +586,17 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             a = self.associations[a].next;
         }
         work(&mut self.ws, count)?;
+        if self.queued[i] {
+            return Err(Error::InvalidParameter("tile has obstacle work"));
+        }
+        let (b, prev) = self.removal_chain(i)?;
         let mut a = self.tiles[i].head;
         while a != NONE {
             let next = self.associations[a].next;
             self.drop_association(a);
             a = next;
         }
-        self.remove_tile(r)
+        Ok(self.remove_checked(i, b, prev))
     }
 
     /// Removes association `a` from its tile's list and from its obstacle's touched

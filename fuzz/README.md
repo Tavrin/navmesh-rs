@@ -114,3 +114,13 @@ cargo run --release --bin seeds -- tiles corpus/tile_endian <records-dir>/*.navr
 cargo +nightly fuzz run tile_state corpus/tile_state -- -max_len=512 -rss_limit_mb=512
 cargo +nightly fuzz run tile_endian corpus/tile_endian -- -max_len=65536 -rss_limit_mb=512
 ```
+
+The streaming targets also cover identity and exhaustion boundaries:
+`prepared_tile` appends accepted trailing bytes, requires different SHA-256
+identity, rejects the original saved state and checks permanent staleness.
+`residency_record` uses version 3's 64-byte entries and checks atomic failure
+when changed content reaches an exhausted salt. `stream_ops` mode bit 2 exercises
+exhausted saved history, stacked global landing permutations (varied heights and
+link direction), and refused cache unloads with live obstacles in a colliding
+hash bucket (varied work thresholds). Stream seeds include every boundary mode;
+residency seeds include exhausted reservations.

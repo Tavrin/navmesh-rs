@@ -34,6 +34,8 @@ pub enum Error {
     TileSlotOccupied,
     /// The navmesh has no free tile slot (or the requested slot is in use).
     NoFreeTile,
+    /// Advancing a tile slot salt would reuse an old reference generation.
+    SaltExhausted,
     /// Ear clipping was incomplete in strict mode (not in recastnavigation).
     PartialTriangulation {
         /// Number of incomplete contours encountered.
@@ -58,7 +60,7 @@ pub enum TileStateError {
     TooShort,
     /// The magic number is not `'DNMS'`.
     WrongMagic,
-    /// The version is not 1.
+    /// The version does not match the state format being read.
     WrongVersion,
     /// The state was stored for a different tile (or a different incarnation of the
     /// same slot): its tile ref does not equal the tile's current ref.
@@ -104,6 +106,7 @@ impl fmt::Display for Error {
             Error::InvalidTileData(r) => write!(f, "invalid tile data: {r:?}"),
             Error::InvalidTileState(r) => write!(f, "invalid tile state: {r:?}"),
             Error::TileSlotOccupied => f.write_str("tile location already occupied"),
+            Error::SaltExhausted => f.write_str("tile slot salt exhausted"),
             Error::NoFreeTile => f.write_str("no free tile slot"),
             Error::PartialTriangulation {
                 failed_contours,

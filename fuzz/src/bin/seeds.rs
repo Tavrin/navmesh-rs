@@ -918,7 +918,7 @@ fn stream_seeds(out: &Path) -> Result<usize, String> {
         written += 1;
         Ok(())
     };
-    for mode in 0u8..4 {
+    for mode in 0u8..8 {
         let mut v = vec![mode];
         for k in 0u8..16 {
             v.extend([0, k, 7, k]);
@@ -1017,7 +1017,12 @@ fn residency_seeds(out: &Path) -> Result<usize, String> {
             nav.residency().to_bytes(),
         )
         .map_err(|e| e.to_string())?;
-        written += 2;
+        let mut exhausted = nav.residency().to_bytes();
+        exhausted[116..120].copy_from_slice(&65535u32.to_le_bytes());
+        exhausted[144] ^= 1; // Force changed content on the exhausted reservation.
+        std::fs::write(out.join(format!("res-{name}-exhausted")), exhausted)
+            .map_err(|e| e.to_string())?;
+        written += 3;
     }
     Ok(written)
 }

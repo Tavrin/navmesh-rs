@@ -25,7 +25,7 @@ libm = ["dep:libm"]
 # Navmesh generation (Recast).
 recast = []
 # Navmesh runtime, tile data and queries (Detour).
-detour = []
+detour = ["dep:sha2"]
 # Agent simulation and local avoidance (DetourCrowd).
 crowd = ["detour"]
 # Dynamic obstacle carving over cached heightfield layers.
@@ -37,6 +37,7 @@ polyref64 = []
 parallel = ["dep:rayon"]
 
 [dependencies]
+sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"], optional = true }
 libm = { version = "0.2.16", optional = true }
 rayon = { version = "1.11", optional = true }
 

@@ -59,10 +59,10 @@ fuzz_target!(|data: &[u8]| {
         again, bytes,
         "restore keeps every slot's salt and reservation"
     );
-    // Entries: slot, salt, flag, layer, x, y, polys at 48 + 40 * i.
-    let count = (bytes.len() - 48) / 40;
+    // Entries: slot, salt, flag, layer, x, y, polys at 48 + 64 * i.
+    let count = (bytes.len() - 48) / 64;
     for i in 0..count.min(64) {
-        let at = 48 + 40 * i;
+        let at = 48 + 64 * i;
         let r = |o: usize| {
             u32::from_le_bytes([
                 bytes[at + o],
@@ -73,7 +73,7 @@ fuzz_target!(|data: &[u8]| {
         };
         let (slot, salt, flag) = (r(0), r(4), r(8));
         let base = nav.encode_poly_id(salt, slot, 0);
-        // Check the saved history before a commit can wrap the finite salt.
+        // Check the saved history before a commit can exhaust the finite salt.
         if salt > 1 {
             assert_eq!(
                 nav.ref_state(nav.encode_poly_id(salt - 1, slot, 0)),
@@ -91,8 +91,13 @@ fuzz_target!(|data: &[u8]| {
                 // A tile at that key returns to the slot (with a new salt unless its
                 // content hash matches the recorded one).
                 if let Ok(t) = prepare_tile(&params, Limits::UNLIMITED, grid_quad(x, y, 0)) {
+                    let before = nav.residency().to_bytes();
+                    let epoch = nav.epoch();
                     if let Ok(tr) = nav.commit(t) {
                         assert_eq!(nav.decode_poly_id_tile(tr), slot);
+                    } else {
+                        assert_eq!(nav.residency().to_bytes(), before);
+                        assert_eq!(nav.epoch(), epoch);
                     }
                 }
             }

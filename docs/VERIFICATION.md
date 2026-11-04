@@ -599,6 +599,44 @@ adds links for pairs of tiles that upstream does not resolve.
 
 ## Tile streaming
 
+Content identity uses SHA-256 over the entire original byte buffer, including
+trailing bytes accepted for upstream parser parity. The dependency is RustCrypto
+[`sha2` 0.10.9](https://docs.rs/crate/sha2/0.10.9), licensed MIT OR Apache-2.0,
+with default features disabled and `force-soft` enabled: pure Rust, no_std.
+This replaces an invertible 64-bit hash; collision resistance is computational,
+not a mathematical guarantee against all possible byte strings. The streaming
+state footer is version 2 (40 bytes); residency is version 3 (64-byte entries).
+Older streaming records are rejected and must be regenerated from original tiles.
+Upstream tile bytes and bare runtime tile-state formats remain unchanged.
+
+Salt exhaustion refuses removal, forgotten reservations and changed-content
+commits before mutation with `Error::SaltExhausted`. A slot supports
+`2^salt_bits - 2` advances (65,534 with 64-bit refs); identical unload/reload
+works at the limit. The explicitly named `restore_tile_allow_stale` API retains
+its documented upstream-compatible ability to override history.
+
+Global off-mesh pairs are rebuilt in ascending `(x, y, layer)` order after
+commit and detach. Prepending makes the greatest eligible landing key supply
+the first global link and snapped endpoint. Existing candidate links are rebuilt
+when another landing appears or disappears, so keyed refs, endpoints and link
+order agree across load permutations. This costs a scan of resident pairs.
+
+Validation of these fixes (2026-11-04): formatting, warnings-denied Clippy
+(default, 32-bit with tilecache, parallel, all features), default/parallel/32-bit
+and tilecache-only tests, no_std builds, Rust 1.88 library check, wasm build,
+rustdoc, public-text and budget commands all exit 0. The four focused regressions
+pass in both reference widths. The 21-case oracle matrix has 84 successful diffs:
+38,272 records per width per mode, 76,544 in plain mode and 76,544 after streaming.
+Native x86-64 and wasm32-wasip1 determinism match 3,116 regular and 27 corrected
+record goldens, unchanged. AArch64 hardware execution remains for CI. The three
+extended fuzz targets compile (exit 0); campaign execution belongs to the
+coordinator, with build-only receipts in [FUZZ-RECEIPTS.md](FUZZ-RECEIPTS.md).
+
+Focused regressions: `failed_unload_preserves_obstacle_associations_across_hash_chain`,
+`crafted_old_hash_collision_rejects_refs_and_saved_state`,
+`salt_exhaustion_never_resurrects_refs_and_is_atomic`, and
+`global_landing_layers_have_canonical_endpoints_and_link_order`.
+
 Streaming (`SlotPolicy`, `prepare_tile`, `commit*`, `unload_tile`, `ref_state`, `epoch`,
 residency records) is not in recastnavigation, so it has no oracle of its own. What is
 checked, and how:
@@ -626,11 +664,14 @@ equal in plain mode and 76,544 equal after streaming**, with no mismatches.
 The existing 3,116 determinism digests and 27 corrected-record digests match the
 unchanged golden files. The generated 8 x 8 grid soak runs 4,000 model operations
 per slot policy and reference width (16,000 total), including 573 unloads and
-492 identical reloads per configuration. Four pinned residency digests cover
-these streaming scenarios. Both-width tests, all-feature and no-std Clippy with
+492 identical reloads per configuration. Four pinned SHA-256 residency digests cover
+these streaming scenarios. Those four assertions were regenerated because
+residency version 3 stores full digests; the reference golden files are unchanged. Both-width tests, all-feature and no-std Clippy with
 warnings denied, formatting, rustdoc and public-text checks return zero.
 
-Streaming timings use a release build with 64-bit polygon references and Rust
+The timings below predate the SHA-256 identity and canonical global relinking
+fixes; they are retained as historical measurements, not qualification of the
+current implementation. They use a release build with 64-bit polygon references and Rust
 1.99.1 on an x86-64 AMD Ryzen 9 7945HX. Three process runs produce six restream
 samples per configuration on the generated large terrain. Values below are the
 range of each sample's p99;
@@ -641,8 +682,8 @@ these are shared-machine observations, not an isolated throughput guarantee.
 | 64 | 2,681 | 2.4 / 3.6 | 2.4 / 3.6–4.7 | 29.7 | 1,940 / 9,348 |
 | 256 | 195 | 3.6–4.7 / 8.3 | 4.8–5.9 / 9.5–11.9 | 40.4 | 10,116 / 27,132 |
 
-The registered 256-cell commit p99 target of at most 100 µs is met in every
-sample. The owner-thread measurement includes saved-state validation/restoration.
+The registered 256-cell commit p99 target of at most 100 µs was met in every
+historical sample. The owner-thread measurement includes saved-state validation/restoration.
 
 Deliberate shapes: a tile-cache layer streams back with `TileCache::load_tile`, not
 `add_tile`, so `add_tile` keeps upstream's behaviour (an added layer does not pick up
@@ -657,8 +698,8 @@ Decisions and reversal costs:
 
 - Keep the DNAV salt/slot/polygon encoding and default sequential order. A new
   ref format would change tile links and stored refs; changing this after release
-  requires a format migration. Salt wrap and deliberate hash collisions remain
-  the documented limits of this representation.
+  requires a format migration. Salt exhaustion is refused before reuse; SHA-256
+  provides computational collision resistance without changing reference bits.
 - Keyed grids allocate slot pages on demand, retaining history after eviction.
   Residency capacity remains caller-configured. Column traversal visits descending
   layers, matching sequential lookup after canonical ascending-layer installation.
@@ -667,10 +708,10 @@ Decisions and reversal costs:
   links and connects resident neighbours. Locking and snapshots remain caller
   choices; a future installer can call `commit_budgeted` from `detour` without
   changing `bake::TileInstaller`.
-- Residency version 2 records polygon layout as well as ref width and slot
+- Residency version 3 records the full SHA-256 identity and polygon layout as well as ref width and slot
   policy. Restore is single-use even before commit, preventing history rewind.
   Changing the blob later requires a versioned decoder.
-- Unload state adds a versioned 16-byte content-hash footer to the ordinary tile
+- Unload state adds a versioned 40-byte SHA-256 footer to the ordinary tile
   state prefix. `commit_with_state` requires that identity even on a fresh mesh;
   ordinary `store_tile_state` bytes remain unchanged. Future unload-state format
   changes need a versioned decoder too.

@@ -3,7 +3,8 @@
 //! against a reference model.
 //!
 //! Layout: byte 0 picks the slot policy (bit 0: keyed) and whether global off-mesh
-//! links are on (bit 1); then two bytes per operation (at most 256): an opcode and
+//! links are on (bit 1), and exercises boundary regressions (bit 2); then two
+//! bytes per operation (at most 256): an opcode and
 //! an argument. Operations: commit (tile, content variant), unload, remove, forget
 //! an unloaded tile, commit with the state saved at unload, budgeted commit,
 //! declare a column known, take refs, path and raycast queries, a resumable search
@@ -104,6 +105,9 @@ fuzz_target!(|data: &[u8]| {
     let Some((&mode, ops)) = data.split_first() else {
         return;
     };
+    if mode & 4 != 0 {
+        navmesh_fuzz::streaming_boundaries(ops);
+    }
     let (keyed, global) = (mode & 1 != 0, mode & 2 != 0);
     let Some(mut nav) = new_nav(keyed, global) else {
         return;

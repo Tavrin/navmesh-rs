@@ -91,6 +91,16 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
+- Cache eviction preflights association and hash-chain work before mutation, so a
+  refused unload preserves live obstacle associations and queued rebuild behavior.
+- Streaming content identity now uses full SHA-256 digests, including trailing
+  bytes accepted by the tile parser. Saved state is bound to the digest.
+  `content_hash` returns `[u8; 32]`; streaming state footer version 2 and residency
+  version 3 reject older records, which must be regenerated from original bytes.
+- Tile slots refuse salt reuse with `Error::SaltExhausted` before mutation. With
+  64-bit references, a slot supports 65,534 advances; identical reloads still work.
+- Global off-mesh pairs are relinked in canonical tile-key order on commit and
+  removal, fixing load-order-dependent snapped endpoints and link order.
 - `NavMeshQuery::portal_points` (and so `find_path` and the other searches that take a
   portal) indexed a polygon's six vertices with the edge of a link read from tile bytes. A
   tile that the reader accepts but whose BV tree reaches a polygon typed as an off-mesh

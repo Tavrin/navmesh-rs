@@ -32,6 +32,11 @@ fuzz_target!(|data: &[u8]| {
     match (&added, prepared) {
         (Ok(ra), Ok(t)) => {
             let again = t.clone();
+            let mut padded = data.to_vec();
+            padded.extend_from_slice(&[0; 8]);
+            let padded_tile =
+                prepare_tile(&params, TILE_LIMITS, padded).expect("trailing bytes accepted");
+            assert_ne!(t.content_hash(), padded_tile.content_hash());
             let rb = b
                 .commit(t)
                 .expect("a prepared tile commits into an empty navmesh");
@@ -44,6 +49,12 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(ta.links.len(), tb.links.len());
             exercise_queries(&b);
             assert_eq!(b.commit(again), Err(Error::TileSlotOccupied));
+            let u = b.unload_tile(rb).expect("unload");
+            let before = b.residency().to_bytes();
+            assert!(b.commit_with_state(padded_tile.clone(), &u.state).is_err());
+            assert_eq!(b.residency().to_bytes(), before);
+            assert_ne!(b.commit(padded_tile).expect("changed content"), rb);
+            assert_eq!(b.ref_state(rb), navmesh_rs::detour::RefState::Stale);
         }
         (Err(ea), Err(eb)) => assert_eq!(*ea, eb),
         (a, b) => panic!("add_tile {a:?} but prepare_tile {:?}", b.map(|_| ())),

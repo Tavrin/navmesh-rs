@@ -11,7 +11,7 @@
 //! unloaded copy is valid again and names the same polygon; any other content for
 //! that tile increments the salt. [`NavMesh::remove_tile`] increments it as before.
 //!
-//! Salts only grow (until they wrap, see [`NavMesh`]), and a ref whose salt is
+//! Salts only grow (exhaustion is refused, see [`NavMesh`]), and a ref whose salt is
 //! older than its slot's is [`RefState::Stale`] for good: no sequence of commits,
 //! unloads, removals or residency restores makes it valid again.
 //! [`NavMesh::restore_tile_allow_stale`] is the one exception, by its contract.
@@ -30,7 +30,7 @@ use crate::{Budget, Error, Limits, TileDataError, TileStateError};
 /// Removals the epoch log keeps (see [`NavMesh::epoch`]).
 pub const REMOVAL_LOG_CAPACITY: usize = 256;
 
-const STREAM_STATE_FOOTER: usize = 16;
+const STREAM_STATE_FOOTER: usize = 40;
 const STREAM_STATE_MAGIC: [u8; 4] = *b"NVS1";
 
 /// How a navmesh assigns tile slots (and so the tile field of refs).
@@ -146,7 +146,7 @@ pub enum Committed {
 pub(crate) struct Parked {
     pub key: TileKey,
     pub layer: i32,
-    pub hash: u64,
+    pub hash: [u8; 32],
     pub polys: u32,
 }
 
@@ -154,7 +154,7 @@ pub(crate) struct Parked {
 #[derive(Clone, Debug)]
 pub struct PreparedTile {
     tile: MeshTile,
-    hash: u64,
+    hash: [u8; 32],
     poly_bits: u32,
 }
 
@@ -173,7 +173,7 @@ impl PreparedTile {
     }
 
     /// [`content_hash`] of the tile bytes.
-    pub fn content_hash(&self) -> u64 {
+    pub fn content_hash(&self) -> [u8; 32] {
         self.hash
     }
 
@@ -213,35 +213,15 @@ pub struct UnloadedTile {
     /// [`NavMesh::store_tile_state`] prefix plus a versioned content-hash footer.
     pub state: Vec<u8>,
     /// [`content_hash`] of `bytes`.
-    pub content_hash: u64,
+    pub content_hash: [u8; 32],
 }
 
-/// 64-bit hash of tile bytes, the same on every platform. It tells a reloaded
-/// identical tile from a rebaked one; it is not collision resistant against bytes
-/// crafted to collide, which would at worst keep refs valid across a content
-/// change (they still name in-range polygons of the new content or are `Invalid`).
-pub fn content_hash(bytes: &[u8]) -> u64 {
-    const K1: u64 = 0x9e37_79b9_7f4a_7c15;
-    const K2: u64 = 0xbf58_476d_1ce4_e5b9;
-    const K3: u64 = 0x94d0_49bb_1331_11eb;
-    let mut h = 0x243f_6a88_85a3_08d3u64 ^ (bytes.len() as u64).wrapping_mul(K1);
-    let mut chunks = bytes.chunks_exact(8);
-    for c in &mut chunks {
-        let mut w = [0u8; 8];
-        w.copy_from_slice(c);
-        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K1);
-        h ^= h >> 29;
-    }
-    let rest = chunks.remainder();
-    if !rest.is_empty() {
-        let mut w = [0u8; 8];
-        w[..rest.len()].copy_from_slice(rest);
-        h = (h ^ u64::from_le_bytes(w)).wrapping_mul(K1);
-        h ^= h >> 29;
-    }
-    h = (h ^ (h >> 30)).wrapping_mul(K2);
-    h = (h ^ (h >> 27)).wrapping_mul(K3);
-    h ^ (h >> 31)
+/// SHA-256 digest of all input tile bytes, including accepted trailing bytes.
+/// Platform independent and collision resistant. Uses the pure-Rust `sha2` crate
+/// with default features disabled (MIT OR Apache-2.0); no standard library needed.
+pub fn content_hash(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
 }
 
 /// Parses and validates tile bytes for a navmesh with `params`, on any thread
@@ -550,7 +530,9 @@ impl NavMesh {
 
     /// Work units [`NavMesh::commit_budgeted`] charges for `t`: its polygons, the
     /// polygons of the resident tiles in its column and the eight around it, and
-    /// one per resident tile when global off-mesh links are on.
+    /// one per resident tile plus a full connection/candidate relink allowance
+    /// when global off-mesh links
+    /// are on (all connection counts times all polygon, link and tile counts).
     pub fn commit_cost(&self, t: &PreparedTile) -> u64 {
         let (x, y) = (t.tile.header.x, t.tile.header.y);
         let mut cost = 1 + t.tile.polys.len() as u64;
@@ -564,7 +546,17 @@ impl NavMesh {
             }
         }
         if self.global_off_mesh {
-            cost += self.resident as u64;
+            cost = cost.saturating_add(self.resident as u64);
+            let mut connections = t.tile.off_mesh_cons.len() as u64;
+            let mut candidates = 1 + t.tile.polys.len() as u64 + t.tile.links.len() as u64;
+            for i in self.resident_slots() {
+                if let Some(tile) = self.tile(i) {
+                    connections = connections.saturating_add(tile.off_mesh_cons.len() as u64);
+                    candidates = candidates
+                        .saturating_add(1 + tile.polys.len() as u64 + tile.links.len() as u64);
+                }
+            }
+            cost = cost.saturating_add(connections.saturating_mul(candidates));
         }
         cost
     }
@@ -611,7 +603,7 @@ impl NavMesh {
     pub fn commit_with_state(&mut self, t: PreparedTile, state: &[u8]) -> Result<TileRef, Error> {
         let target = self.commit_target(&t)?;
         let salt = match target.parked_hash {
-            Some(old) if old != t.hash => self.next_salt(target.salt),
+            Some(old) if old != t.hash => self.next_salt(target.salt)?,
             _ => target.salt,
         };
         let would = self.encode_poly_id(salt, target.ti as u32, 0);
@@ -629,10 +621,10 @@ impl NavMesh {
         if footer[..4] != STREAM_STATE_MAGIC {
             return Err(Error::InvalidTileState(TileStateError::WrongMagic));
         }
-        if footer[4..8] != 1u32.to_le_bytes() {
+        if footer[4..8] != 2u32.to_le_bytes() {
             return Err(Error::InvalidTileState(TileStateError::WrongVersion));
         }
-        if footer[8..16] != t.hash.to_le_bytes() {
+        if footer[8..40] != t.hash {
             return Err(Error::InvalidTileState(TileStateError::WrongTile));
         }
         let ti = target.ti;
@@ -680,8 +672,8 @@ impl NavMesh {
         let hash = content_hash(&tile.data);
         // Capacity was reserved before detaching: appending cannot allocate.
         state.extend_from_slice(&STREAM_STATE_MAGIC);
-        state.extend_from_slice(&1u32.to_le_bytes());
-        state.extend_from_slice(&hash.to_le_bytes());
+        state.extend_from_slice(&2u32.to_le_bytes());
+        state.extend_from_slice(&hash);
         let s = &mut self.slots[ti];
         s.next = -1;
         s.parked = Some(Parked {
@@ -709,8 +701,8 @@ impl NavMesh {
             .stream
             .parked_slot(&self.slots, key.x, key.y, layer)
             .ok_or(Error::InvalidParameter("no unloaded tile there"))?;
+        let next = self.next_salt(self.slots[ti].salt)?;
         self.stream.unpark(key.x, key.y, layer);
-        let next = self.next_salt(self.slots[ti].salt);
         self.release_slot(ti, next);
         Ok(())
     }
@@ -894,9 +886,9 @@ pub struct ResidencyRecord {
 }
 
 const RES_MAGIC: u32 = u32::from_le_bytes(*b"NVRS");
-const RES_VERSION: u32 = 2;
+const RES_VERSION: u32 = 3;
 const RES_HEADER: usize = 44;
-const RES_ENTRY: usize = 40;
+const RES_ENTRY: usize = 64;
 
 impl ResidencyRecord {
     /// Number of slots recorded.
@@ -910,7 +902,7 @@ impl ResidencyRecord {
     }
 
     /// Little-endian bytes: a 48-byte header (magic `NVRS`, version, ref bits,
-    /// max tiles, policy, keyed origin and size, polygon bits, entry count) and 40 bytes per
+    /// max tiles, policy, keyed origin and size, polygon bits, entry count) and 64 bytes per
     /// slot (slot, salt, tile flag, layer, x, y, polygon count, pad, content hash).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(RES_HEADER + self.entries.len() * RES_ENTRY);
@@ -939,7 +931,7 @@ impl ResidencyRecord {
             let p = e.tile.unwrap_or(Parked {
                 key: TileKey::default(),
                 layer: 0,
-                hash: 0,
+                hash: [0; 32],
                 polys: 0,
             });
             out.extend_from_slice(&u32::from(e.tile.is_some()).to_le_bytes());
@@ -948,7 +940,7 @@ impl ResidencyRecord {
             out.extend_from_slice(&p.key.y.to_le_bytes());
             out.extend_from_slice(&p.polys.to_le_bytes());
             out.extend_from_slice(&0u32.to_le_bytes());
-            out.extend_from_slice(&p.hash.to_le_bytes());
+            out.extend_from_slice(&p.hash);
         }
         out
     }
@@ -1018,16 +1010,15 @@ impl ResidencyRecord {
                 u(at + 24)?,
                 u(at + 28)?,
             );
-            let hb = data.get(at + 32..at + 40).ok_or_else(bad)?;
-            let mut h8 = [0u8; 8];
-            h8.copy_from_slice(hb);
-            let hash = u64::from_le_bytes(h8);
+            let hb = data.get(at + 32..at + 64).ok_or_else(bad)?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(hb);
             if salt == 0 || pad != 0 {
                 return Err(bad());
             }
             let tile = match flag {
                 0 => {
-                    if layer != 0 || x != 0 || y != 0 || polys != 0 || hash != 0 {
+                    if layer != 0 || x != 0 || y != 0 || polys != 0 || hash != [0; 32] {
                         return Err(bad());
                     }
                     None
