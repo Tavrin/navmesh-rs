@@ -193,6 +193,18 @@ entrance, default/preset parameter customization, and finite repeatable adaptive
 sampling for every even division count and ring count at depths 1/3/32. Four
 compile-fail doctests enforce non-exhaustive parameter structs and state enums.
 
+## Upstream corrections (`UpstreamFixes`)
+
+Each correction is off by default, so every record above is unchanged. With a flag on, the
+tests in `tests/fixes.rs` show the upstream behaviour (flag off) and the corrected one (flag
+on) on a constructed case: sliced against plain corridors on a tiled floor
+(`SLICED_CROSS_SIDE`), the six nearest neighbours of an agent among more than 32 candidates
+(`NEAREST_NEIGHBOURS`), the velocity chosen from a two-division pattern (`ADAPTIVE_PATTERN`),
+and the detail mesh of a zero sample distance, directly and through `bake` (`ZERO_SAMPLE_DIST`).
+`nav-port --fixes all` writes corrected records and `reference/determinism.sh` compares their
+changed digests with `reference/determinism-fixes.golden`. The ledge-filter report (`#729`)
+is analysed in `reference/UPSTREAM.md` and has no flag.
+
 ## Tile-cache verification
 
 `reference/run-tilecache-parity.sh` compares all records on `dungeon_tilecache`,

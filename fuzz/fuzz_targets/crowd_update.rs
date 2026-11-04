@@ -2,7 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use navmesh_rs::crowd::{AgentId, AgentParams, Crowd};
 use navmesh_rs::detour::{NavMesh, NavMeshCreateParams, create_nav_mesh_data};
-use navmesh_rs::{Budget, Budgeted, Limits, Workspace};
+use navmesh_rs::{Budget, Budgeted, Limits, UpstreamFixes, Workspace};
 fuzz_target!(|data: &[u8]| {
     let n = 0xffff;
     let Ok(tile) = create_nav_mesh_data(&NavMeshCreateParams {
@@ -35,6 +35,9 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut crowd) = Crowd::new(&mut ws, &nav, 8, 0.6) else {
         return;
     };
+    if data.first().is_some_and(|b| b & 1 != 0) {
+        crowd.set_fixes(UpstreamFixes::ALL);
+    }
     for chunk in data.as_chunks::<16>().0.iter().take(64) {
         let v = core::array::from_fn(|i| {
             f32::from_bits(u32::from_le_bytes(

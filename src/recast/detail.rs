@@ -8,7 +8,7 @@ use super::{
     dir_offset_x, dir_offset_y,
 };
 use crate::common::{ceil_i32, clamp, floor_i32, fmax, fmin, sqr, sqrtf, vmax, vmin};
-use crate::{Error, Workspace};
+use crate::{Error, UpstreamFixes, Workspace};
 
 /// Height detail per polygon (`rcPolyMeshDetail`).
 #[derive(Clone, Debug, Default)]
@@ -82,6 +82,27 @@ impl PolyMeshDetail {
         chf: &CompactHeightfield,
         sample_dist: f32,
         sample_max_error: f32,
+    ) -> Result<PolyMeshDetail, Error> {
+        Self::build_with_fixes(
+            ws,
+            mesh,
+            chf,
+            sample_dist,
+            sample_max_error,
+            UpstreamFixes::NONE,
+        )
+    }
+
+    /// [`PolyMeshDetail::build`] with upstream corrections applied
+    /// ([`UpstreamFixes::ZERO_SAMPLE_DIST`]). With [`UpstreamFixes::NONE`] it is
+    /// identical to `build`.
+    pub fn build_with_fixes(
+        ws: &mut Workspace,
+        mesh: &PolyMesh,
+        chf: &CompactHeightfield,
+        sample_dist: f32,
+        sample_max_error: f32,
+        fixes: UpstreamFixes,
     ) -> Result<PolyMeshDetail, Error> {
         ws.begin();
         check_surface_chf(ws, chf)?;
@@ -200,6 +221,7 @@ impl PolyMeshDetail {
                 &mut tris,
                 &mut edges,
                 &mut samples,
+                fixes,
             )?;
             for v in verts[..nverts * 3].chunks_exact_mut(3) {
                 v[0] += orig[0];
@@ -920,6 +942,7 @@ fn build_poly_detail(
     tris: &mut Vec<i32>,
     edges: &mut Vec<i32>,
     samples: &mut Vec<i32>,
+    fixes: UpstreamFixes,
 ) -> Result<usize, Error> {
     const MAX_VERTS: usize = 127;
     const MAX_TRIS: usize = 255;
@@ -1027,6 +1050,14 @@ fn build_poly_detail(
                 }
             }
             j = i;
+        }
+    }
+    if sample_dist <= 0.0 && fixes.contains(UpstreamFixes::ZERO_SAMPLE_DIST) {
+        // No edge subdivision was asked for: the hull is the polygon itself, in the
+        // order the subdivision loop above would have produced.
+        for k in 0..nin {
+            hull[nhull] = ((k + nin - 1) % nin) as i32;
+            nhull += 1;
         }
     }
     let hull = &hull[..nhull];

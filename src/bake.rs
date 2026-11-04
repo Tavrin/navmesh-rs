@@ -32,7 +32,7 @@ use crate::detour::{self, NavMesh, NavMeshCreateParams, NavMeshParams};
 use crate::recast::{
     self, CompactHeightfield, Config, ContourSet, Heightfield, PolyMesh, PolyMeshDetail,
 };
-use crate::{Error, Limits, Usage, Workspace};
+use crate::{Error, Limits, UpstreamFixes, Usage, Workspace};
 
 /// Region partition used by the tile pipeline; not in recastnavigation as a type.
 #[non_exhaustive]
@@ -126,6 +126,10 @@ pub struct BakeConfig {
     pub max_total_bytes: usize,
     /// Reject incomplete ear clipping (not in recastnavigation). Defaults to false.
     pub strict_triangulation: bool,
+    /// Upstream defect corrections applied while baking (not in recastnavigation).
+    /// Only [`UpstreamFixes::ZERO_SAMPLE_DIST`] concerns baking. Defaults to
+    /// [`UpstreamFixes::NONE`], which reproduces upstream.
+    pub fixes: UpstreamFixes,
 }
 
 impl Default for BakeConfig {
@@ -158,6 +162,7 @@ impl Default for BakeConfig {
             tile_limits: Limits::default(),
             max_total_bytes: usize::MAX,
             strict_triangulation: false,
+            fixes: UpstreamFixes::NONE,
         }
     }
 }
@@ -689,12 +694,13 @@ fn build_tile_in_workspace(
         }
     }
     let detail = tw.trusted_stage(|ws| {
-        PolyMeshDetail::build(
+        PolyMeshDetail::build_with_fixes(
             ws,
             &mesh,
             &chf,
             cfg.detail_sample_dist,
             cfg.detail_sample_max_error,
+            c.fixes,
         )
     })?;
     if mesh.npolys == 0 {

@@ -16,7 +16,8 @@
 //! features: bit 0 switches the three span filters off, bit 1 gives triangle areas, bits 2-3
 //! count the area volumes, bit 4 enables strict triangulation, bit 5 turns detail sampling off,
 //! bit 6 sets tight per-tile limits from `[4]` and `[5]`, bit 7 moves the volume polygon to the
-//! second vertex; `[4]`, `[5]` limit and volume parameters; `[6]` vertex count; then the vertices
+//! second vertex; `[4]`, `[5]` limit and volume parameters (`[4]` bit 0 also enables the
+//! zero-sample-distance correction when detail sampling is off); `[6]` vertex count; then the vertices
 //! (12 bytes each when raw, otherwise three bytes scaled to 0..16, 0..8, 0..16) and the
 //! triangles, three bytes each (at most 128).
 use libfuzzer_sys::fuzz_target;
@@ -201,12 +202,13 @@ fn reference_tile(
             }
         }
         let detail = t.stage(|ws| {
-            PolyMeshDetail::build(
+            PolyMeshDetail::build_with_fixes(
                 ws,
                 &mesh,
                 &chf,
                 cfg.detail_sample_dist,
                 cfg.detail_sample_max_error,
+                c.fixes,
             )
         })?;
         if mesh.npolys == 0 {
@@ -347,6 +349,9 @@ fuzz_target!(|data: &[u8]| {
     cfg.strict_triangulation = features & 0x10 != 0;
     if features & 0x20 != 0 {
         cfg.recast.detail_sample_dist = 0.0;
+        if data[4] & 1 != 0 {
+            cfg.fixes = navmesh_rs::UpstreamFixes::ZERO_SAMPLE_DIST;
+        }
     }
     cfg.tile_limits.max_bytes = 8 << 20;
     cfg.tile_limits.max_work = 2_000_000;

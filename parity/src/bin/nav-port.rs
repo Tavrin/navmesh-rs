@@ -5,6 +5,7 @@
 //! ```text
 //! nav-port bake  <case-file> --records FILE
 //! nav-port digest <case-file>              # record digests, for the determinism check
+//! nav-port bake|digest <case-file> --fixes all|none|<flag,flag>   # upstream corrections (default none)
 //! nav-port bench <case-file> [--repeat N]
 //! nav-port verify-parallel <case-file>       # requires parallel feature
 //! nav-port bench-tiles <case-file> --threads N [--repeat N]
@@ -774,12 +775,13 @@ fn build_one(
     sink.record(&format!("{prefix}poly_mesh"), |p| {
         stream_poly_mesh(p, &pmesh)
     });
-    let dmesh = recast::PolyMeshDetail::build(
+    let dmesh = recast::PolyMeshDetail::build_with_fixes(
         ws,
         &pmesh,
         &chf,
         cfg.detail_sample_dist,
         cfg.detail_sample_max_error,
+        fixes(),
     )?;
     sink.record(&format!("{prefix}detail_mesh"), |p| {
         stream_detail_mesh(p, &dmesh)
@@ -1037,6 +1039,7 @@ fn record_queries(
     sink: &mut Sink,
 ) -> Result<(), Error> {
     let mut q = NavMeshQuery::new(nav, 2048)?;
+    q.set_fixes(fixes());
     let rng = std::cell::RefCell::new(Rng(if c.seed != 0 { c.seed } else { 1 }));
     let n = c.queries.max(0) as usize;
     let mut refs = vec![0 as PolyRef; n + 1];
@@ -1578,6 +1581,7 @@ fn bake_extension_tiles(
     cfg.walkable_height = c.agent_height;
     cfg.walkable_radius = c.agent_radius;
     cfg.walkable_climb = c.agent_max_climb;
+    cfg.fixes = fixes();
     let mut ws = Workspace::new();
     let baked = if parallel {
         bake::tiles_parallel(&input, &cfg, &mut ws)
@@ -2112,6 +2116,34 @@ fn bench_paths(c: &Case, g: &Geometry, repeat: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Upstream corrections selected by `--fixes`; unset means none, so the default
+/// records stay comparable with the reference driver.
+static FIXES: std::sync::OnceLock<navmesh_rs::UpstreamFixes> = std::sync::OnceLock::new();
+
+fn fixes() -> navmesh_rs::UpstreamFixes {
+    FIXES.get().copied().unwrap_or_default()
+}
+
+/// Parses `none`, `all` or a comma list of flag names (lower case, as in the
+/// constants: `sliced_cross_side`, `nearest_neighbours`, `adaptive_pattern`,
+/// `zero_sample_dist`).
+fn parse_fixes(list: &str) -> Result<navmesh_rs::UpstreamFixes, String> {
+    use navmesh_rs::UpstreamFixes as F;
+    let mut set = F::NONE;
+    for name in list.split(',') {
+        set |= match name {
+            "none" => F::NONE,
+            "all" => F::ALL,
+            "sliced_cross_side" => F::SLICED_CROSS_SIDE,
+            "nearest_neighbours" => F::NEAREST_NEIGHBOURS,
+            "adaptive_pattern" => F::ADAPTIVE_PATTERN,
+            "zero_sample_dist" => F::ZERO_SAMPLE_DIST,
+            other => return Err(format!("unknown fix `{other}`")),
+        };
+    }
+    Ok(set)
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | bench <case> [--repeat N] | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
@@ -2124,6 +2156,12 @@ fn run() -> Result<(), String> {
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1))
     };
+    if let Some(list) = opt("--fixes") {
+        let set = parse_fixes(list)?;
+        FIXES
+            .set(set)
+            .map_err(|_| "--fixes given twice".to_string())?;
+    }
     let case = parse_case(Path::new(case_path))?;
     let g = load_obj(&case.mesh)?;
     let base = Path::new(case_path)
@@ -2241,6 +2279,7 @@ fn record_crowds(c: &Case, b: &Baked, sink: &mut Sink) -> Result<(), Error> {
         let mut nav = assemble(b)?;
         let mut ws = Workspace::new();
         let mut crowd = Crowd::new(&mut ws, &nav, c.crowd_agents, c.agent_radius)?;
+        crowd.set_fixes(fixes());
         if (1..=4).contains(&variant) {
             for k in 0..4 {
                 crowd.set_obstacle_avoidance_params(k, ObstacleAvoidanceParams::quality(k)?)?;

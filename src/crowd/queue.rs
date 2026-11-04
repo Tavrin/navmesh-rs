@@ -70,6 +70,14 @@ impl PathQueue {
             query: Some(DetachedQuery::new(nav, max_nodes)?),
         })
     }
+    /// Selects the upstream corrections the queue's sliced searches apply
+    /// ([`UpstreamFixes::SLICED_CROSS_SIDE`]). Takes effect for the next search
+    /// step; set it before enqueueing for a consistent result.
+    pub fn set_fixes(&mut self, fixes: UpstreamFixes) {
+        if let Some(q) = self.query.as_mut() {
+            q.set_fixes(fixes);
+        }
+    }
     /// Enqueues a search using an index into the filter array passed to `update`.
     /// Refs are checked against `nav`. A full queue returns [`Error::BufferTooSmall`].
     pub fn request(

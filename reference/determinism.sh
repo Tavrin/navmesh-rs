@@ -41,12 +41,24 @@ for c in "${cases[@]}"; do
   "${runner[@]}" "$bin" digest "$here/cases/$c.case" >> "$out"
 done
 
+# Second pass with every upstream correction on (`--fixes all`). Only the digest
+# lines that differ from the default pass are kept: they are the records a correction
+# changes, so the file stays small and says where the corrections act.
+fixed_all=$(mktemp)
+fixed=$(mktemp)
+trap 'rm -f "$out" "$fixed_all" "$fixed"' EXIT
+for c in "${cases[@]}"; do
+  "${runner[@]}" "$bin" digest "$here/cases/$c.case" --fixes all >> "$fixed_all"
+done
+grep -vxF -f "$out" "$fixed_all" > "$fixed" || true
+
 if [ "$update" = 1 ]; then
   cp "$out" "$here/determinism.golden"
-  echo "wrote $here/determinism.golden ($(wc -l < "$out") lines)"
-elif diff -u "$here/determinism.golden" "$out"; then
-  echo "determinism: $(wc -l < "$out") record digests match the golden file${target:+ on $target}"
+  cp "$fixed" "$here/determinism-fixes.golden"
+  echo "wrote $here/determinism.golden ($(wc -l < "$out") lines) and determinism-fixes.golden ($(wc -l < "$fixed") lines)"
+elif diff -u "$here/determinism.golden" "$out" && diff -u "$here/determinism-fixes.golden" "$fixed"; then
+  echo "determinism: $(wc -l < "$out") record digests and $(wc -l < "$fixed") corrected-record digests match the golden files${target:+ on $target}"
 else
-  echo "determinism: digests differ from reference/determinism.golden" >&2
+  echo "determinism: digests differ from the golden files in reference/" >&2
   exit 1
 fi

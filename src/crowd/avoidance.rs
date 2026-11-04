@@ -28,6 +28,7 @@ pub struct ObstacleAvoidanceParams {
     /// Adaptive angular divisions (1..=32). Odd counts preserve the defined C++
     /// pattern; even counts use initialized Rust storage where C++ reads an
     /// unwritten sample, and carry no C++ parity claim.
+    /// [`UpstreamFixes::ADAPTIVE_PATTERN`] writes that sample instead.
     pub adaptive_divs: u8,
     /// Adaptive ring count (1..=4).
     pub adaptive_rings: u8,
@@ -106,8 +107,14 @@ pub struct ObstacleAvoidanceQuery {
     segments: Vec<Segment>,
     max_circles: usize,
     max_segments: usize,
+    fixes: UpstreamFixes,
 }
 impl ObstacleAvoidanceQuery {
+    /// Selects the upstream corrections sampling applies
+    /// ([`UpstreamFixes::ADAPTIVE_PATTERN`]); the default is [`UpstreamFixes::NONE`].
+    pub fn set_fixes(&mut self, fixes: UpstreamFixes) {
+        self.fixes = fixes;
+    }
     /// Allocates obstacle storage.
     pub fn new(ws: &mut Workspace, max_circles: usize, max_segments: usize) -> Result<Self, Error> {
         ws.begin();
@@ -123,6 +130,7 @@ impl ObstacleAvoidanceQuery {
             segments: ws.vec_with_capacity(max_segments)?,
             max_circles,
             max_segments,
+            fixes: UpstreamFixes::NONE,
         })
     }
     /// Clears obstacles without reallocating.
@@ -423,11 +431,18 @@ impl ObstacleAvoidanceQuery {
                 last2 = n + 1;
                 n += 2;
             }
-            // Upstream skips this slot for even divisions and reads uninitialised
-            // storage. Defined Rust behaviour uses the zero-initialised slot.
+            // Upstream writes this slot one position too far for even divisions and
+            // samples the unwritten slot before it. Without the fix the port keeps
+            // that shape (the unwritten slot reads as zero); with it the slot is
+            // written in place.
             if nd & 1 == 0 {
                 let b = pat[last2];
-                pat[n + 1] = [b[0] * ca - b[1] * sa, b[0] * sa + b[1] * ca];
+                let at = if self.fixes.contains(UpstreamFixes::ADAPTIVE_PATTERN) {
+                    n
+                } else {
+                    n + 1
+                };
+                pat[at] = [b[0] * ca - b[1] * sa, b[0] * sa + b[1] * ca];
                 n += 1;
             }
         }
