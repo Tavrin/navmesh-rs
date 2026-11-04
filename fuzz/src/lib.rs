@@ -1,5 +1,7 @@
 //! Shared code of the fuzz targets and the seed writer.
 
+pub mod bake_world;
+
 use navmesh_rs::detour::{self, DefaultFilter, NavMesh, NavMeshCreateParams, NavMeshQuery};
 use navmesh_rs::recast::{
     self, CompactHeightfield, ContourSet, Heightfield, HeightfieldLayerSet, PolyMesh,

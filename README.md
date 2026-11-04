@@ -124,6 +124,42 @@ setup has its own workspace budget. Retained output and concurrent tiles add to
 memory use, and rayon's scheduler allocations are outside these budgets.
 `parallel` is off by default; leave it off for wasm and `no_std` builds.
 
+### Large worlds: incremental, resumable, cancellable jobs
+
+For a world too large to hold as one triangle soup, implement `bake::GeometrySource` (it
+answers "what is in this box", in a fixed order) and drive a `bake::BakeJob`. Each tile
+is baked from its own bordered column with the pipeline `tiles` uses, so the bytes are
+identical. The caller persists a `BakeManifest` beside the tiles; after an edit,
+`dirty_from_boxes(&config, &grid, &boxes)` names the tiles the edited boxes touch, the tiles
+a larger grid added and, if the configuration or layout changed, every tile (`full_rebake`),
+and `skip_unchanged` drops those whose input hash did not change. `retarget` moves the
+manifest to the new grid and `apply` merges the job's `manifest_delta`, refusing a delta baked
+under another configuration. Rebaking only the dirty tiles gives exactly the tiles and
+manifest of a full bake. `step` works in slices of a `Budget`, `run_parallel` uses the rayon
+pool, and a `CancelToken` stops a job without ever returning a partial tile. A navmesh fed
+by `TileInstaller` replaces a resident tile with its rebake and keeps the newest queued
+version of each tile; after a cancel, every tile is whole, new exactly where
+`manifest_delta` lists it. For a large `Input`, `Input::indexed` builds the spatial index
+once so each fetch costs what the tile holds, not what the mesh holds. Manifest digests are
+not collision resistant: use the manifest as a cache for trusted content.
+
+```rust
+use navmesh_rs::bake::{BakeConfig, BakeJob, GridLayout, Input, JobOptions};
+use navmesh_rs::{Budget, Progress};
+
+let verts = [0., 0., 0., 0., 0., 24., 24., 0., 24., 24., 0., 0.];
+let tris = [0, 1, 2, 0, 2, 3];
+let source = Input::new(&verts, &tris); // any `GeometrySource` works here
+let config = BakeConfig::default();
+let grid = GridLayout::from_input(&source, &config)?; // a world states its own bounds
+let mut job = BakeJob::new(&source, &config, &grid, grid.keys(), JobOptions::default())?;
+while job.step(&mut Budget::new(50_000))? != Progress::Done {
+    while let Some(tile) = job.next_ready() { /* hand `tile.data` to the navmesh */ }
+}
+while let Some(tile) = job.next_ready() { /* the last tiles */ }
+# Ok::<(), navmesh_rs::bake::BakeError>(())
+```
+
 ## Crowd
 
 Enable the default `crowd` feature to manage agents over an existing navmesh.

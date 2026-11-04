@@ -24,15 +24,33 @@
 //! tile that receives it, so a surface crossing a seam is rasterised identically
 //! (up to the border) on both sides.
 
+use alloc::borrow::Cow;
 use alloc::vec::Vec;
 use core::fmt;
 
 use crate::common::{floorf, fmax, fmin};
 use crate::detour::{self, NavMesh, NavMeshCreateParams, NavMeshParams};
-use crate::recast::{
-    self, CompactHeightfield, Config, ContourSet, Heightfield, PolyMesh, PolyMeshDetail,
+use crate::recast::{self, Config};
+use crate::{Error, Limits, UpstreamFixes, Workspace};
+
+mod install;
+mod job;
+mod manifest;
+mod source;
+mod task;
+
+pub use install::{TileInstaller, install_cost};
+pub use job::{BakeJob, JobOptions, TileOutput};
+pub use manifest::{
+    BAKE_REVISION, BakeManifest, DirtyTiles, GridLayout, MANIFEST_VERSION, ManifestDelta,
+    ManifestEntry, TileKey,
 };
-use crate::{Error, Limits, UpstreamFixes, Usage, Workspace};
+pub use source::{
+    GeometrySource, IndexedInput, ItemId, OffMeshSink, TriangleId, TriangleSink, VolumeSink,
+};
+#[cfg(test)]
+use task::TileWorkspace;
+use task::{Advance, OffMesh, TileTask, TriSource, VolumeRef};
 
 /// Region partition used by the tile pipeline; not in recastnavigation as a type.
 #[non_exhaustive]
@@ -255,8 +273,8 @@ struct Prepared {
     columns: i32,
 }
 
-fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prepared, Error> {
-    ws.begin();
+/// Checks every setting a tile bake reads, before any geometry is touched.
+fn validate_config(c: &BakeConfig) -> Result<(), Error> {
     let base = c.recast;
     if !positive(base.cs)
         || !positive(base.ch)
@@ -281,6 +299,13 @@ fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prep
     {
         return Err(Error::InvalidParameter("tile bake configuration"));
     }
+    Ok(())
+}
+
+fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prepared, Error> {
+    ws.begin();
+    validate_config(c)?;
+    let base = c.recast;
     work(
         ws,
         input
@@ -492,49 +517,6 @@ fn validate_links(input: &Input<'_>, ws: &mut Workspace) -> Result<(), Error> {
     Ok(())
 }
 
-// Stage APIs reset accounting. Supply the remaining per-tile budget at each
-// boundary, then accumulate usage so a later stage cannot spend it again.
-struct TileWorkspace {
-    ws: Workspace,
-    limits: Limits,
-    usage: Usage,
-}
-impl TileWorkspace {
-    fn stage<T>(&mut self, f: impl FnOnce(&mut Workspace) -> Result<T, Error>) -> Result<T, Error> {
-        let mut limits = self.limits;
-        limits.max_bytes = limits.max_bytes.saturating_sub(self.usage.bytes);
-        limits.max_work = limits.max_work.saturating_sub(self.usage.work);
-        self.ws.set_limits(limits);
-        self.ws.begin();
-        let out = f(&mut self.ws);
-        self.usage.bytes = self
-            .usage
-            .bytes
-            .checked_add(self.ws.usage().bytes)
-            .ok_or(Error::SizeOverflow)?;
-        self.usage.work = self
-            .usage
-            .work
-            .checked_add(self.ws.usage().work)
-            .ok_or(Error::SizeOverflow)?;
-        out
-    }
-
-    /// Like [`stage`](Self::stage) for a stage whose compact field was built by
-    /// this pipeline: callers never see it, so the per-stage whole-grid
-    /// connection scans (a full pass per stage) are skipped. Their work is still
-    /// charged, so budgets behave as before.
-    fn trusted_stage<T>(
-        &mut self,
-        f: impl FnOnce(&mut Workspace) -> Result<T, Error>,
-    ) -> Result<T, Error> {
-        self.ws.set_compact_trusted(true);
-        let out = self.stage(f);
-        self.ws.set_compact_trusted(false);
-        out
-    }
-}
-
 fn build_tile(
     input: &Input<'_>,
     c: &BakeConfig,
@@ -544,16 +526,11 @@ fn build_tile(
     x: i32,
     y: i32,
 ) -> TileResult {
-    let mut tw = TileWorkspace {
-        ws: Workspace::new(),
-        limits: c.tile_limits,
-        usage: Usage::default(),
-    };
-    build_tile_in_workspace(input, c, cfg, bucket, volume_bucket, x, y, &mut tw)
+    build_tile_counted(input, c, cfg, bucket, volume_bucket, x, y).0
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_tile_in_workspace(
+/// Builds one tile from a borrowed input; also returns the work the tile charged.
+fn build_tile_counted(
     input: &Input<'_>,
     c: &BakeConfig,
     cfg: &Config,
@@ -561,210 +538,28 @@ fn build_tile_in_workspace(
     volume_bucket: &[usize],
     x: i32,
     y: i32,
-    tw: &mut TileWorkspace,
-) -> TileResult {
-    let (tris, mut areas) = tw.stage(|ws| {
-        work(ws, bucket.len())?;
-        let mut tris =
-            ws.vec_with_capacity(bucket.len().checked_mul(3).ok_or(Error::SizeOverflow)?)?;
-        let mut areas = ws.vec_with_capacity(bucket.len())?;
-        for &i in bucket {
-            tris.extend_from_slice(&input.tris[i * 3..i * 3 + 3]);
-            areas.push(input.areas.map_or(0, |a| a[i]));
-        }
-        Ok((tris, areas))
-    })?;
-    tw.stage(|ws| {
-        if input.areas.is_some() {
-            recast::clear_unwalkable_triangles(
-                ws,
-                cfg.walkable_slope_angle,
-                input.verts,
-                &tris,
-                &mut areas,
-            )
-        } else {
-            recast::mark_walkable_triangles(
-                ws,
-                cfg.walkable_slope_angle,
-                input.verts,
-                &tris,
-                &mut areas,
-            )
-        }
-    })?;
-    // Heightfield::new allocates its grid but does not charge cell visits.
-    // Precharge that initialization before entering the stage (which resets usage).
-    tw.stage(|ws| {
-        let cells = usize::try_from(cfg.width)
-            .map_err(|_| Error::SizeOverflow)?
-            .checked_mul(usize::try_from(cfg.height).map_err(|_| Error::SizeOverflow)?)
-            .ok_or(Error::SizeOverflow)?;
-        work(ws, cells)
-    })?;
-    let mut hf = tw.stage(|ws| {
-        Heightfield::new(
-            ws, cfg.width, cfg.height, cfg.bmin, cfg.bmax, cfg.cs, cfg.ch,
-        )
-    })?;
-    if !tris.is_empty() {
-        tw.stage(|ws| hf.rasterize_triangles(ws, input.verts, &tris, &areas, cfg.walkable_climb))?;
-    }
-    if c.filter_low_hanging {
-        tw.stage(|ws| hf.filter_low_hanging_walkable_obstacles(ws, cfg.walkable_climb))?;
-    }
-    if c.filter_ledge {
-        tw.stage(|ws| hf.filter_ledge_spans(ws, cfg.walkable_height, cfg.walkable_climb))?;
-    }
-    if c.filter_low_height {
-        tw.stage(|ws| hf.filter_walkable_low_height_spans(ws, cfg.walkable_height))?;
-    }
-    let mut chf =
-        tw.stage(|ws| CompactHeightfield::build(ws, cfg.walkable_height, cfg.walkable_climb, &hf))?;
-    drop(hf);
-    tw.trusted_stage(|ws| recast::erode_walkable_area(ws, cfg.walkable_radius, &mut chf))?;
-    for &i in volume_bucket {
-        let v = &input.volumes[i];
-        tw.trusted_stage(|ws| {
-            recast::mark_convex_poly_area(ws, v.verts, v.hmin, v.hmax, v.area, &mut chf)
-        })?;
-    }
-    match c.partition {
-        Partition::Watershed => {
-            tw.trusted_stage(|ws| recast::build_distance_field(ws, &mut chf))?;
-            tw.trusted_stage(|ws| {
-                recast::build_regions(
-                    ws,
-                    &mut chf,
-                    cfg.border_size,
-                    cfg.min_region_area,
-                    cfg.merge_region_area,
-                )
-            })?;
-        }
-        Partition::Monotone => tw.trusted_stage(|ws| {
-            recast::build_regions_monotone(
-                ws,
-                &mut chf,
-                cfg.border_size,
-                cfg.min_region_area,
-                cfg.merge_region_area,
-            )
-        })?,
-        Partition::Layers => tw.trusted_stage(|ws| {
-            recast::build_layer_regions(ws, &mut chf, cfg.border_size, cfg.min_region_area)
-        })?,
-    }
-    let contours = tw.trusted_stage(|ws| {
-        ContourSet::build(
-            ws,
-            &chf,
-            cfg.max_simplification_error,
-            cfg.max_edge_len,
-            recast::CONTOUR_TESS_WALL_EDGES,
-        )
-    })?;
-    let (mut mesh, report) = tw.stage(|ws| {
-        PolyMesh::build_with_report(
-            ws,
-            &contours,
-            cfg.max_verts_per_poly,
-            c.strict_triangulation,
-        )
-    })?;
-    tw.stage(|ws| {
-        work(ws, mesh.areas.len())?;
-        for (a, f) in mesh.areas.iter_mut().zip(&mut mesh.flags) {
-            if *a == recast::WALKABLE_AREA {
-                *a = 0;
-            }
-            *f = if *a == 0 || *a >= 16 {
-                1
-            } else {
-                1 | (1 << *a)
-            };
-        }
-        Ok(())
-    })?;
-
-    if cfg.detail_sample_dist > 0.0 {
-        let samples_per_axis = cfg.width as f32 * cfg.cs / cfg.detail_sample_dist;
-        if !samples_per_axis.is_finite() || samples_per_axis > (i32::MAX / 4) as f32 {
-            return Err(Error::InvalidParameter("detail sample distance too small"));
+) -> (TileResult, u64) {
+    let mut task = TileTask::new(
+        c,
+        cfg,
+        x,
+        y,
+        Cow::Borrowed(input.verts),
+        TriSource::Bucket { input, bucket },
+        volume_bucket
+            .iter()
+            .map(|&i| VolumeRef::borrowed(&input.volumes[i]))
+            .collect(),
+        OffMesh::Borrowed(input.off_mesh),
+        None,
+    );
+    loop {
+        match task.advance() {
+            Ok(Advance::More) => {}
+            Ok(Advance::Done(data, report)) => return (Ok((data, report)), task.work_used()),
+            Err(e) => return (Err(e), task.work_used()),
         }
     }
-    let detail = tw.trusted_stage(|ws| {
-        PolyMeshDetail::build_with_fixes(
-            ws,
-            &mesh,
-            &chf,
-            cfg.detail_sample_dist,
-            cfg.detail_sample_max_error,
-            c.fixes,
-        )
-    })?;
-    if mesh.npolys == 0 {
-        return Ok((None, report));
-    }
-    let params = NavMeshCreateParams {
-        verts: &mesh.verts,
-        vert_count: mesh.nverts,
-        polys: &mesh.polys,
-        poly_flags: &mesh.flags,
-        poly_areas: &mesh.areas,
-        poly_count: mesh.npolys,
-        nvp: mesh.nvp,
-        detail_meshes: &detail.meshes,
-        detail_verts: &detail.verts,
-        detail_verts_count: i32::try_from(detail.verts.len() / 3)
-            .map_err(|_| Error::SizeOverflow)?,
-        detail_tris: &detail.tris,
-        detail_tri_count: i32::try_from(detail.tris.len() / 4).map_err(|_| Error::SizeOverflow)?,
-        tile_x: x,
-        tile_y: y,
-        tile_layer: 0,
-        user_id: 0,
-        bmin: mesh.bmin,
-        bmax: mesh.bmax,
-        walkable_height: c.walkable_height,
-        walkable_radius: c.walkable_radius,
-        walkable_climb: c.walkable_climb,
-        cs: cfg.cs,
-        ch: cfg.ch,
-        build_bv_tree: true,
-        ..input.off_mesh
-    };
-    tw.stage(|ws| {
-        // Conservative output + temporary BV arrays/sort + link/classification
-        // bound, charged before entering the existing Detour builder.
-        let n = mesh
-            .verts
-            .len()
-            .checked_add(mesh.polys.len())
-            .and_then(|n| n.checked_add(detail.verts.len()))
-            .and_then(|n| n.checked_add(detail.tris.len()))
-            .and_then(|n| n.checked_add(input.off_mesh.off_mesh_con_verts.len()))
-            .and_then(|n| n.checked_add(1))
-            .ok_or(Error::SizeOverflow)?;
-        let bound = n.checked_mul(128).ok_or(Error::SizeOverflow)?;
-        let polys = usize::try_from(mesh.npolys).map_err(|_| Error::SizeOverflow)?;
-        let sort_work = polys
-            .checked_mul(
-                usize::try_from(usize::BITS - polys.leading_zeros())
-                    .map_err(|_| Error::SizeOverflow)?
-                    .pow(2),
-            )
-            .ok_or(Error::SizeOverflow)?;
-        work(ws, bound.checked_add(sort_work).ok_or(Error::SizeOverflow)?)?;
-        ws.charge_bytes::<u8>(bound)?;
-        let data = detour::create_with_limits(&params, &c.tile_limits)?;
-        if data.len() > c.tile_limits.max_tile_bytes {
-            return Err(Error::LimitExceeded);
-        }
-        // Validate the produced tile against all caller-specified format limits.
-        detour::check_bake_tile_limits(&data, &c.tile_limits)?;
-        Ok((Some(data), report))
-    })
 }
 
 /// Bakes tiles serially; extension **not in recastnavigation**.
@@ -919,6 +714,7 @@ fn fill_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Usage;
 
     #[test]
     fn aggregate_reserves_retained_outputs_and_all_workers_before_work() {
@@ -1057,12 +853,7 @@ mod tests {
             let setup = ws.usage().work;
             let mut work = 0;
             for i in 0..n {
-                let mut tw = TileWorkspace {
-                    ws: Workspace::new(),
-                    limits: c.tile_limits,
-                    usage: Usage::default(),
-                };
-                let data = build_tile_in_workspace(
+                let (data, tile_work) = build_tile_counted(
                     &input,
                     &c,
                     &p.configs[i],
@@ -1070,11 +861,10 @@ mod tests {
                     &p.volume_buckets[i],
                     i as i32,
                     0,
-                    &mut tw,
-                )
-                .unwrap();
+                );
+                let data = data.unwrap();
                 assert!(data.0.is_some());
-                work += tw.usage.work;
+                work += tile_work;
                 if n == 8 {
                     let all: Vec<_> = (0..volumes.len()).collect();
                     let unculled =

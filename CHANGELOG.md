@@ -6,7 +6,42 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-04
+
 ### Added
+
+- Incremental, resumable and cancellable tile baking from a geometry provider (`bake`
+  module, extension not in recastnavigation):
+  - `GeometrySource`: a deterministic provider of triangles, area volumes and off-mesh
+    connections for one tile column at a time, so a large world never has to be in memory.
+    `Input` implements it.
+  - `GridLayout`, `TileKey`, `BakeManifest` (with `to_bytes` / `from_bytes` for untrusted
+    bytes), `ManifestEntry`: the tile grid, and per-tile input and output digests the caller
+    persists next to the tiles. `BakeManifest::dirty_from_boxes(cfg, grid, boxes)` turns
+    edited boxes, a grown grid or a changed configuration or layout into the tiles to rebake
+    (`DirtyTiles`: keys, removed tiles, `full_rebake`) and `BakeJob::skip_unchanged` drops
+    those whose input did not change (and reports a manifest it cannot compare with).
+    `BakeManifest::retarget` moves a manifest to a new grid; `apply` takes the job's
+    `ManifestDelta` and refuses one baked under another configuration. `from_bytes` checks
+    the grid against the configuration hash and bounds the grid size by `Limits::max_work`.
+  - `BakeJob`: the same pipeline as `bake::tiles`, driven by `step` (work `Budget`, whole
+    stages), `run_parallel` / `run_parallel_chunk` (rayon with `parallel`) or both, with
+    finished tiles handed out in row-major order by `next_ready` and the matching manifest
+    entries by `manifest_delta`. Output is byte-identical for any step budget, thread count
+    and for an incremental rebake against a full bake.
+  - `CancelToken` and `Error::Cancelled`: a relaxed atomic load at every work charge stops
+    a job within one charge interval; no partial tile is ever returned.
+  - `Workspace::set_cancel_token`.
+  - `TileInstaller`: queues finished tiles and installs them into a `NavMesh` in slices of a
+    work `Budget` (one unit per KiB of tile data), resuming on the next call; and
+    `GridLayout::nav_mesh_params(max_tiles, max_polys)`, so the residency cap is the
+    caller's parameter. No tile-count limit in the job, the manifest or the installer. A
+    rebaked tile replaces the resident one, the newest queued version of a tile wins, a tile
+    rebaked to nothing removes it, and `clear` drops what is queued.
+  - `Input::indexed` / `IndexedInput`: the same source as `Input` with a spatial index
+    built once, so a fetch costs what the tile holds. A job's byte limits count as `tiles`
+    counts them, and `BakeConfig::max_total_bytes` is enforced by the job.
+- Fuzz targets `incremental_bake` and `bake_job_steps`; seed mode `bake-job`.
 
 - `UpstreamFixes`, a bit set of opt-in corrections for wrong but defined upstream behaviour.
   `UpstreamFixes::NONE` is the default everywhere and reproduces upstream exactly. It is
@@ -111,6 +146,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- `bake::tiles` and the job share one stage machine for the per-tile pipeline (no change
+  to output, budgets or errors).
 - `Error` has a new variant, `InvalidTileState` (the enum is `#[non_exhaustive]`).
 - Breaking: `RaycastHit` is `#[non_exhaustive]` and has a new field `edge`; build values
   with `RaycastHit::default()`.
