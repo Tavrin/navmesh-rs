@@ -442,3 +442,32 @@ fn huge_triangle_over_a_small_grid_is_a_typed_error() {
     let result = hf.rasterize_triangle(&mut ws, v0, v1, v2, 0, 0);
     assert!(matches!(result, Err(Error::InvalidInput(_))), "{result:?}");
 }
+
+/// `rcFilterLedgeSpans` after upstream's ledge rewrite counts a neighbour whose free gap
+/// is exactly `walkable_height` cells as traversable, as the compact heightfield and
+/// the low-height filter do; one cell less is not. See `reference/UPSTREAM.md`.
+#[test]
+fn ledge_filter_treats_a_gap_of_exactly_walkable_height_as_traversable() {
+    // 3x3 columns, cell size 1: the middle column has a floor at 10 and a ceiling at 20;
+    // the north column drops to 3 and has a span at `north_ceiling`; the others are level.
+    let centre_area = |north_ceiling: u16| {
+        let mut ws = Workspace::new();
+        let mut hf = Heightfield::new(&mut ws, 3, 3, [0.; 3], [3.; 3], 1.0, 1.0).unwrap();
+        for (x, z) in [(0, 0), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (2, 2)] {
+            hf.add_span(&mut ws, x, z, 0, 10, 1, 0).unwrap();
+        }
+        hf.add_span(&mut ws, 1, 1, 0, 10, 1, 0).unwrap();
+        hf.add_span(&mut ws, 1, 1, 20, 21, 1, 0).unwrap();
+        hf.add_span(&mut ws, 1, 2, 0, 3, 1, 0).unwrap();
+        hf.add_span(&mut ws, 1, 2, north_ceiling, north_ceiling + 1, 1, 0)
+            .unwrap();
+        hf.filter_ledge_spans(&mut ws, 5, 1).unwrap();
+        hf.column(4).next().unwrap().area
+    };
+    assert_eq!(
+        centre_area(15),
+        0,
+        "gap == walkable height: a drop, so a ledge"
+    );
+    assert_eq!(centre_area(14), 1, "gap one cell short: not a neighbour");
+}

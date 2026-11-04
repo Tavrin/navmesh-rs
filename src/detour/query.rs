@@ -15,7 +15,7 @@ use super::{
     STRAIGHTPATH_START, Status, VERTS_PER_POLYGON,
 };
 use crate::budget::spend_one;
-use crate::{Budget, Budgeted, Error};
+use crate::{Budget, Budgeted, Error, UpstreamFixes};
 
 pub(crate) const H_SCALE: f32 = 0.999;
 
@@ -141,6 +141,7 @@ pub struct NavMeshQuery<'a> {
     pub(crate) tiny_node_pool: NodePool,
     pub(crate) open_list: NodeQueue,
     pub(crate) query: QueryData,
+    fixes: UpstreamFixes,
 }
 
 pub(crate) type Tp<'a> = (PolyRef, &'a MeshTile, &'a Poly);
@@ -157,7 +158,20 @@ impl<'a> NavMeshQuery<'a> {
             tiny_node_pool: NodePool::new(64, 32)?,
             open_list: NodeQueue::new(max_nodes)?,
             query: QueryData::default(),
+            fixes: UpstreamFixes::NONE,
         })
+    }
+
+    /// Selects the upstream defect corrections this query applies; the default
+    /// is [`UpstreamFixes::NONE`]. Only [`UpstreamFixes::SLICED_CROSS_SIDE`]
+    /// concerns a query. Change it between searches, not during a sliced one.
+    pub fn set_fixes(&mut self, fixes: UpstreamFixes) {
+        self.fixes = fixes;
+    }
+
+    /// The corrections this query applies.
+    pub fn fixes(&self) -> UpstreamFixes {
+        self.fixes
     }
 
     /// The navmesh this query reads.
@@ -1127,7 +1141,13 @@ impl<'a> NavMeshQuery<'a> {
                 if !filter.pass_filter(nref, nei.1, nei.2) {
                     continue;
                 }
-                let Some(nn) = self.node_pool.get_node(nref, 0) else {
+                let cross_side =
+                    if self.fixes.contains(UpstreamFixes::SLICED_CROSS_SIDE) && link.side != 0xff {
+                        link.side >> 1
+                    } else {
+                        0
+                    };
+                let Some(nn) = self.node_pool.get_node(nref, cross_side) else {
                     self.query.status |= Status::OUT_OF_NODES;
                     continue;
                 };
@@ -1701,11 +1721,15 @@ pub(crate) struct DetachedQuery {
     tiny_node_pool: NodePool,
     open_list: NodeQueue,
     query: QueryData,
+    fixes: UpstreamFixes,
 }
 #[cfg(feature = "crowd")]
 impl DetachedQuery {
     pub(crate) fn new(nav: &NavMesh, max_nodes: usize) -> Result<Self, Error> {
         Ok(NavMeshQuery::new(nav, max_nodes)?.detach())
+    }
+    pub(crate) fn set_fixes(&mut self, fixes: UpstreamFixes) {
+        self.fixes = fixes;
     }
     pub(crate) fn attach(self, nav: &NavMesh) -> NavMeshQuery<'_> {
         NavMeshQuery {
@@ -1714,6 +1738,7 @@ impl DetachedQuery {
             tiny_node_pool: self.tiny_node_pool,
             open_list: self.open_list,
             query: self.query,
+            fixes: self.fixes,
         }
     }
 }
@@ -1725,6 +1750,7 @@ impl NavMeshQuery<'_> {
             tiny_node_pool: self.tiny_node_pool,
             open_list: self.open_list,
             query: self.query,
+            fixes: self.fixes,
         }
     }
 }
