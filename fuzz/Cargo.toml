@@ -105,3 +105,18 @@ path = "fuzz_targets/trusted_bake.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "incremental_bake"
+path = "fuzz_targets/incremental_bake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bake_job_steps"
+path = "fuzz_targets/bake_job_steps.rs"
+test = false
+doc = false
+bench = false
+required-features = ["parallel"]

@@ -41,6 +41,8 @@ pub enum Error {
     },
     /// An output buffer is too small.
     BufferTooSmall,
+    /// The call was stopped by its [`CancelToken`] (not in recastnavigation).
+    Cancelled,
 }
 
 /// Why navmesh tile bytes were rejected.
@@ -89,7 +91,44 @@ impl fmt::Display for Error {
                 "partial triangulation: {failed_contours} contours, {missing_triangles} missing triangles"
             ),
             Error::BufferTooSmall => f.write_str("buffer too small"),
+            Error::Cancelled => f.write_str("cancelled"),
         }
+    }
+}
+
+/// A shared flag that stops work in progress (not in recastnavigation).
+///
+/// Clones share one flag. Setting it is irreversible; make a new token for the
+/// next job. A [`Workspace`] given a token (through the bake job API) checks it
+/// with one relaxed atomic load at every work charge and then fails the running
+/// call with [`Error::Cancelled`].
+///
+/// ```
+/// use navmesh_rs::CancelToken;
+///
+/// let token = CancelToken::new();
+/// let other = token.clone();
+/// assert!(!token.is_cancelled());
+/// other.cancel();
+/// assert!(token.is_cancelled());
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct CancelToken(alloc::sync::Arc<core::sync::atomic::AtomicBool>);
+
+impl CancelToken {
+    /// A token that is not cancelled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cancels every clone of this token.
+    pub fn cancel(&self) {
+        self.0.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether [`cancel`](Self::cancel) has been called on any clone.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(core::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -155,6 +194,8 @@ pub struct Workspace {
     /// Set only by the crate's own pipelines while every compact field they pass
     /// to a stage was built by this crate and not exposed to caller edits since.
     compact_trusted: bool,
+    /// Checked at every work charge when present.
+    cancel: Option<CancelToken>,
 }
 
 impl Workspace {
@@ -169,7 +210,14 @@ impl Workspace {
             limits,
             usage: Usage::default(),
             compact_trusted: false,
+            cancel: None,
         }
+    }
+
+    /// Stops calls on this workspace with [`Error::Cancelled`] once `token` is
+    /// cancelled (checked at each work charge). `None` removes the token.
+    pub fn set_cancel_token(&mut self, token: Option<CancelToken>) {
+        self.cancel = token;
     }
 
     /// Whether the compact field passed to the running stage is known valid, so the
@@ -205,6 +253,11 @@ impl Workspace {
     /// Charges `n` work units.
     #[inline]
     pub(crate) fn work(&mut self, n: u64) -> Result<(), Error> {
+        if let Some(token) = &self.cancel
+            && token.is_cancelled()
+        {
+            return Err(Error::Cancelled);
+        }
         self.usage.work = self.usage.work.saturating_add(n);
         if self.usage.work > self.limits.max_work {
             Err(Error::LimitExceeded)

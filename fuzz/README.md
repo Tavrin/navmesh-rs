@@ -98,3 +98,18 @@ the polygon mesh's border-vertex removal. `seeds recast-grid <dir>` writes two
 meshes of 5,041 plus-shaped islands that the polygon mesh turns into about 50,000
 polygons, past the 16-bit edge numbering of the adjacency builder; they are the
 seeds that reach its `LimitExceeded` guard.
+
+`incremental_bake` builds a small editable world (triangles, area volumes, off-mesh links)
+and a list of edits from the input (layout in `src/bake_world.rs`), bakes it with a
+`BakeJob`, rebakes only the tiles `dirty_from_boxes` and `skip_unchanged` select, and
+requires the merged tiles and manifest to equal a full bake of the edited world.
+`bake_job_steps` (enable `--features parallel`) drives a job over the same kind of world
+with data-chosen step budgets, a cancel at a data-chosen step and the parallel driver at 1,
+4 and 16 threads, and compares every result with `bake::tiles`: same bytes and order, no
+tile after a cancel, delivered tiles equal the reference prefix. Seeds and runs:
+
+```sh
+cargo run --release --bin seeds -- bake-job corpus/bake_job
+cargo +nightly fuzz run incremental_bake corpus/bake_job -- -max_len=1024
+cargo +nightly fuzz run bake_job_steps --features parallel corpus/bake_job -- -max_len=1024
+```
