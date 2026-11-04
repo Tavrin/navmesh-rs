@@ -22,6 +22,58 @@ pub struct PolyMeshDetail {
 }
 
 impl PolyMeshDetail {
+    /// Concatenates detail meshes, for example the per-tile detail meshes of a tiled
+    /// build (`rcMergePolyMeshDetails`). Sub-mesh entries are rebased on the vertex
+    /// and triangle counts of the meshes before them.
+    ///
+    /// Differences from upstream, which would read out of bounds or wrap: arrays
+    /// shorter than a mesh's counts allow, or a total beyond what `u32` offsets and
+    /// `i32` counts can hold, are errors ([`Error::InvalidInput`],
+    /// [`Error::SizeOverflow`]).
+    pub fn merge(ws: &mut Workspace, meshes: &[&PolyMeshDetail]) -> Result<PolyMeshDetail, Error> {
+        ws.begin();
+        let mut max_meshes = 0usize;
+        let mut max_verts = 0usize;
+        let mut max_tris = 0usize;
+        for m in meshes {
+            if m.meshes.len() % 4 != 0 || m.verts.len() % 3 != 0 || m.tris.len() % 4 != 0 {
+                return Err(Error::InvalidInput("detail mesh array length"));
+            }
+            max_meshes += m.meshes.len() / 4;
+            max_verts += m.verts.len() / 3;
+            max_tris += m.tris.len() / 4;
+        }
+        if i32::try_from(max_meshes).is_err()
+            || i32::try_from(max_verts).is_err()
+            || i32::try_from(max_tris).is_err()
+        {
+            return Err(Error::SizeOverflow);
+        }
+        ws.work((max_meshes + max_verts + max_tris) as u64)?;
+        let mut out = PolyMeshDetail {
+            meshes: ws.vec_with_capacity(max_meshes * 4)?,
+            verts: ws.vec_with_capacity(max_verts * 3)?,
+            tris: ws.vec_with_capacity(max_tris * 4)?,
+        };
+        let mut nverts = 0u32;
+        let mut ntris = 0u32;
+        for m in meshes {
+            for s in m.meshes.chunks_exact(4) {
+                out.meshes.extend_from_slice(&[
+                    nverts.wrapping_add(s[0]),
+                    s[1],
+                    ntris.wrapping_add(s[2]),
+                    s[3],
+                ]);
+            }
+            out.verts.extend_from_slice(&m.verts);
+            out.tris.extend_from_slice(&m.tris);
+            nverts += (m.verts.len() / 3) as u32;
+            ntris += (m.tris.len() / 4) as u32;
+        }
+        Ok(out)
+    }
+
     /// Builds the detail mesh: per polygon, a triangulation that follows the
     /// heightfield within `sample_max_error` (`rcBuildPolyMeshDetail`).
     pub fn build(

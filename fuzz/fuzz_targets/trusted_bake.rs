@@ -110,10 +110,14 @@ fn reference_tile(
         })?;
         t.charge((cfg.width as u64) * (cfg.height as u64), 0)?;
         let mut hf = t.stage(|ws| {
-            Heightfield::new(ws, cfg.width, cfg.height, cfg.bmin, cfg.bmax, cfg.cs, cfg.ch)
+            Heightfield::new(
+                ws, cfg.width, cfg.height, cfg.bmin, cfg.bmax, cfg.cs, cfg.ch,
+            )
         })?;
         if !tris.is_empty() {
-            t.stage(|ws| hf.rasterize_triangles(ws, input.verts, &tris, &areas, cfg.walkable_climb))?;
+            t.stage(|ws| {
+                hf.rasterize_triangles(ws, input.verts, &tris, &areas, cfg.walkable_climb)
+            })?;
         }
         if c.filter_low_hanging {
             t.stage(|ws| hf.filter_low_hanging_walkable_obstacles(ws, cfg.walkable_climb))?;
@@ -172,7 +176,12 @@ fn reference_tile(
             )
         })?;
         let (mut mesh, report) = t.stage(|ws| {
-            PolyMesh::build_with_report(ws, &contours, cfg.max_verts_per_poly, c.strict_triangulation)
+            PolyMesh::build_with_report(
+                ws,
+                &contours,
+                cfg.max_verts_per_poly,
+                c.strict_triangulation,
+            )
         })?;
         t.charge(mesh.areas.len() as u64, 0)?;
         for (a, f) in mesh.areas.iter_mut().zip(&mut mesh.flags) {
@@ -213,9 +222,11 @@ fn reference_tile(
         params.nvp = mesh.nvp;
         params.detail_meshes = &detail.meshes;
         params.detail_verts = &detail.verts;
-        params.detail_verts_count = i32::try_from(detail.verts.len() / 3).map_err(|_| Error::SizeOverflow)?;
+        params.detail_verts_count =
+            i32::try_from(detail.verts.len() / 3).map_err(|_| Error::SizeOverflow)?;
         params.detail_tris = &detail.tris;
-        params.detail_tri_count = i32::try_from(detail.tris.len() / 4).map_err(|_| Error::SizeOverflow)?;
+        params.detail_tri_count =
+            i32::try_from(detail.tris.len() / 4).map_err(|_| Error::SizeOverflow)?;
         params.tile_x = x;
         params.tile_y = y;
         params.bmin = mesh.bmin;
@@ -343,7 +354,8 @@ fuzz_target!(|data: &[u8]| {
         // Spread the limits over the scale at which individual stages start to fail.
         cfg.tile_limits.max_bytes =
             (1 + usize::from(data[5] >> 4)) << (8 + usize::from(data[4] >> 4) % 14);
-        cfg.tile_limits.max_work = (1 + u64::from(data[4] & 15)) << (4 + u64::from(data[5] & 15) % 18);
+        cfg.tile_limits.max_work =
+            (1 + u64::from(data[4] & 15)) << (4 + u64::from(data[5] & 15) % 18);
     }
     let setup = Limits {
         max_bytes: 8 << 20,

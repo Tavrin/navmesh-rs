@@ -578,6 +578,25 @@ fn stream_poly_mesh(p: &mut Payload, m: &PolyMesh) {
     }
 }
 
+fn stream_detail_mesh(p: &mut Payload, d: &recast::PolyMeshDetail) {
+    p.i32((d.meshes.len() / 4) as i32)
+        .i32((d.verts.len() / 3) as i32)
+        .i32((d.tris.len() / 4) as i32);
+    for &v in &d.meshes {
+        p.u32(v);
+    }
+    for &v in &d.verts {
+        p.f32(v);
+    }
+    for &v in &d.tris {
+        p.u8(v);
+    }
+}
+
+/// The Recast meshes of one built tile, kept for the merge records: the tile grid
+/// location, the polygon mesh and the detail mesh.
+type KeptMesh = ((i32, i32), PolyMesh, recast::PolyMeshDetail);
+
 fn poly_flags_for_area(area: u8) -> u16 {
     if area == 0 || area >= 16 {
         1
@@ -598,6 +617,7 @@ fn build_one(
     prefix: &str,
     tile: (i32, i32),
     layer_data: &mut Vec<Vec<u8>>,
+    kept: &mut Vec<KeptMesh>,
 ) -> Result<Option<Vec<u8>>, Error> {
     let tilecache = c.mode == "tilecache";
     sink.record(&format!("{prefix}config"), |p| stream_config(p, cfg));
@@ -687,6 +707,22 @@ fn build_one(
                     p.u32(u32::try_from(data.len()).unwrap()).bytes(&data);
                 },
             );
+            sink.record(
+                &format!("layer_{}_{}_{}.layer_endian", h.tx, h.ty, h.tlayer),
+                |p| {
+                    let mut d = data.clone();
+                    p.u8(u8::from(tc::tile_cache_header_swap_endian(&mut d).is_ok()));
+                    p.bytes(&d[..tc::LAYER_HEADER_SIZE]);
+                    let mut back = d.clone();
+                    let _ = tc::tile_cache_header_swap_endian(&mut back);
+                    p.u8(u8::from(back == data));
+                    let mut bad = data.clone();
+                    bad[3] ^= 0x01;
+                    p.u8(u8::from(
+                        tc::tile_cache_header_swap_endian(&mut bad).is_ok(),
+                    ));
+                },
+            );
             layer_data.push(data);
         }
         return Ok(None);
@@ -746,19 +782,11 @@ fn build_one(
         cfg.detail_sample_max_error,
     )?;
     sink.record(&format!("{prefix}detail_mesh"), |p| {
-        p.i32((dmesh.meshes.len() / 4) as i32)
-            .i32((dmesh.verts.len() / 3) as i32)
-            .i32((dmesh.tris.len() / 4) as i32);
-        for &v in &dmesh.meshes {
-            p.u32(v);
-        }
-        for &v in &dmesh.verts {
-            p.f32(v);
-        }
-        for &v in &dmesh.tris {
-            p.u8(v);
-        }
+        stream_detail_mesh(p, &dmesh)
     });
+    if sink.writer.is_some() {
+        kept.push((tile, pmesh.clone(), dmesh.clone()));
+    }
     if pmesh.npolys == 0 {
         return Ok(None);
     }
@@ -818,6 +846,8 @@ struct Baked {
     tiles: Vec<(i32, i32, i32, Vec<u8>)>,
     params: Option<NavMeshParams>,
     cache: Option<TileCache<RawCompressor, tilecache_records::Process>>,
+    /// Recast meshes of every built tile (recording runs of solo and tiled bakes).
+    meshes: Vec<KeptMesh>,
 }
 
 fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
@@ -828,6 +858,7 @@ fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
         tiles: Vec::new(),
         params: None,
         cache: None,
+        meshes: Vec::new(),
     };
     if c.mode == "solo" {
         let mut cfg = base;
@@ -844,6 +875,7 @@ fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
             "",
             (0, 0),
             &mut layer_data,
+            &mut out.meshes,
         )? {
             out.tiles.push((0, 0, 0, t));
         }
@@ -898,6 +930,7 @@ fn bake(c: &Case, g: &Geometry, sink: &mut Sink) -> Result<Baked, Error> {
                 &format!("tile_{x}_{y}."),
                 (x, y),
                 &mut layer_data,
+                &mut out.meshes,
             )?;
             if let Some(t) = t {
                 out.tiles.push((x, y, 0, t));
@@ -1282,6 +1315,131 @@ fn record_queries(
     Ok(())
 }
 
+/// `poly_mesh_copy`, `merged_poly_mesh[_block]` and `merged_detail_mesh[_block]`
+/// (reference/RECORDS.md).
+fn record_merged_meshes(b: &Baked, sink: &mut Sink) -> Result<(), Error> {
+    let Some((_, first, _)) = b.meshes.first() else {
+        return Ok(());
+    };
+    let mut ws = Workspace::new();
+    let copy = first.copy(&mut ws)?;
+    sink.record("poly_mesh_copy", |p| stream_poly_mesh(p, &copy));
+    for pass in 0..2 {
+        let picked: Vec<&KeptMesh> = b
+            .meshes
+            .iter()
+            .filter(|((x, y), _, _)| pass == 0 || (*x < 2 && *y < 2))
+            .collect();
+        if picked.is_empty() {
+            continue;
+        }
+        let suffix = if pass == 0 { "" } else { "_block" };
+        let pm: Vec<&PolyMesh> = picked.iter().map(|k| &k.1).collect();
+        let dm: Vec<&recast::PolyMeshDetail> = picked.iter().map(|k| &k.2).collect();
+        let merged = PolyMesh::merge(&mut ws, &pm)?;
+        sink.record(&format!("merged_poly_mesh{suffix}"), |p| {
+            stream_poly_mesh(p, &merged)
+        });
+        let md = recast::PolyMeshDetail::merge(&mut ws, &dm)?;
+        sink.record(&format!("merged_detail_mesh{suffix}"), |p| {
+            stream_detail_mesh(p, &md)
+        });
+    }
+    Ok(())
+}
+
+/// `tile_endian`: the byte-order conversion of every tile's bytes.
+fn record_tile_endian(b: &Baked, sink: &mut Sink) {
+    use navmesh_parity::container::fnv1a64;
+    sink.record("tile_endian", |p| {
+        p.u32(b.tiles.len() as u32);
+        for (x, y, l, src) in &b.tiles {
+            p.i32(*x).i32(*y).i32(*l).u32(src.len() as u32);
+            let mut d = src.clone();
+            let data_ok = detour::nav_mesh_data_swap_endian(&mut d).is_ok();
+            let header_ok = detour::nav_mesh_header_swap_endian(&mut d).is_ok();
+            p.u8(u8::from(data_ok)).u8(u8::from(header_ok));
+            p.bytes(&d[..100]);
+            let h = fnv1a64(&d);
+            p.u32(h as u32).u32((h >> 32) as u32);
+            let mut back = d.clone();
+            let _ = detour::nav_mesh_header_swap_endian(&mut back);
+            let _ = detour::nav_mesh_data_swap_endian(&mut back);
+            p.u8(u8::from(back == *src));
+            let mut foreign = d.clone();
+            p.u8(u8::from(
+                detour::nav_mesh_data_swap_endian(&mut foreign).is_ok(),
+            ));
+            let mut bad = src.clone();
+            bad[3] ^= 0x01;
+            p.u8(u8::from(
+                detour::nav_mesh_header_swap_endian(&mut bad).is_ok(),
+            ));
+        }
+    });
+}
+
+/// `tile_state`: store and restore of tile state on a copy of the navmesh.
+fn record_tile_state(b: &Baked, sink: &mut Sink) -> Result<(), Error> {
+    let mut nav = assemble(b)?;
+    let slots: Vec<usize> = (0..nav.max_tiles() as usize)
+        .filter(|&i| nav.tile(i).is_some())
+        .collect();
+    let mut p = Payload::new();
+    p.u32(slots.len() as u32);
+    for slot in slots {
+        let tref = nav.tile_ref(slot);
+        let base = nav.poly_ref_base(slot).ok_or(Error::InvalidRef)?;
+        let (x, y, layer, n) = {
+            let h = &nav.tile(slot).ok_or(Error::InvalidRef)?.header;
+            (h.x, h.y, h.layer, h.poly_count)
+        };
+        let size = nav.tile_state_size(tref)?;
+        p.i32(x).i32(y).i32(layer).i32(n).u32(size as u32);
+        let store = |nav: &NavMesh| -> Result<(u32, Vec<u8>), Error> {
+            let mut buf = vec![0u8; size];
+            let r = nav.store_tile_state(tref, &mut buf).map(|_| ());
+            Ok((st(&r, |_| Status::OK), buf))
+        };
+        let (s1, a) = store(&nav)?;
+        let mut small = vec![0u8; size];
+        let r = nav.store_tile_state(tref, &mut small[..size - 1]);
+        p.u32(s1).u32(st(&r, |_| Status::OK)).bytes(&a);
+        for i in 0..n as PolyRef {
+            nav.set_poly_flags(base | i, (0x5a5au32 ^ (i as u32).wrapping_mul(131)) as u16)?;
+            nav.set_poly_area(base | i, ((i as u32 * 7 + 3) & 0x3f) as u8)?;
+        }
+        let (_, edited) = store(&nav)?;
+        p.bytes(&edited);
+        let r = nav.restore_tile_state(tref, &a);
+        p.u32(st(&r, |_| Status::OK));
+        p.bytes(&store(&nav)?.1);
+        let r = nav.restore_tile_state(tref, &edited);
+        p.u32(st(&r, |_| Status::OK));
+        p.bytes(&store(&nav)?.1);
+        let mut bad_magic = a.clone();
+        bad_magic[0] ^= 0x01;
+        let mut bad_version = a.clone();
+        bad_version[4] ^= 0x01;
+        let mut other_tile = a.clone();
+        other_tile[8] ^= 0x01;
+        for blob in [
+            &a[..size - 1],
+            &bad_magic[..],
+            &bad_version[..],
+            &other_tile[..],
+        ] {
+            let r = nav.restore_tile_state(tref, blob);
+            p.u32(st(&r, |_| Status::OK));
+        }
+        p.bytes(&store(&nav)?.1);
+    }
+    sink.record("tile_state", |pl| {
+        pl.bytes(p.as_bytes());
+    });
+    Ok(())
+}
+
 /// Navmesh verdicts on malformed or conflicting tiles (reference/RECORDS.md).
 fn record_malformed(b: &Baked, nav: &NavMesh, sink: &mut Sink) {
     let Some((_, _, _, src)) = b.tiles.first() else {
@@ -1436,6 +1594,7 @@ fn bake_extension(c: &Case, g: &Geometry, parallel: bool) -> Result<Baked, Strin
     Ok(Baked {
         params: Some(baked.params),
         cache: None,
+        meshes: Vec::new(),
         tiles: baked
             .tiles
             .into_iter()
@@ -1480,6 +1639,7 @@ fn verify_parallel(c: &Case, g: &Geometry) -> Result<(), String> {
         let got = Baked {
             params: Some(baked.params),
             cache: None,
+            meshes: Vec::new(),
             tiles: baked
                 .tiles
                 .iter()
@@ -1896,6 +2056,9 @@ fn bake_records(case: &Case, g: &Geometry, base: &str) -> (Vec<u8>, Result<(), S
         record_queries(case, &nav, &DefaultFilter::default(), "", &mut sink)
             .and_then(|()| record_queries(case, &nav, &costs, "filtered.", &mut sink))
             .map_err(|e| format!("queries: {e}"))?;
+        record_merged_meshes(&b, &mut sink).map_err(|e| format!("merged meshes: {e}"))?;
+        record_tile_endian(&b, &mut sink);
+        record_tile_state(&b, &mut sink).map_err(|e| format!("tile state: {e}"))?;
         record_malformed(&b, &nav, &mut sink);
         record_crowds(case, &b, &mut sink).map_err(|e| format!("crowd: {e}"))?;
         tilecache_records::record_obstacles(case, &mut b, &mut nav, &mut sink)

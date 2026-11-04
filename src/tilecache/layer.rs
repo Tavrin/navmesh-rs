@@ -145,6 +145,37 @@ impl LayerHeader {
         ]);
     }
 }
+/// Swaps the byte order of a layer header in place (`dtTileCacheHeaderSwapEndian`).
+///
+/// The crate reads and writes layers little-endian; upstream's "native" order is
+/// the host's, so this converts between little-endian and big-endian layers and is
+/// its own inverse. It accepts a header whose magic and version are both correct in
+/// one byte order or both in the other, then reverses the bytes of the magic,
+/// version, tile coordinates, bounds and the two height limits. The one-byte
+/// fields and the compressed grids that follow the header are not touched.
+/// [`Error::InvalidInput`] when the magic or version fit neither byte order or
+/// `data` is shorter than the 56-byte header.
+pub fn tile_cache_header_swap_endian(data: &mut [u8]) -> Result<(), Error> {
+    if data.len() < LAYER_HEADER_SIZE {
+        return Err(Error::InvalidInput("truncated layer header"));
+    }
+    let magic = i32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let version = i32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+    let native = magic == LAYER_MAGIC && version == 1;
+    let swapped = magic == LAYER_MAGIC.swap_bytes() && version == 1i32.swap_bytes();
+    if !native && !swapped {
+        return Err(Error::InvalidInput("layer magic/version"));
+    }
+    for w in 0..11 {
+        let b = w * 4;
+        data.swap(b, b + 3);
+        data.swap(b + 1, b + 2);
+    }
+    data.swap(44, 45);
+    data.swap(46, 47);
+    Ok(())
+}
+
 /// A decoded layer. Private grids preserve the validation invariant.
 #[derive(Debug)]
 pub struct Layer {

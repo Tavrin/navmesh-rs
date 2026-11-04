@@ -582,10 +582,66 @@ adds links for pairs of tiles that upstream does not resolve.
   the oracle's generator and are not in the golden file. AArch64 is verified by CI only.
 - Queries on invalid refs where upstream copies uninitialised data (the hit normal of the plain
   `raycast`) are not in the query set.
-- Tile state save and restore (`storeTileState` / `restoreTileState`) and big-endian tile data
-  are not ported.
 - The records were produced on one machine; a second machine and a CI job that rebuilds the
   driver are not set up.
+
+## Mesh merging, tile state and byte order
+
+Seven record kinds (see `reference/RECORDS.md`) compare these upstream functions with the port on
+the whole corpus: `rcCopyPolyMesh` (`poly_mesh_copy`), `rcMergePolyMeshes` and
+`rcMergePolyMeshDetails` over every tile and over the 2 x 2 block at the grid origin
+(`merged_*`), `getTileStateSize` / `storeTileState` / `restoreTileState` including four rejected
+blobs per tile (`tile_state`), `dtNavMeshHeaderSwapEndian` / `dtNavMeshDataSwapEndian` on every
+tile (`tile_endian`), and `dtTileCacheHeaderSwapEndian` on every layer (`layer_endian`).
+
+Result of `nav-parity diff` between the oracle and the port, per case and ref width (21 cases x
+2 widths): 42 of 42 comparisons equal, 38,272 records per width, 0 failed. Before this change the
+corpus had 38,009 records per width; the 263 new ones are the kinds above, and the old ones
+are produced by unchanged oracle code and still compare equal. The cross-platform determinism
+golden file grew from 3,035 to 3,116 lines: no existing line changed except the eight per-case
+summary lines (record count and combined digest), the rest are the new records' digests.
+
+Deliberate differences from upstream, all on inputs where upstream reads out of bounds or wraps:
+
+- `PolyMesh::merge` / `copy` and `PolyMeshDetail::merge` return `InvalidInput` for arrays shorter
+  than their counts, a polygon vertex index past its mesh's vertices, meshes that differ in `nvp`,
+  and non-finite bounds; `FormatLimit` for a merge offset outside 0..=65535 cells or a result with
+  more than 65,535 vertices or polygons (upstream logs the last two and returns corrupt data). The
+  merged mesh's arrays are trimmed to their counts where upstream keeps the over-allocation.
+- `nav_mesh_data_swap_endian` checks every count against the buffer before it swaps anything.
+- `restore_tile_state` validates the whole blob before it changes a polygon.
+- Upstream's body swap does not convert the off-mesh `user_id`, so a tile converted with it keeps
+  that field in the old byte order. The port does the same (byte-identical output is the contract)
+  and adds `nav_mesh_swap_off_mesh_user_ids`, which is not in recastnavigation, for callers who
+  want the field converted. Tile-state blobs zero the pad byte of each polygon entry, which
+  upstream leaves uninitialised, so blobs are comparable byte for byte.
+
+## Upstream API coverage
+
+The public headers of the pin (`Recast/Include`, `Detour/Include`, `DetourTileCache/Include`,
+`DetourCrowd/Include`; `DebugUtils` and `RecastDemo` are not part of the port) were compared
+with `src/`. Every function and class of the headers below has a port, except for these, which
+are left out on purpose. Header line numbers are at the pin.
+
+| Upstream | Why it is not ported |
+|---|---|
+| `Recast.h:512-578` `rcAlloc*` / `rcFree*` pairs; `DetourAlloc.h` `dtAlloc*`, `dtFree*`, `dtAllocSetCustom`; `RecastAlloc.h` `rcAllocSetCustom`, `rcVector`, `rcIntArray`; `DetourTileCacheBuilder.h:108-125` `dtFreeTileCache*`; `dtAllocCrowd`, `dtAllocNavMesh`, `dtAllocNavMeshQuery`, `dtAllocTileCache` and their `Free` partners | Rust ownership and `Drop`. Allocation goes through the global allocator with fallible, charged reservation (`Limits`), so a pluggable allocator would be a second mechanism for the same job. |
+| `Recast.h` `rcContext`, `rcScopedTimer`, `RC_TIMER_*`, `RC_LOG_*`; `RecastAssert.h` / `DetourAssert.h` custom assert hooks | Logging, timers and asserts. Failures are typed `Error`s, per-call cost is `Usage` (bytes and work), and nothing asserts. Timing is the caller's. |
+| `Recast.h` inline math (`rcMin`, `rcMax`, `rcClamp`, `rcSwap`, `rcSqr`, `rcAbs`, `rcSqrt`, `rcVcross`, `rcVdot`, `rcVmad`, `rcVadd`, `rcVsub`, `rcVmin`, `rcVmax`, `rcVdist`, `rcVnormalize`, ...); `DetourCommon.h` `dtV*`, `dtSqr`, `dtClamp`, `dtMin`, `dtMax`, `dtAlign4`, `dtNextPow2`, `dtIlog2`, `dtSwapByte`, `dtSwapEndian`, `dtGetThenAdvanceBufferPointer`; `DetourMath.h` `dtMath*` | Vector and integer helpers on `float*` that Rust code writes with arrays and `core`. The port has crate-private versions with upstream's evaluation order, which the bit-exact records depend on; exporting them would freeze that order as API. |
+| `DetourCommon.h` geometry helpers: `dtClosestHeightPointTriangle`, `dtPointInPolygon`, `dtDistancePtSegSqr2D`, `dtCalcPolyCenter`, `dtOverlapQuantBounds`, `dtOverlapBounds`, `dtDistancePtPolyEdgesSqr`, `dtIntersectSegmentPoly2D`, `dtIntersectSegSeg2D`, `dtRandomPointInConvexPoly`, `dtClosestPtPointTriangle`, `dtOverlapPolyPoly2D`, `dtOppositeTile`, `dtTriArea2D` | General geometry not tied to a navmesh. Crate-private where the queries need them. Cheap to export if a user asks for one. |
+| `DetourNode.h` `dtNodePool`, `dtNodeQueue` | Internals of the query. Their capacity is the `max_nodes` argument of `NavMeshQuery::new`. |
+| `DetourNavMesh.h` protected members (`getNeighbourTilesAt`, `queryPolygonsInTile`, `getPolyHeight(tile, poly)`, `closestPointOnPoly`, `connect*Links`, `baseOffMeshLinks`); `DT_TILE_FREE_DATA` and `dtTileFlags` | Not part of upstream's public API, or about who frees the buffer, which `Vec` ownership settles. |
+| `DetourTileCache.h:111-115` `getTileCount`, `getTile(i)`; `calcTightTileBounds`; `encode/decodeTileId`, `encode/decodeObstacleId`; `dtTileCacheAlloc` | Tiles are reached by ref (`tiles_at`, `query_tiles`, `tile_header`, `tile_data`); `calcTightTileBounds` is the inside of `query_tiles`; ref packing is internal. Obstacles keep their indexed accessor (`obstacle_at`). |
+| `DetourCrowd.h` `getEditableAgent`, `getAgentCount`, `getNavMeshQuery`, `dtCrowdAgentDebugInfo`, `dtObstacleAvoidanceDebugData`, `dtAllocObstacleAvoidanceDebugData` | Agents change through typed calls (`update_agent_parameters`, `request_*`), not through a raw mutable pointer that skips validation. The crowd borrows the navmesh for each update and keeps no query object. The debug structs feed a renderer. `max_agents` is the count. |
+| `DetourPathCorridor.h` `dtMergeCorridorStartMoved`, `dtMergeCorridorEndMoved`, `dtMergeCorridorStartShortcut` | Public free functions upstream, folded into `PathCorridor` (they edit the corridor's own array). Their results are covered by the crowd trajectories, which compare whole corridors. |
+| `DebugUtils/` (`DebugDraw.h`, `DetourDebugDraw.h`, `RecastDebugDraw.h`, `RecastDump.h`), `RecastDemo/` | Debug drawing and file dumps that need a renderer and a file format of their own. The comparison records are the port's dump format. |
+
+Added with the tile state and byte-order work: the `unsigned short` and the unindexed overloads of
+`rcRasterizeTriangles` (`Heightfield::rasterize_triangles_u16`, `rasterize_triangle_soup`),
+`dtGetDetailTriEdgeFlags` (`detour::detail_tri_edge_flags`), and the crowd accessors
+`getActiveAgents`, `getQueryHalfExtents`, `getGrid` and `getPathQueue` (`Crowd::active_agents`,
+`query_half_extents`, `grid`, `path_queue`). These four groups are checked by unit tests, not by
+records: they are accessors and wrappers over functions the records already cover.
 
 ## Query and large-terrain optimization qualification
 

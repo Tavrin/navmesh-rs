@@ -16,6 +16,42 @@ pub const RECAST_LIMITS: Limits = Limits {
     ..Limits::UNLIMITED
 };
 
+/// Tile bytes of a 10 x 10 quad split into two triangles with two off-mesh
+/// connections, for the tile state and byte-order targets and their seeds.
+pub fn sample_tile() -> Vec<u8> {
+    const N: u16 = 0xffff;
+    let polys = [
+        0, 1, 2, N, N, N, N, N, 1, N, N, N, 0, 2, 3, N, N, N, 0, N, N, N, N, N,
+    ];
+    let con_verts = [2.0, 0.0, 2.0, 8.0, 0.0, 8.0, 3.0, 0.0, 3.0, 7.0, 0.0, 7.0];
+    detour::create_nav_mesh_data(&NavMeshCreateParams {
+        verts: &[0u16, 0, 0, 0, 0, 10, 10, 0, 10, 10, 0, 0],
+        vert_count: 4,
+        polys: &polys,
+        poly_flags: &[1, 1],
+        poly_areas: &[0, 0],
+        poly_count: 2,
+        nvp: 6,
+        off_mesh_con_verts: &con_verts,
+        off_mesh_con_rad: &[1.0, 1.0],
+        off_mesh_con_flags: &[1, 1],
+        off_mesh_con_areas: &[0, 0],
+        off_mesh_con_dir: &[1, 1],
+        off_mesh_con_user_id: &[0x0102_0304, 0x0506_0708],
+        off_mesh_con_count: 2,
+        bmin: [0.0; 3],
+        bmax: [10.0, 1.0, 10.0],
+        walkable_height: 2.0,
+        walkable_radius: 0.5,
+        walkable_climb: 0.5,
+        cs: 1.0,
+        ch: 1.0,
+        build_bv_tree: true,
+        ..Default::default()
+    })
+    .unwrap_or_default()
+}
+
 /// Runs a few queries between points derived from the first tile's bounds.
 pub fn exercise_queries(nav: &NavMesh) {
     let Some(t) = (0..nav.max_tiles() as usize).find_map(|i| nav.tile(i)) else {

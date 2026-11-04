@@ -153,7 +153,7 @@ compile_error!("navmesh-rs needs the `std` or the `libm` feature for floating-po
 mod budget;
 mod common;
 pub use budget::{Budget, Budgeted, Progress};
-pub use common::{Error, Limits, TileDataError, Usage, Workspace};
+pub use common::{Error, Limits, TileDataError, TileStateError, Usage, Workspace};
 
 #[cfg(feature = "recast")]
 pub mod recast;

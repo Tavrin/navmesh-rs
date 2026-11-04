@@ -248,7 +248,9 @@ resource use; they write into the cache's budgeted output slices.
 ## Status and limits
 
 - Ported: Recast, Detour, DetourCrowd and DetourTileCache.
-- Not ported yet: merging and copying polygon meshes, and big-endian tile data.
+- Also ported: merging and copying polygon meshes, tile state (polygon flags and areas) save
+  and restore, and byte-order conversion of tile and layer data. The upstream API left out on
+  purpose (allocators, logging, debug drawing, raw helpers) is listed in `docs/VERIFICATION.md`.
 - Stage functions follow upstream; the `bake` extension provides serial and parallel tiled builds.
 - Bit-exactness with the C++ library is checked on x86-64 Linux with glibc, with the default
   `std` feature. On other platforms the default build can differ in the last bit where upstream
