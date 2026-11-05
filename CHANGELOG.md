@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-05
+
 ### Added
 
 - Opt-in per-job and per-tile bake reports (`JobOptions::reports`, `BakeJob::report`):
