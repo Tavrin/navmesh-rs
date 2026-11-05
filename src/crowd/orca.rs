@@ -125,9 +125,19 @@ fn unit(a: V2, fallback: V2) -> V2 {
     let l = norm(a);
     if l > 0. { mul(a, 1. / l) } else { fallback }
 }
-fn clip(v: V2, speed: f32) -> V2 {
-    if dot(v, v) > speed * speed {
+pub(super) fn clip(v: V2, speed: f32) -> V2 {
+    let v = if dot(v, v) > speed * speed {
         mul(unit(v, [1., 0.]), speed)
+    } else {
+        v
+    };
+    // Rounding a point on the disc to f32 can put it just outside. Measure the
+    // rounded coordinates in f64 and leave one f32 epsilon of radial margin
+    // only when needed; subsequent component rounding cannot consume it all.
+    let length = root64(dot64(v.map(f64::from), v.map(f64::from)));
+    if length > f64::from(speed) {
+        let scale = f64::from(speed) / length * (1. - f64::from(f32::EPSILON));
+        v.map(|x| (f64::from(x) * scale) as f32)
     } else {
         v
     }
@@ -330,7 +340,9 @@ fn solve(
             }
         }
         let t = if directional {
-            if dot64(objective, tangent) > 0. {
+            // The tangent points opposite to the input line direction.
+            // On an exact directional tie, select its upper endpoint.
+            if dot64(objective, tangent) >= 0. {
                 hi
             } else {
                 lo
@@ -468,6 +480,25 @@ pub(super) fn velocity_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rounded_output_remains_inside_the_exact_speed_disc() {
+        let input = [0.6, 0.8];
+        assert!(dot64(input.map(f64::from), input.map(f64::from)) > 1.);
+        let v = clip(input, 1.);
+        assert!(dot64(v.map(f64::from), v.map(f64::from)) <= 1.);
+        assert!(norm(sub(v, input)) < 1e-6);
+    }
+
+    #[test]
+    fn directional_tie_selects_the_upper_tangent_endpoint() -> Result<(), Error> {
+        let p = Plane { n: [1., 0.], c: 1. };
+        let (v, end) = solve(&mut Workspace::new(), &[p], 2., [-1., 0.], true)?;
+        assert_eq!(end, 1);
+        assert_eq!(v[0], 1.);
+        assert!((v[1] - root64(3.)).abs() < 1e-14);
+        Ok(())
+    }
 
     #[test]
     fn rounded_normal_intersection_stays_on_the_speed_disc() -> Result<(), Error> {

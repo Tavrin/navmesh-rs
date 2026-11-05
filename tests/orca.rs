@@ -72,7 +72,7 @@ fn random_infeasible_and_degenerate_states_stay_speed_bounded() {
         )
         .unwrap();
         assert!(v.iter().all(|v| v.is_finite()));
-        assert!(v[0] * v[0] + v[1] * v[1] <= a.max_speed * a.max_speed + 1e-5);
+        assert!(f64::from(v[0]).hypot(f64::from(v[1])) <= f64::from(a.max_speed));
     }
 }
 #[test]

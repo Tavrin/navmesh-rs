@@ -19,6 +19,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
+- ORCA directional ties select the consistent tangent endpoint; output and
+  acceleration interpolation retain the exact speed bound after float rounding.
 - ORCA linear programs normalize distance equations and use double precision for
   disc intersections and projected constraints, reducing near-parallel cancellation.
 - ORCA finite static segments project the current velocity onto visible endpoint

@@ -5,8 +5,8 @@ default-mode evidence do not establish the requested oracle, nonpenetration and
 performance acceptance criteria. The opt-in implementation is a review candidate.
 The sampled planner remains the default.
 
-The original tables below are historical. The fix-round measurements and stop
-decision at the end describe the current candidate and the revised acceptance bars.
+The tables before "Relative-reference qualification" are historical. That final
+section describes the current candidate, comparison policy and stop decision.
 
 ## Decisions
 
@@ -512,3 +512,217 @@ Strict oracle matching contradicts the speed disc on the retained counterexample
 the alternative numerical exemption is not established for all residuals.
 The separation bar still fails. Cost, implementation gates and deterministic
 replay pass, and do not substitute for physical acceptance.
+
+
+## Relative-reference qualification
+
+Status: **not qualified for integration**. The relative test is measured, not
+substituted for the historical failures above. The sampled planner remains the
+default. No absolute acceptance test was weakened. The new relative evaluator
+fails closed on missing arrival tails and unexplained bounded fallback changes.
+
+### Changes and mismatch classification
+
+An exact directional tie in the projected LP selected the wrong interval endpoint
+for the chosen tangent orientation. Reversing a tangent requires reversing its
+zero-dot-product tie decision too. Selecting the upper tangent endpoint removes
+all eight corridor and four static-segment discrepancies. The focused regression
+pins this endpoint choice independently of the crowd trajectories.
+
+The final f32 velocity can round just outside the speed disc even after an
+otherwise correct clamp. Measure the rounded vector in double precision and,
+only if outside, leave one f32 epsilon of radial margin. Apply the same check
+after acceleration interpolation, which can round outside again. A `(0.6, 0.8)`
+regression and the strengthened 10,000-state speed test pin this invariant.
+The sampled integration path is unchanged. For ORCA, reducing `max_speed`
+below the current speed enforces the new speed bound immediately; in that
+recovery case the hard speed invariant takes priority over gradual deceleration.
+The fixed qualification fixtures do not change their speed limits.
+
+The final frozen-state comparison retains the original 100,000 configurations,
+548,574 random velocities and four 400-step scenarios, with the original
+`1e-4 m/s` threshold:
+
+| Inputs | Remaining mismatches | Maximum error, m/s |
+|---|---:|---:|
+| Random | 202 | 2.383491595 |
+| Circle | 0 | 0.0000339074 |
+| Crossing | 0 | 0.00000311885 |
+| Corridor | 0 | 0.0000100155 |
+| Static segments | 0 | 0.0000881563 |
+
+Every retained random velocity has an individual classification and a certificate:
+
+| Class, in priority order | Count | Evidence and limit |
+|---|---:|---|
+| Reference speed contradiction | 108 | Reference speed exceeds the disc by more than `1e-4 m/s`; the worst analytical velocity-error lower bound remains `2.168765674 m/s`. |
+| Demonstrated precision-sensitive fallback | 33 | An unchanged-source extended-intermediate-precision reference build reduces each error below `1e-4 m/s`; maximum residual `0.0000920714 m/s`, maximum original error `0.279261726 m/s`. |
+| Bounded infeasible-fallback behavioral difference | 61 | Candidate output is certified near-optimal for the reference's observable normalized planes, but differs by up to `1.550569510 m/s`; extended precision still leaves errors up to `1.608031592 m/s`. |
+
+All 202 programs are infeasible. The independent certificate uses only public API
+half-planes, not reference implementation code. For any nonnegative weights
+summing to one, the minimum worst violation inside a speed disc is at least
+`sum(w*c) - speed*norm(sum(w*n))`. Single-plane, two-plane and three-plane dual
+supports supply a lower bound; evaluating the candidate supplies an upper bound.
+Across all cases the largest upper-minus-lower gap is `0.000000731 m/s`.
+For the 61 behavioral residuals, every infeasibility lower bound exceeds
+`0.290774 m/s`; the reference's own worst-violation gap can reach
+`0.601191 m/s`. This is evidence against replacing the candidate's valid minimax
+solution with an arbitrary reference output. It does not establish the precise
+arithmetic cause of all 61 differences, nor a small velocity-error bound.
+
+The extended-precision build resolves 43 cases overall; ten already belong to the
+higher-priority speed-contradiction class. No case is double-counted. No numerical
+exemption is granted. The 61 residuals remain an explicit compatibility failure;
+no candidate minimax defect was found that would justify changing its fallback
+to reproduce them. `reference/orca_classify.py` reproduces the classification and
+stdlib dual bounds from retained inputs and a public-plane diagnostic executable.
+Its exit 1 intentionally preserves that behavioral failure.
+
+### Common metric definitions and native reference measurements
+
+`nav-orca relative-metrics` collects all six existing crowd fixtures. Supplying
+the separately built `reference/harness/orca-trajectory.cc` executable uses the
+same Rust metric collector on reference trajectories. Initial positions and goals
+are exported from the actual crowd fixture as round-tripping f32 decimals.
+Radius, timestep, speed, horizons, neighbour range/cap and goal-speed arithmetic
+match the fixture. Reference motion uses its own public simulator API, including
+its own integration and obstacle processing. No reference code enters the crate.
+
+The independent final-position grid enumerates unordered pair-ticks without the
+avoidance cap. Penetration includes **all positive** depths; p99 below is the
+nearest-rank percentile conditional on positive penetration, not a percentile
+padded with noninteracting pairs. Zero means no positive penetration. Arrival is
+the first tick within 0.5 m of the goal; agents continue participating until all
+have arrived or the original scene timeout. Arrival percentiles rank all agents;
+missing tail ranks remain unmeasured rather than being replaced by the timeout.
+Stationary deadlocks mean unarrived agents moving less than 5 cm over the final
+20 seconds, using a rolling 401-position history. This is an operational detector.
+
+The standalone reference has no navigation funnel. Its doorway uses an explicit
+opening waypoint; the candidate uses its existing corridor steering. Doorway
+standalone navigation therefore cannot qualify an equal-policy arrival ratio.
+An equal-navigation control would be needed to qualify that distinction; its
+unmeasured status is recorded below.
+
+| Scene | Reference / candidate maximum penetration, m | Reference / candidate positive-depth p99, m | Reference / candidate arrival p100, s | Reference / candidate unreached |
+|---|---:|---:|---:|---:|
+| Circle 64 | 0.068525612 / 0.034274042 | 0.025568247 / 0.016960919 | 60.50 / 49.35 | 0 / 0 |
+| Circle 512 | 0.134895742 / 0.171704173 | 0.036157608 / 0.036863089 | 189.60 / 173.25 | 0 / 0 |
+| Crossing 128 | 0.035444796 / 0.014600396 | 0.008958638 / 0.004372895 | 101.90 / 102.90 | 0 / 0 |
+| Corridor 64 | 0.060882211 / 0.040270925 | 0.048327625 / 0.027207255 | unmeasured / unmeasured | 1 / 1 |
+| Doorway 64 | 0.031862676 / 0.021192491 | 0.011198580 / 0.005482495 | unmeasured / unmeasured | 24 / 28 |
+| Dense 2,000 | 0 / 0 | 0 / 0 | 50.40 / 50.40 | 0 / 0 |
+
+| Scene | Reference arrival p50 / p95 / p99, s | Candidate arrival p50 / p95 / p99, s | Reference speed violations above 1e-6 m/s |
+|---|---|---|---:|
+| Circle 64 | 46.05 / 59.80 / 60.50 | 42.55 / 47.00 / 49.35 | 2 |
+| Circle 512 | 152.85 / 177.90 / 185.35 | 140.70 / 158.00 / 163.50 | 59 |
+| Crossing 128 | 91.45 / 96.70 / 100.80 | 91.75 / 97.20 / 102.10 | 12 |
+| Corridor 64 | 97.00 / 107.35 / unmeasured | 97.90 / 108.95 / unmeasured | 2 |
+| Doorway 64 | 61.50 / unmeasured / unmeasured | 58.25 / unmeasured / unmeasured | 1 |
+| Dense 2,000 | 50.40 / 50.40 / 50.40 | 50.40 / 50.40 / 50.40 | 0 |
+
+Both implementations report zero stationary deadlocks in all six fixtures.
+The candidate has **zero strictly positive speed excesses** in every collected
+state, without a tolerance. The standalone reference has 76 excesses above
+`1e-6 m/s`; its maximum excess is `0.010719477 m/s` in circle-512. The tolerated
+reference counter is reported separately from the candidate's strict counter.
+
+Circle-512 now passes the arrival bar (`173.25 <= 189.60 * 1.05 = 199.08 s`),
+but fails relative maximum penetration
+(`0.171704173 > 0.134895742 + 0.01 = 0.144895742 m`). Its positive-depth p99
+passes. Missing corridor and doorway arrival tails are not passing evidence.
+
+### Final cost
+
+The unchanged pinned benchmark uses ten warmup ticks and nine alternating-order
+pairs of ten ticks; medians include preferred-velocity preparation and crowd
+update. Shared-host timings remain diagnostic, with the within-run ratios used
+for the requested cost comparison.
+
+| Agents | Sampled, microseconds/agent-tick | Candidate, microseconds/agent-tick | Ratio |
+|---:|---:|---:|---:|
+| 100 | 2.599019 | 2.445856 | 0.941069 |
+| 1,000 | 2.522081 | 3.074417 | 1.219000 |
+| 5,000 | 2.585293 | 3.279537 | 1.268536 |
+
+All three measured ratios pass 1.5. Neither the neighbor set nor sampled quality
+was reduced to obtain those ratios. The new speed checks are included.
+
+
+
+### Equal-navigation control: unmeasured
+
+A copied-source diagnostic backend was prepared to substitute a separate
+public-API reference process for velocity selection while retaining the crowd's
+navigation and original integration. The first run reused a cached candidate
+executable after switching copied sources in a shared build directory. Its
+exit-0 output is **invalid reference evidence**, as confirmed by the absence of
+the reference protocol marker in the binary. That output is retained separately.
+A distinct build fingerprint exposed a missing qualified string import in the
+scratch backend; the failed build exits 101 and is retained.
+
+The corrected diagnostic was never admitted. After more than 36 minutes under
+the required reservation, its owned queued wrapper was terminated and exited
+143. No admitted job or other operator's job was canceled. No equal-navigation
+control result is claimed. The native circle-512 comparison already fails the
+relative maximum-penetration bar without a navigation-policy difference, so this
+additional diagnostic cannot promote the current candidate. The standalone
+doorway comparison remains explicitly limited by its different steering policy.
+
+
+### Gate receipt and decision
+
+The immutable final implementation-gate runner exits 0. Every implementation
+and replay row below passes; acceptance and unadmitted-diagnostic rows retain
+their nonzero codes separately. The measured and gated implementation checksums
+match the final worktree. The 3,116 default and
+27 corrected sampled records remain byte-identical to the base revision.
+
+| Final checks | Exit code |
+|---|---:|
+| Formatting; default, parallel, 32-bit/tilecache and all-feature Clippy with warnings denied | 0 |
+| Default, workspace parallel, parallel 32-bit and crowd 32-bit tests | 0 |
+| no_std crowd; tilecache-only std tests and no_std build | 0 |
+| Rustdoc with warnings denied; WebAssembly build; MSRV check | 0 |
+| All fuzz-target builds, without campaigns | 0 |
+| Unchanged public-text guard | 0 |
+| Sampled native and WASI determinism; both corpus budget cases | 0 |
+| Replacement ORCA native and WASI determinism | 0 |
+| Frozen-state comparison | 1 |
+| Mismatch classification acceptance | 1 |
+| Relative standalone acceptance | 1 |
+| Additional equal-navigation control, canceled before admission | 143 |
+
+The replacement ORCA-only 60-second digests are:
+
+```text
+orca circle 64 4ba62029a50a6966
+orca circle 512 3159a1e880a76949
+orca crossing 64 3665ccd25aea1c32
+orca corridor 64 70cb542664397110
+orca doorway 64 d1b31fde9b478eac
+orca dense 2000 2bb7a7fd69ca5e5c
+```
+
+Retained nonpassing attempts are distinct from the final implementation gates:
+three initial Clippy checks exit 101 for collector formatting/lint mistakes;
+initial native/WASI ORCA and the explicit retired-golden comparison exit 1;
+the first numerical-analysis environment failed to import its installed numeric
+packages. The final dual certificate uses only the Python standard library.
+A diagnostic copied-source build initially reused a cached candidate executable;
+its exit-0 metrics are invalidated and retained, not counted as reference evidence.
+The subsequent diagnostic rebuild exposed a missing qualified string import
+and exited 101; that scratch-only error is corrected separately from production.
+
+Decision: **not qualified for integration**. Keep the deterministic tie and strict
+speed fixes, the sampled default and all failure evidence. The measured speed
+correction changes symmetric trajectories enough to improve arrival and worsen
+maximum penetration; small local velocity changes cannot be extrapolated into
+physical acceptance. Removing the clamp would violate the invariant. Replacing
+a certified minimax result with an unexplained bounded reference output would
+trade correctness for an unsupported compatibility rule. Broader position
+correction or neighbor-policy changes have no qualifying evidence in this round.
+Stop without promoting the relative penetration failure or unmeasured arrival
+tails. No commits, branch/index changes, integration or fuzz campaigns were made.

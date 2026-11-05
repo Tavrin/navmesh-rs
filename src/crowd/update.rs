@@ -738,6 +738,11 @@ impl Crowd {
                 dv = vscale(&dv, max / ds);
             }
             a.vel = vadd(&a.vel, &dv);
+            if matches!(a.params.avoidance, AvoidanceMode::Orca(_)) {
+                // Acceleration interpolation can round back outside the disc.
+                let v = orca::clip([a.vel[0], a.vel[2]], a.params.max_speed);
+                a.vel = [v[0], 0., v[1]];
+            }
             if vlen(&a.vel) > 0.0001 {
                 a.npos = vmad(&a.npos, &a.vel, dt);
             } else {

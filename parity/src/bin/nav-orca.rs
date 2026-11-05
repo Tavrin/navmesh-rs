@@ -8,21 +8,27 @@ fn next<T: std::str::FromStr>(tokens: &mut std::str::SplitWhitespace<'_>) -> T {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("invalid protocol input"))
 }
+#[path = "../orca_relative.rs"]
+mod relative;
 #[path = "../orca_scenarios.rs"]
 mod scenarios;
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
+        Some("relative-metrics") => {
+            relative::run()?;
+            return Ok(());
+        }
         Some("digest") => {
             scenarios::digest().unwrap();
-            return;
+            return Ok(());
         }
         Some("measure") => {
             scenarios::measure().unwrap();
-            return;
+            return Ok(());
         }
         Some("invariants") => {
             scenarios::invariants().unwrap();
-            return;
+            return Ok(());
         }
         _ => {}
     }
@@ -68,4 +74,5 @@ fn main() {
             println!("{:.9} {:.9}", v[0], v[1]);
         }
     }
+    Ok(())
 }
