@@ -606,3 +606,99 @@ fn crowd_tick_charges_long_collision_chains_to_its_aggregate_budget() {
     c.update(&mut ws, &nav, 0.1).unwrap();
     assert_eq!(ws.usage().work, 64 * 4096 + 100 + 64 * (1 + 64));
 }
+
+#[test]
+fn orca_selects_nearest_beyond_grid_cap_and_obeys_budget() {
+    use navmesh_rs::{Budget, Budgeted};
+    let nav = floor_width(40);
+    let mut ws = Workspace::new();
+    let mut c = Crowd::new(&mut ws, &nav, 48, 0.6).unwrap();
+    let mut p = AgentParams::default();
+    let mut orca = OrcaParams::default();
+    orca.max_neighbours = 40;
+    p.avoidance = AvoidanceMode::Orca(orca);
+    p.update_flags = OBSTACLE_AVOIDANCE;
+    p.collision_query_range = 8.;
+    for i in 0..48 {
+        let pos = [10. + (i % 8) as f32 * 0.8, 0., 2. + (i / 8) as f32 * 0.8];
+        let id = c.add_agent(&mut ws, &nav, pos, p).unwrap();
+        c.request_move_velocity(id, [1., 0., 0.]).unwrap();
+    }
+    let before: Vec<_> = c.active_agents().map(|a| a.npos).collect();
+    let mut b = Budget::new(1);
+    assert!(matches!(
+        c.update_budgeted(&mut ws, &nav, 0.05, &mut b).unwrap(),
+        Budgeted::Exhausted(())
+    ));
+    assert_eq!(
+        before,
+        c.active_agents().map(|a| a.npos).collect::<Vec<_>>()
+    );
+    let mut b = Budget::unlimited();
+    assert!(
+        c.update_budgeted(&mut ws, &nav, 0.05, &mut b)
+            .unwrap()
+            .is_complete()
+    );
+    assert_eq!(c.agent(AgentId(20)).unwrap().neighbours().len(), 40);
+    for a in c.active_agents() {
+        assert!(
+            a.neighbours()
+                .windows(2)
+                .all(|v| v[0].1 < v[1].1 || (v[0].1 == v[1].1 && v[0].0 < v[1].0))
+        );
+        assert!(a.nvel[0] * a.nvel[0] + a.nvel[2] * a.nvel[2] <= p.max_speed * p.max_speed + 1e-5);
+    }
+    assert!(b.used() > 48 * 4096);
+}
+
+#[test]
+fn corrected_and_orca_neighbours_equal_brute_force_across_search_radii() {
+    use navmesh_rs::UpstreamFixes;
+    let nav = floor_width(100);
+    let mut ws = Workspace::new();
+    let mut c = Crowd::new(&mut ws, &nav, 100, 0.6).unwrap();
+    let mut rng = 19u32;
+    let mut rand = || {
+        rng = rng.wrapping_mul(1664525).wrapping_add(1013904223);
+        (rng >> 8) as f32 / 16777216.
+    };
+    let mut p = AgentParams::default();
+    p.update_flags = 0;
+    p.collision_query_range = 12.;
+    for _ in 0..100 {
+        c.add_agent(&mut ws, &nav, [2. + rand() * 96., 0., 1. + rand() * 8.], p)
+            .unwrap();
+    }
+    for cap in [6, 16, 40] {
+        c.set_fixes(UpstreamFixes::NEAREST_NEIGHBOURS);
+        for id in 0..100 {
+            p.avoidance = if cap == 6 {
+                AvoidanceMode::Sampled
+            } else {
+                let mut params = OrcaParams::default();
+                params.max_neighbours = cap;
+                AvoidanceMode::Orca(params)
+            };
+            c.update_agent_parameters(AgentId(id), p).unwrap();
+        }
+        let before: Vec<_> = c.active_agents().map(|a| a.npos).collect();
+        c.update(&mut ws, &nav, 0.).unwrap();
+        for (i, a) in c.agents().iter().enumerate() {
+            let mut expected: Vec<_> = before
+                .iter()
+                .enumerate()
+                .filter_map(|(j, b)| {
+                    let dx = before[i][0] - b[0];
+                    let dz = before[i][2] - b[2];
+                    let ds = dx * dx + dz * dz;
+                    (i != j && ds <= p.collision_query_range * p.collision_query_range)
+                        .then_some((j, ds))
+                })
+                .collect();
+            expected.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+            expected.truncate(usize::from(cap));
+            assert_eq!(a.neighbours(), expected, "agent {i}, cap {cap}");
+        }
+    }
+}

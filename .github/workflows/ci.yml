@@ -64,6 +64,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: bash reference/corpus/fetch.sh --public-only
       - run: reference/determinism.sh
+      - run: bash reference/orca-determinism.sh
   determinism-wasm32:
     name: determinism, wasm32 (wasmtime)
     runs-on: ubuntu-24.04
@@ -85,6 +86,9 @@ jobs:
           NAV_TARGET=wasm32-wasip1 \
           NAV_RUNNER="wasmtime run --dir $PWD --dir $NAV_CORPUS_DIR --env NAV_CORPUS_DIR=$NAV_CORPUS_DIR" \
           reference/determinism.sh
+          NAV_TARGET=wasm32-wasip1 \
+          NAV_RUNNER="wasmtime run --dir $PWD --dir $NAV_CORPUS_DIR --env NAV_CORPUS_DIR=$NAV_CORPUS_DIR" \
+          bash reference/orca-determinism.sh
   # Budgeted and resumable queries over the corpus: equal to the plain calls when the
   # budget suffices, never over budget.
   budgets:

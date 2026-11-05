@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use navmesh_rs::crowd::{AgentId, AgentParams, Crowd};
+use navmesh_rs::crowd::{AgentId, AgentParams, AvoidanceMode, Crowd, OrcaParams};
 use navmesh_rs::detour::{NavMesh, NavMeshCreateParams, create_nav_mesh_data};
 use navmesh_rs::{Budget, Budgeted, Limits, UpstreamFixes, Workspace};
 fuzz_target!(|data: &[u8]| {
@@ -47,7 +47,15 @@ fuzz_target!(|data: &[u8]| {
         let id = AgentId((chunk[12] % 8) as usize);
         match chunk[13] % 7 {
             0 => {
-                let _ = crowd.add_agent(&mut ws, &nav, v, AgentParams::default());
+                let mut p = AgentParams::default();
+                if chunk[14] & 1 != 0 {
+                    let mut orca = OrcaParams::default();
+                    orca.time_horizon = v[0];
+                    orca.time_horizon_obstacles = v[1];
+                    orca.max_neighbours = u16::from(chunk[15]);
+                    p.avoidance = AvoidanceMode::Orca(orca);
+                }
+                let _ = crowd.add_agent(&mut ws, &nav, v, p);
             }
             1 => {
                 let _ = crowd.request_move_velocity(id, v);

@@ -6,6 +6,17 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in ORCA crowd avoidance with deterministic nearest-neighbour selection,
+  two-sided local boundary constraints, speed-bounded incremental linear programs
+  and charged work through `update_budgeted`. The sampled planner remains default.
+  This candidate is not qualified for integration; see `docs/ORCA-RESULTS.md` for
+  failed oracle, penetration and cost acceptance criteria.
+- Public planar `orca_velocity`, `OrcaAgent`, `OrcaParams` and reusable
+  `OrcaScratch`; standalone oracle, trajectory and cost qualification drivers.
+- ORCA input fuzz target and ORCA coverage in the crowd-update fuzz target.
+
 ## [0.2.1] - 2026-11-05
 
 ### Added

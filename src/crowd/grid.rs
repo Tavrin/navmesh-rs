@@ -144,6 +144,43 @@ impl ProximityGrid {
         }
         Ok(n)
     }
+    // Full candidate collection for corrected nearest-neighbour queries. A
+    // caller-owned stamp table avoids rescanning an ever-growing output slice
+    // for each occurrence of an id in the spatial hash. The default capped
+    // query deliberately retains upstream's path and ordering.
+    pub(crate) fn query_all_in(
+        &self,
+        ws: &mut Workspace,
+        b: [f32; 4],
+        ids: &mut [u16],
+        stamps: &mut [u16],
+        stamp: u16,
+    ) -> Result<usize, Error> {
+        let [x0, y0, x1, y1] = self.cells(b)?;
+        ws.work(self.cell_work(b)?)?;
+        let mut n = 0;
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let mut i = self.buckets[self.hash(x, y)];
+                while i != usize::MAX {
+                    ws.work(1)?;
+                    let item = self.pool[i];
+                    if item.x == x && item.y == y {
+                        let entry = stamps
+                            .get_mut(usize::from(item.id))
+                            .ok_or(Error::BufferTooSmall)?;
+                        if *entry != stamp {
+                            *entry = stamp;
+                            *ids.get_mut(n).ok_or(Error::BufferTooSmall)? = item.id;
+                            n += 1;
+                        }
+                    }
+                    i = item.next;
+                }
+            }
+        }
+        Ok(n)
+    }
     /// Current occupied cell bounds, or the upstream empty sentinel bounds.
     pub fn bounds(&self) -> [i32; 4] {
         self.bounds

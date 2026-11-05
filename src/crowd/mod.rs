@@ -17,6 +17,7 @@ use crate::{Budget, Budgeted, Error, Limits, UpstreamFixes, Workspace};
 use alloc::vec::Vec;
 mod avoidance;
 mod boundary;
+mod orca;
 // Public helper calls reset usage; internal `_in` calls compose within the
 // manager's existing per-call budget.
 mod corridor;
@@ -26,6 +27,7 @@ pub use avoidance::{ObstacleAvoidanceParams, ObstacleAvoidanceQuery};
 pub use boundary::LocalBoundary;
 pub use corridor::PathCorridor;
 pub use grid::ProximityGrid;
+pub use orca::{AvoidanceMode, OrcaAgent, OrcaParams, OrcaScratch, orca_velocity};
 pub use queue::PathQueue;
 
 /// Anticipate corners when steering.
@@ -133,6 +135,8 @@ pub struct AgentParams {
     pub update_flags: u8,
     /// Avoidance parameter slot (0..8).
     pub obstacle_avoidance_type: usize,
+    /// Local velocity planner, gated by [`OBSTACLE_AVOIDANCE`].
+    pub avoidance: AvoidanceMode,
     /// Filter slot (0..16).
     pub query_filter_type: usize,
 }
@@ -148,6 +152,7 @@ impl Default for AgentParams {
             separation_weight: 2.,
             update_flags: 31,
             obstacle_avoidance_type: 3,
+            avoidance: AvoidanceMode::Sampled,
             query_filter_type: 0,
         }
     }
@@ -172,6 +177,14 @@ impl AgentParams {
             || self.update_flags & !31 != 0
         {
             return Err(Error::InvalidParameter("agent parameters"));
+        }
+        if let AvoidanceMode::Orca(p) = self.avoidance {
+            p.validate()?;
+            for t in [p.time_horizon, p.time_horizon_obstacles] {
+                if !(1.0e-5..=1.0e5).contains(&t) {
+                    return Err(Error::InvalidParameter("ORCA time range"));
+                }
+            }
         }
         Ok(())
     }
@@ -223,13 +236,14 @@ pub struct CrowdAgent {
     replan_time: f32,
     replan: bool,
     pathq: u32,
-    neis: [(usize, f32); 6],
+    neis: Vec<(usize, f32)>,
     nneis: usize,
     disp: V3,
     anim: Animation,
 }
 impl CrowdAgent {
-    /// The neighbours kept by the last update (at most six), nearest first, as
+    /// The neighbours kept by the last update (six for sampled mode, the configured
+    /// cap for ORCA), nearest first, as
     /// the neighbour's agent slot and its squared planar distance.
     pub fn neighbours(&self) -> &[(usize, f32)] {
         &self.neis[..self.nneis]
@@ -322,7 +336,7 @@ impl Crowd {
                 replan_time: 0.,
                 replan: false,
                 pathq: 0,
-                neis: [(0, 0.); 6],
+                neis: ws.vec(6, (0, 0.))?,
                 nneis: 0,
                 disp: [0.; 3],
                 anim: Animation::default(),

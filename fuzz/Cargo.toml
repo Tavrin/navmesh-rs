@@ -162,3 +162,10 @@ path = "fuzz_targets/connectivity_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "orca_step"
+path = "fuzz_targets/orca_step.rs"
+test = false
+doc = false
+bench = false
