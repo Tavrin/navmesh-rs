@@ -222,7 +222,7 @@ pub fn measure() -> Result<(), Error> {
 pub fn invariants() -> Result<(), Error> {
     for (name, n, ticks) in [
         ("circle", 64, 1400usize),
-        ("circle", 512, 2400),
+        ("circle", 512, 12000),
         ("crossing", 128, 2400),
         ("corridor", 64, 2400),
         ("doorway", 64, 1400),

@@ -187,3 +187,29 @@ fn overlapping_snapshot_keeps_the_speed_disc_when_the_lp_is_infeasible() {
     assert!(v.iter().all(|x| x.is_finite()));
     assert!(v[0] * v[0] + v[1] * v[1] <= a.max_speed * a.max_speed + 1e-6);
 }
+
+#[test]
+fn finite_wall_endpoint_uses_the_visible_tangent_ray() {
+    let mut a = agent(0., 0.);
+    a.velocity = [2., 2.];
+    a.preferred_velocity = a.velocity;
+    a.max_speed = 3.;
+    let mut ws = Workspace::new();
+    let mut scratch = OrcaScratch::default();
+    let mut params = OrcaParams::default();
+    params.time_horizon_obstacles = 1.;
+    // Tangent from the origin to the radius-.5 circle at (1, 1).
+    let leg = 1.75_f32.sqrt();
+    let tangent = [(leg - 0.5) / 2., (leg + 0.5) / 2.];
+    let along = 2. * (tangent[0] + tangent[1]);
+    let expected = tangent.map(|x| x * along);
+    for wall in [[1., -1., 1., 1.], [1., 1., 1., -1.]] {
+        let v = orca_velocity(&mut ws, &a, &[], &[wall], &params, 0.05, &mut scratch).unwrap();
+        assert!((v[0] - expected[0]).abs() < 1e-6);
+        assert!((v[1] - expected[1]).abs() < 1e-6);
+        // The ray touches the expanded endpoint and clears the finite segment.
+        let time = (v[0] + v[1]) / (v[0] * v[0] + v[1] * v[1]);
+        let separation = ((time * v[0] - 1.).powi(2) + (time * v[1] - 1.).powi(2)).sqrt();
+        assert!((separation - a.radius).abs() < 1e-6);
+    }
+}

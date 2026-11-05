@@ -12,10 +12,20 @@ All notable changes to this project are documented in this file. The format foll
   two-sided local boundary constraints, speed-bounded incremental linear programs
   and charged work through `update_budgeted`. The sampled planner remains default.
   This candidate is not qualified for integration; see `docs/ORCA-RESULTS.md` for
-  failed oracle, penetration and cost acceptance criteria.
+  unresolved oracle and separation acceptance criteria.
 - Public planar `orca_velocity`, `OrcaAgent`, `OrcaParams` and reusable
   `OrcaScratch`; standalone oracle, trajectory and cost qualification drivers.
 - ORCA input fuzz target and ORCA coverage in the crowd-update fuzz target.
+
+### Fixed
+
+- ORCA linear programs normalize distance equations and use double precision for
+  disc intersections and projected constraints, reducing near-parallel cancellation.
+- ORCA finite static segments project the current velocity onto visible endpoint
+  arcs, cutoff segments and tangent rays, preserving two-sided endpoint behavior.
+- ORCA nearest-neighbour queries use a smaller search only after proving that it
+  contains the full nearest set; otherwise they repeat the full-range query.
+  The sampled planner and its golden files are unchanged.
 
 ## [0.2.1] - 2026-11-05
 

@@ -458,8 +458,57 @@ impl Crowd {
                 pos[2] + range,
             ];
             let n = if nearest {
-                self.grid
-                    .query_all_in(ws, bounds, ids, &mut candidate_stamps, (i + 1) as u16)?
+                // For ORCA, a smaller complete query proves the same nearest
+                // set once it contains the cap inside its inscribed circle.
+                // Otherwise discard its stamps and query the full range. The
+                // corrected sampled path keeps its exhaustive collection.
+                let radius = (2. * a.params.radius * sqrtf(neighbour_cap as f32)).min(range);
+                let narrow = matches!(a.params.avoidance, AvoidanceMode::Orca(_))
+                    && neighbour_cap > 0
+                    && radius < range;
+                let mut n = 0;
+                let mut enough = false;
+                if narrow {
+                    n = self.grid.query_all_in(
+                        ws,
+                        [
+                            pos[0] - radius,
+                            pos[2] - radius,
+                            pos[0] + radius,
+                            pos[2] + radius,
+                        ],
+                        ids,
+                        &mut candidate_stamps,
+                        (i + 1) as u16,
+                    )?;
+                    let mut inside = 0;
+                    for &id in &ids[..n] {
+                        ws.work(1)?;
+                        let j = self.active[usize::from(id)];
+                        let nei = &self.agents[j];
+                        if i != j
+                            && (pos[1] - nei.npos[1]).abs() < (height + nei.params.height) / 2.
+                            && vdist_2d_sqr(&pos, &nei.npos) <= sqr(radius)
+                        {
+                            inside += 1;
+                        }
+                    }
+                    enough = inside >= neighbour_cap;
+                }
+                if !enough {
+                    for &id in &ids[..n] {
+                        ws.work(1)?;
+                        candidate_stamps[usize::from(id)] = 0;
+                    }
+                    n = self.grid.query_all_in(
+                        ws,
+                        bounds,
+                        ids,
+                        &mut candidate_stamps,
+                        (i + 1) as u16,
+                    )?;
+                }
+                n
             } else {
                 self.grid.query_items_in(ws, bounds, ids)?
             };

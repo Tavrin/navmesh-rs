@@ -68,10 +68,10 @@ def main():
         "configurations": len(failures),
         "oracle_over_speed_configurations": sum(any(math.hypot(*v) > 2.00001 for v in f["expected"]) for f in failures),
     }
-    if failures:
-        with open(args.output + ".failures.json", "w", encoding="utf8") as output:
-            json.dump(sorted(failures, key=lambda f: -f["max_error"]), output, indent=2)
+    with open(args.output + ".failures.json", "w", encoding="utf8") as output:
+        json.dump(sorted(failures, key=lambda f: -f["max_error"]), output, indent=2)
     del cases
+    scenario_failures = []
     for scenario in ["circle", "crossing", "corridor", "static"]:
         n = 64 if scenario == "circle" else 32
         agents, goals = [], []
@@ -112,6 +112,17 @@ def main():
         errors = [math.dist(a, b) for a, b in zip(actual, expected)]
         report[scenario] = {"steps": 400, "velocities": len(errors),
                             "max_error_m_s": max(errors), "over_1e_4": sum(e > 1e-4 for e in errors)}
+        for step, case in enumerate(frozen):
+            start, end = step * n, (step + 1) * n
+            failing = [i for i, error in enumerate(errors[start:end]) if error > 1e-4]
+            if failing:
+                scenario_failures.append({"scenario": scenario, "step": step, "input": case,
+                                          "failing_agents": failing,
+                                          "actual": actual[start:end], "expected": expected[start:end],
+                                          "max_error": max(errors[start:end])})
+    with open(args.output + ".scenario-failures.json", "w", encoding="utf8") as output:
+        json.dump(scenario_failures, output, indent=2)
+        output.write("\n")
     with open(args.output, "w", encoding="utf8") as output:
         json.dump(report, output, indent=2)
         output.write("\n")
