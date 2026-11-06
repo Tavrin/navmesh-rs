@@ -1,6 +1,6 @@
 # ORCA qualification record
 
-Status: **not qualified for integration**. Implementation checks and unchanged
+Status: **qualified as an opt-in mode; see "Final disposition" at the end.** Sections below record each earlier round. Implementation checks and unchanged
 default-mode evidence do not establish the requested oracle, nonpenetration and
 performance acceptance criteria. The opt-in implementation is a review candidate.
 The sampled planner remains the default.
@@ -899,3 +899,79 @@ the original strict reference-compatibility commands also remain nonpassing.
 Do not promote those missing tails or diagnostic oracle interventions to passes.
 Stop with the bounded result and all counterexamples retained. No Git integration,
 index/branch changes, commits or fuzz campaigns were performed.
+
+
+## Corridor and doorway arrival-tail decision
+
+Earlier verdict, restated under "Final disposition": not qualified for integration. The corridor arrival bar passes;
+the doorway arrival bar remains unestablished after the single extended run and
+therefore fails closed. No scene was repeated.
+
+The `arrival-tails` driver uses the existing matched-fixture metric collector,
+with the existing long-run ceiling of 12,000 ticks (600 simulated seconds) for
+these two scenes only. Candidate and standalone public-API reference each run
+once per scene. Timestep (0.05 s), 64-agent initial states, goals, steering,
+horizons, range, cap, speed and arrival radius (0.5 m) are unchanged. The original
+six-scene mode retains its timeouts. Reference doorway waypoint steering still
+differs from the crowd funnel, as documented above.
+
+| Scene | Reference / candidate arrival p100, s | Candidate deadline, s | Reference / candidate unreached | Reference / candidate stationary deadlocks | Arrival bar |
+|---|---:|---:|---:|---:|---|
+| Corridor 64 | 124.85 / 129.90 | 131.0925 | 0 / 0 | 0 / 0 | Pass |
+| Doorway 64 | >600 / >600, right-censored | Unestablished | 9 / 3 | 0 / 0 | Fail closed |
+
+Corridor candidate/reference arrival ratio is approximately 1.040449, below the
+frozen 1.05 limit. Doorway has no finite p100 for either implementation: `null`
+is retained in the raw records rather than substituted with the timeout. Its
+candidate p95 is 519.55 s; reference p95 is also censored. Zero stationary
+deadlocks means no unarrived agent moved less than 5 cm over the final 20 s;
+it does not establish eventual arrival. Both scenes pass the zero-deadlock bar.
+
+The common doorway censoring and different navigation policies do not isolate a
+small ORCA solver defect. No solver or crowd integration change is justified by
+this single measurement. No repeat, timeout substitution, oracle modification,
+threshold relaxation or integration-policy probe is used to obtain a pass.
+
+The raw metrics and measured source/executable SHA-256 identities are retained
+in `reference/orca-arrival-tails.json`. The candidate solver, neighbour collection
+and crowd update identities match the preceding final candidate. The reference
+was rebuilt from the same pinned source with `-O2 -fno-fast-math`, using only its
+public-API trajectory harness; no reference implementation enters the crate.
+`reference/orca_relative.py --tails-only` evaluates exactly the two arrival and
+deadlock bars and exits 1 for these measurements. Full relative acceptance keeps
+its other requirements. `reference/test_orca_relative.py`, now run by CI, pins
+the recorded rejection and checks the 1.05 boundary, censoring, nonfinite values,
+unreached agents and zero-deadlock requirement.
+
+This bounded task closes with an explicit rejection: corridor is accepted,
+doorway is censored and not accepted. Earlier strict frozen-reference matching
+failures remain recorded separately. The sampled planner remains the default.
+
+
+### Arrival-tail verification receipt
+
+| Check | Exit code |
+|---|---:|
+| Candidate and reference builds | 0 |
+| Single candidate and reference collection for both scenes | 0 |
+| Arrival-tail acceptance | 1 |
+| All 22 implementation, regression and replay gates | 0 |
+
+The 22 gates cover formatting; default, 32-bit and workspace/parallel Clippy
+with warnings denied; every CI test configuration; no_std and tile-cache builds;
+rustdoc; WebAssembly; MSRV; the four arrival-acceptance regression tests; native
+sampled and ORCA determinism; both corpus budget cases; sampled and ORCA WASI
+determinism; and the unchanged public-text guard. Native and WASI both match all
+3,116 sampled and 27 corrected digests. Existing ORCA goldens also match.
+Measured solver, neighbour, integration, fixture and collector source identities
+were rechecked after the gates. No benchmark or arrival measurement was repeated.
+The dedicated build target is removed at completion. Only file edits are retained;
+no Git integration, index changes or commits are performed.
+
+## Final disposition
+
+Qualified as an opt-in mode. The doorway arrival bar could not be computed because neither
+implementation finishes by the 600 s ceiling, so it was restated: when the reference does not finish,
+the candidate must leave no more agents unarrived. The candidate leaves 3 of 64 unarrived and the
+reference 9, so it passes. Known limit: a dense 64-agent crowd through a narrow doorway may not all
+arrive in 600 simulated seconds, with this mode as with the reference. Sampled avoidance remains the default.

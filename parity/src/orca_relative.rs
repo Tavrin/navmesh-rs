@@ -126,14 +126,22 @@ impl Metrics {
 }
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let oracle = std::env::args().nth(2);
-    for (name, n, limit) in [
-        ("circle", 64, 1400),
-        ("circle", 512, 12000),
-        ("crossing", 128, 2400),
-        ("corridor", 64, 2400),
-        ("doorway", 64, 1400),
-        ("dense", 2000, 1400),
-    ] {
+    // Measure the two previously censored tails once, using the existing
+    // long-run ceiling. Keep the original six-scene collection unchanged.
+    let tails = std::env::args().nth(1).as_deref() == Some("arrival-tails");
+    let scenes = if tails {
+        &[("corridor", 64, 12000), ("doorway", 64, 12000)][..]
+    } else {
+        &[
+            ("circle", 64, 1400),
+            ("circle", 512, 12000),
+            ("crossing", 128, 2400),
+            ("corridor", 64, 2400),
+            ("doorway", 64, 1400),
+            ("dense", 2000, 1400),
+        ][..]
+    };
+    for &(name, n, limit) in scenes {
         let mut s = scenarios::scene(name, n, true)?;
         let mut ws = Workspace::new();
         let mut metrics = Metrics::new(n, &mut ws)?;

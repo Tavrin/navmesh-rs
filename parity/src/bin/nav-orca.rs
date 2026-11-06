@@ -14,7 +14,7 @@ mod relative;
 mod scenarios;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
-        Some("relative-metrics") => {
+        Some("relative-metrics" | "arrival-tails") => {
             relative::run()?;
             return Ok(());
         }
