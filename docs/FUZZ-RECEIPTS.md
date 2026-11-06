@@ -567,3 +567,12 @@ Bounded edit sequences on a keyed grid; incremental weak labels and directed cov
 independent flood fills of the resident links, including atomic budget refusal. Started from an empty
 corpus, `-rss_limit_mb=512`, `-max_len=4096`, AddressSanitizer: five 600 s chunks on one core,
 674475 executions, coverage 2,251 → 2,297 → 2,304 → 2,313 → 2,313 (the fifth chunk added none). No crash.
+
+## `crowd_update` with ORCA, 2026-11-06
+
+Crowd target extended to the ORCA mode, seeded from the archived corpus (641 files), `-rss_limit_mb=512`,
+`-max_len=4096`, AddressSanitizer: three 600 s chunks, 700,365 executions, coverage 2,855 → 2,858 → 2,858
+(the third chunk added none). No crash.
+
+`orca_step`, 2026-11-06: empty starting corpus, `-rss_limit_mb=512`, `-max_len=4096`, AddressSanitizer: two
+600 s chunks, 83480376 executions, coverage 308 → 308 (the second chunk added none). No crash.

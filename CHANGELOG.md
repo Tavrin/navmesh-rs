@@ -6,6 +6,33 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-06
+
+### Added
+
+- Opt-in ORCA crowd avoidance with deterministic nearest-neighbour selection,
+  two-sided local boundary constraints, speed-bounded incremental linear programs
+  and charged work through `update_budgeted`. The sampled planner remains default.
+  Compared with the RVO2 library on the same scenes (`docs/ORCA-RESULTS.md`): maximum
+  penetration 0.127 m against 0.135 m on a 512-agent circle, arrival within 5%, about 1.3x the
+  cost of the sampled planner. In a dense 64-agent doorway neither finishes within 600 simulated
+  seconds; this mode leaves 3 agents unarrived and RVO2 leaves 9.
+- Public planar `orca_velocity`, `OrcaAgent`, `OrcaParams` and reusable
+  `OrcaScratch`; standalone oracle, trajectory and cost qualification drivers.
+- ORCA input fuzz target and ORCA coverage in the crowd-update fuzz target.
+
+### Fixed
+
+- ORCA directional ties select the consistent tangent endpoint; output and
+  acceleration interpolation retain the exact speed bound after float rounding.
+- ORCA linear programs normalize distance equations and use double precision for
+  disc intersections and projected constraints, reducing near-parallel cancellation.
+- ORCA finite static segments project the current velocity onto visible endpoint
+  arcs, cutoff segments and tangent rays, preserving two-sided endpoint behavior.
+- ORCA nearest-neighbour queries use a smaller search only after proving that it
+  contains the full nearest set; otherwise they repeat the full-range query.
+  The sampled planner and its golden files are unchanged.
+
 ## [0.2.1] - 2026-11-05
 
 ### Added

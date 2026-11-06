@@ -406,8 +406,17 @@ impl Crowd {
                 .add_item(j as u16, [p[0] - r, p[2] - r, p[0] + r, p[2] + r])?;
         }
         let all_candidates = self.fixes.contains(UpstreamFixes::NEAREST_NEIGHBOURS);
+        let any_orca = self
+            .active
+            .iter()
+            .any(|&i| matches!(self.agents[i].params.avoidance, AvoidanceMode::Orca(_)));
         // One id slot per active agent holds every candidate a query can return.
-        let mut wide = if all_candidates {
+        let mut wide = if all_candidates || any_orca {
+            ws.vec(self.active.len(), 0u16)?
+        } else {
+            Vec::new()
+        };
+        let mut candidate_stamps = if all_candidates || any_orca {
             ws.vec(self.active.len(), 0u16)?
         } else {
             Vec::new()
@@ -425,25 +434,84 @@ impl Crowd {
                 a.boundary
                     .update(a.corridor.first_poly(), a.npos, range, &mut q, f)?;
             }
+            let nearest = all_candidates || matches!(a.params.avoidance, AvoidanceMode::Orca(_));
+            let neighbour_cap = match a.params.avoidance {
+                AvoidanceMode::Orca(p) => {
+                    usize::from(p.max_neighbours).min(self.active.len().saturating_sub(1))
+                }
+                _ => 6,
+            };
+            if a.neis.len() < neighbour_cap {
+                let additional = neighbour_cap - a.neis.len();
+                ws.reserve(&mut a.neis, additional)?;
+                a.neis.resize(neighbour_cap, (0, 0.));
+            }
             a.nneis = 0;
             let pos = a.npos;
             let height = a.params.height;
             let mut capped = [0u16; 32];
-            let ids: &mut [u16] = if all_candidates {
-                &mut wide
+            let ids: &mut [u16] = if nearest { &mut wide } else { &mut capped };
+            let bounds = [
+                pos[0] - range,
+                pos[2] - range,
+                pos[0] + range,
+                pos[2] + range,
+            ];
+            let n = if nearest {
+                // For ORCA, a smaller complete query proves the same nearest
+                // set once it contains the cap inside its inscribed circle.
+                // Otherwise discard its stamps and query the full range. The
+                // corrected sampled path keeps its exhaustive collection.
+                let radius = (2. * a.params.radius * sqrtf(neighbour_cap as f32)).min(range);
+                let narrow = matches!(a.params.avoidance, AvoidanceMode::Orca(_))
+                    && neighbour_cap > 0
+                    && radius < range;
+                let mut n = 0;
+                let mut enough = false;
+                if narrow {
+                    n = self.grid.query_all_in(
+                        ws,
+                        [
+                            pos[0] - radius,
+                            pos[2] - radius,
+                            pos[0] + radius,
+                            pos[2] + radius,
+                        ],
+                        ids,
+                        &mut candidate_stamps,
+                        (i + 1) as u16,
+                    )?;
+                    let mut inside = 0;
+                    for &id in &ids[..n] {
+                        ws.work(1)?;
+                        let j = self.active[usize::from(id)];
+                        let nei = &self.agents[j];
+                        if i != j
+                            && (pos[1] - nei.npos[1]).abs() < (height + nei.params.height) / 2.
+                            && vdist_2d_sqr(&pos, &nei.npos) <= sqr(radius)
+                        {
+                            inside += 1;
+                        }
+                    }
+                    enough = inside >= neighbour_cap;
+                }
+                if !enough {
+                    for &id in &ids[..n] {
+                        ws.work(1)?;
+                        candidate_stamps[usize::from(id)] = 0;
+                    }
+                    n = self.grid.query_all_in(
+                        ws,
+                        bounds,
+                        ids,
+                        &mut candidate_stamps,
+                        (i + 1) as u16,
+                    )?;
+                }
+                n
             } else {
-                &mut capped
+                self.grid.query_items_in(ws, bounds, ids)?
             };
-            let n = self.grid.query_items_in(
-                ws,
-                [
-                    pos[0] - range,
-                    pos[2] - range,
-                    pos[0] + range,
-                    pos[2] + range,
-                ],
-                ids,
-            )?;
             for &id in &ids[..n] {
                 let j = self.active[id as usize];
                 if i == j {
@@ -460,20 +528,25 @@ impl Crowd {
                     continue;
                 }
                 let a = &mut self.agents[i];
-                let at = if all_candidates {
+                let at = if nearest {
                     // Candidates arrive in grid order: order by (distance, index).
-                    a.neis[..a.nneis]
-                        .iter()
-                        .position(|v| dist < v.1 || (dist == v.1 && j < v.0))
-                        .unwrap_or(a.nneis)
+                    let kept = &a.neis[..a.nneis];
+                    if kept
+                        .last()
+                        .is_some_and(|&(index, distance)| (distance, index) <= (dist, j))
+                    {
+                        a.nneis
+                    } else {
+                        kept.partition_point(|&(index, distance)| (distance, index) < (dist, j))
+                    }
                 } else {
                     insert_pos(&a.neis[..a.nneis], dist, |v| v.1)
                 };
-                if at < 6 {
-                    let end = a.nneis.min(5);
+                if at < neighbour_cap {
+                    let end = a.nneis.min(neighbour_cap - 1);
                     a.neis.copy_within(at..end, at + 1);
                     a.neis[at] = (j, dist);
-                    a.nneis = (a.nneis + 1).min(6);
+                    a.nneis = (a.nneis + 1).min(neighbour_cap);
                 }
             }
         }
@@ -592,12 +665,39 @@ impl Crowd {
             self.agents[i].desired_speed = speed;
             self.agents[i].dvel = dvel;
         }
+        let mut orca_scratch = OrcaScratch::default();
+        let mut orca_neighbours = Vec::new();
         for &i in &self.active {
             let a = &self.agents[i];
             if a.state != S::Walking {
                 continue;
             }
-            let nvel = if a.params.update_flags & OBSTACLE_AVOIDANCE != 0 {
+            let nvel = if a.params.update_flags & OBSTACLE_AVOIDANCE != 0
+                && dt > 0.
+                && let AvoidanceMode::Orca(p) = a.params.avoidance
+            {
+                orca_neighbours.clear();
+                ws.reserve(&mut orca_neighbours, a.nneis)?;
+                for &(j, _) in &a.neis[..a.nneis] {
+                    orca_neighbours.push(OrcaAgent::crowd(&self.agents[j]));
+                }
+                let mut walls = [[0.; 4]; 8];
+                for (out, &(_, s)) in walls.iter_mut().zip(&a.boundary.segments) {
+                    *out = [s[0], s[2], s[3], s[5]];
+                }
+                let v = orca::velocity_in(
+                    ws,
+                    &OrcaAgent::crowd(a),
+                    &orca_neighbours,
+                    &walls[..a.boundary.segments.len()],
+                    &p,
+                    dt,
+                    &mut orca_scratch,
+                )?;
+                [v[0], 0., v[1]]
+            } else if a.params.update_flags & OBSTACLE_AVOIDANCE != 0
+                && matches!(a.params.avoidance, AvoidanceMode::Sampled)
+            {
                 self.avoidance.reset();
                 for &(j, _) in &a.neis[..a.nneis] {
                     let n = &self.agents[j];
@@ -638,6 +738,11 @@ impl Crowd {
                 dv = vscale(&dv, max / ds);
             }
             a.vel = vadd(&a.vel, &dv);
+            if matches!(a.params.avoidance, AvoidanceMode::Orca(_)) {
+                // Acceleration interpolation can round back outside the disc.
+                let v = orca::clip([a.vel[0], a.vel[2]], a.params.max_speed);
+                a.vel = [v[0], 0., v[1]];
+            }
             if vlen(&a.vel) > 0.0001 {
                 a.npos = vmad(&a.npos, &a.vel, dt);
             } else {

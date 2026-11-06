@@ -346,3 +346,13 @@ result. A follow-up query corpus run reduced the mean from 36,998 to 35,829
 instructions per route pipeline; C++ used 29,293. The per-stage 1.1x C++ goal
 remains unmet. Performance measurements and qualification limits are recorded in
 [`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+
+### Optional reciprocal crowd avoidance
+
+Set `AgentParams::avoidance` to `AvoidanceMode::Orca(OrcaParams::default())` to
+select reciprocal half-plane velocity planning. The sampled planner remains the
+default. See [ORCA parameters, geometry and limits](docs/ORCA.md) for the pure
+planar API, budgets, qualification commands and collision-guarantee assumptions.
+
+The current ORCA candidate is [not qualified for integration](docs/ORCA-RESULTS.md);
+its oracle, penetration and cost acceptance criteria remain unmet.
