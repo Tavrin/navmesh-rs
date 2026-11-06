@@ -6,6 +6,19 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Experimental additive uniform-cost xz interval queries: `AnyAnglePoint`, `AnyAnglePath`,
+  `AnyAngleSearch::{begin,resume}`, and `NavMeshQuery::find_any_angle_path`.
+  Filters opt in through `QueryFilter::uniform_cost`; weighted costs and
+  encountered off-mesh traversal return `Unsupported`. Search progress is
+  budgeted, retained states are capped, and mesh changes require a restart.
+- Experimental opt-in boundary traversal extraction through `BakeConfig::links`, with drop,
+  jump and climb metadata, solid-span clearance checks, generated-link inspection
+  on `Tile`/`TileOutput`, and extraction reach included in incremental halos and
+  configuration hashes. Disabled extraction preserves the existing pipeline.
+
+
 ## [0.2.1] - 2026-11-05
 
 ### Added

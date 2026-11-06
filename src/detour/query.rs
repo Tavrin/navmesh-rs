@@ -32,6 +32,11 @@ const DETAIL_MASK: u32 = 0x0ff_ffff;
 
 /// Polygon filter and traversal cost (`dtQueryFilter`).
 pub trait QueryFilter {
+    /// Uniform positive traversal multiplier, or `None` for unsupported costs.
+    /// Implementations opting in promise the same cost on every passable polygon.
+    fn uniform_cost(&self) -> Option<f32> {
+        None
+    }
     /// Whether the polygon may be visited.
     fn pass_filter(&self, r: PolyRef, tile: &MeshTile, poly: &Poly) -> bool;
     /// Cost of moving from `pa` to `pb` across `cur` (between `prev` and `next`,
@@ -69,6 +74,11 @@ impl Default for DefaultFilter {
 }
 
 impl QueryFilter for DefaultFilter {
+    fn uniform_cost(&self) -> Option<f32> {
+        let first = self.area_cost[0];
+        (first.is_finite() && first > 0.0 && self.area_cost.iter().all(|&c| c == first))
+            .then_some(first)
+    }
     #[inline]
     fn pass_filter(&self, _r: PolyRef, _tile: &MeshTile, poly: &Poly) -> bool {
         (poly.flags & self.include_flags) != 0 && (poly.flags & self.exclude_flags) == 0

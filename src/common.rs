@@ -53,6 +53,8 @@ pub enum Error {
     MeshChanged,
     /// The call was stopped by its [`CancelToken`] (not in recastnavigation).
     Cancelled,
+    /// The requested algorithm does not support this traversal model.
+    Unsupported,
 }
 
 /// Why stored tile state was rejected on restore.
@@ -124,6 +126,7 @@ impl fmt::Display for Error {
             Error::TileOutsideGrid => f.write_str("tile outside the keyed grid"),
             Error::MeshChanged => f.write_str("navmesh changed under the search"),
             Error::Cancelled => f.write_str("cancelled"),
+            Error::Unsupported => f.write_str("unsupported traversal model"),
         }
     }
 }

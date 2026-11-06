@@ -162,3 +162,17 @@ path = "fuzz_targets/connectivity_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "any_angle_query"
+path = "fuzz_targets/any_angle_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link_extract"
+path = "fuzz_targets/link_extract.rs"
+test = false
+doc = false
+bench = false

@@ -31,6 +31,8 @@
     clippy::unnecessary_cast
 )]
 
+mod any_angle;
+pub use any_angle::{AnyAnglePath, AnyAnglePoint, AnyAngleSearch};
 mod builder;
 mod endian;
 pub(crate) mod math;
