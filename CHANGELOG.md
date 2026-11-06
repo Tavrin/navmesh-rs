@@ -6,13 +6,17 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-06
+
 ### Added
 
 - Opt-in ORCA crowd avoidance with deterministic nearest-neighbour selection,
   two-sided local boundary constraints, speed-bounded incremental linear programs
   and charged work through `update_budgeted`. The sampled planner remains default.
-  This candidate is not qualified for integration; see `docs/ORCA-RESULTS.md` for
-  unresolved oracle and separation acceptance criteria.
+  Compared with the RVO2 library on the same scenes (`docs/ORCA-RESULTS.md`): maximum
+  penetration 0.127 m against 0.135 m on a 512-agent circle, arrival within 5%, about 1.3x the
+  cost of the sampled planner. In a dense 64-agent doorway neither finishes within 600 simulated
+  seconds; this mode leaves 3 agents unarrived and RVO2 leaves 9.
 - Public planar `orca_velocity`, `OrcaAgent`, `OrcaParams` and reusable
   `OrcaScratch`; standalone oracle, trajectory and cost qualification drivers.
 - ORCA input fuzz target and ORCA coverage in the crowd-update fuzz target.

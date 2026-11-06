@@ -573,3 +573,6 @@ corpus, `-rss_limit_mb=512`, `-max_len=4096`, AddressSanitizer: five 600 s chunk
 Crowd target extended to the ORCA mode, seeded from the archived corpus (641 files), `-rss_limit_mb=512`,
 `-max_len=4096`, AddressSanitizer: three 600 s chunks, 700,365 executions, coverage 2,855 → 2,858 → 2,858
 (the third chunk added none). No crash.
+
+`orca_step`, 2026-11-06: empty starting corpus, `-rss_limit_mb=512`, `-max_len=4096`, AddressSanitizer: two
+600 s chunks, 83480376 executions, coverage 308 → 308 (the second chunk added none). No crash.
