@@ -132,11 +132,29 @@ pub(super) fn clip(v: V2, speed: f32) -> V2 {
         v
     };
     // Rounding a point on the disc to f32 can put it just outside. Measure the
-    // rounded coordinates in f64 and leave one f32 epsilon of radial margin
-    // only when needed; subsequent component rounding cannot consume it all.
-    let length = root64(dot64(v.map(f64::from), v.map(f64::from)));
-    if length > f64::from(speed) {
-        let scale = f64::from(speed) / length * (1. - f64::from(f32::EPSILON));
+    // rounded coordinates in f64 and leave a radial rounding margin only when
+    // needed; subsequent component rounding cannot consume it all.
+    // Each f32 coordinate product is exact in f64. Recover the addition's
+    // rounding residual too: a small orthogonal component can put the exact
+    // vector outside while the rounded squared length equals the boundary.
+    let [x, y] = v.map(f64::from);
+    let (xx, yy) = (x * x, y * y);
+    let squared = xx + yy;
+    let residual = if xx >= yy {
+        yy - (squared - xx)
+    } else {
+        xx - (squared - yy)
+    };
+    let limit = f64::from(speed) * f64::from(speed);
+    if squared > limit || (squared == limit && residual > 0.) {
+        let length = root64(squared);
+        let scale = if speed > 0. && speed < f32::MIN_POSITIVE {
+            // Subnormal coordinates have an absolute rounding step. One step
+            // of radial margin exceeds their combined component-rounding error.
+            f64::from(f32::from_bits(speed.to_bits() - 1)) / length
+        } else {
+            f64::from(speed) / length * (1. - f64::from(f32::EPSILON))
+        };
         v.map(|x| (f64::from(x) * scale) as f32)
     } else {
         v
@@ -488,6 +506,24 @@ mod tests {
         let v = clip(input, 1.);
         assert!(dot64(v.map(f64::from), v.map(f64::from)) <= 1.);
         assert!(norm(sub(v, input)) < 1e-6);
+    }
+
+    #[test]
+    fn tiny_orthogonal_component_cannot_hide_outside_the_speed_disc() {
+        let tiny = 1.4901161e-8_f32;
+        assert_eq!(4. + f64::from(tiny) * f64::from(tiny), 4.);
+        let v = clip([2., tiny], 2.);
+        assert!(v[0] < 2.);
+        assert_eq!(clip([2., 0.], 2.), [2., 0.]);
+    }
+
+    #[test]
+    fn subnormal_speed_limit_retains_a_representable_rounding_margin() {
+        for bits in [1, 2, 0x007f_ffff] {
+            let speed = f32::from_bits(bits);
+            let v = clip([speed, speed], speed);
+            assert!(f64::from(v[0]).hypot(f64::from(v[1])) <= f64::from(speed));
+        }
     }
 
     #[test]

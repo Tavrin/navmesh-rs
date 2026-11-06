@@ -5,8 +5,8 @@ default-mode evidence do not establish the requested oracle, nonpenetration and
 performance acceptance criteria. The opt-in implementation is a review candidate.
 The sampled planner remains the default.
 
-The tables before "Relative-reference qualification" are historical. That final
-section describes the current candidate, comparison policy and stop decision.
+Earlier sections retain historical measurements. The final section describes
+the current candidate, comparison policy and stop decision.
 
 ## Decisions
 
@@ -35,7 +35,8 @@ The Apache-2.0 oracle is
 [RVO2 at `6b4eb00a93a9f3abf723235ff006d6aad3e2f212`](https://github.com/snape/RVO2/tree/6b4eb00a93a9f3abf723235ff006d6aad3e2f212).
 Its downloaded archive SHA-256 is
 `d92c7d73be7548b955856d54367e634d58562eaf4db51cd79b5b444910ea4396`.
-Only its licence, build configuration and public headers were inspected.
+Before the later numerical diagnosis, only its licence, build configuration and
+public headers had been inspected.
 
 The oracle comparison uses 100,000 fixed-seed random configurations, 548,574
 agent velocities, and 400-step circle, crossing, corridor and static-segment
@@ -726,3 +727,175 @@ trade correctness for an unsupported compatibility rule. Broader position
 correction or neighbor-policy changes have no qualifying evidence in this round.
 Stop without promoting the relative penetration failure or unmeasured arrival
 tails. No commits, branch/index changes, integration or fuzz campaigns were made.
+
+
+## Further qualification and equal-navigation control
+
+Status: **not qualified for integration across all required fixtures**. The
+circle-512 maximum-penetration gap is fixed in the measured candidate, and all
+202 frozen-state mismatches now have retained causal or analytical evidence.
+Corridor and doorway arrival p100 remain unmeasured at the frozen timeouts.
+Those missing tails cannot satisfy the arrival acceptance test. The sampled
+planner remains the default.
+
+### Cause and retained fix
+
+The equal-navigation control ran first. It replaced only local velocity
+selection with a separate public-API reference process while retaining crowd
+steering, frozen-state ordering, acceleration interpolation, strict-speed
+clamping, overlap correction and corridor projection. A separate build profile
+and an embedded protocol marker establish the executable's identity. All six
+scenes completed collection successfully. Its pipe overhead is excluded from
+planner-cost evidence; affinity and scheduling changes are retained with that
+diagnostic's execution receipt.
+
+Circle-512 maximum penetration is `0.134895742 m` for the standalone reference,
+`0.155890822 m` for the reference under shared crowd integration, and
+`0.171704173 m` for the pre-fix candidate. Shared integration contributes to the
+gap, but does not explain the additional `0.015813351 m` candidate depth. The
+control is diagnostic and does not replace the frozen standalone limit of
+`0.144895742 m`. The flat circle uses requested velocities, so doorway funnel
+policy is not an explanation for its discrepancy.
+
+A hard-bound defect remained in the final velocity clamp: exact products of f32
+coordinates fit in f64, but their sum can round to the squared speed limit even
+when the exact vector lies outside. For example, `(2, 2^-26)` is outside radius 2,
+although the rounded f64 sum is 4. The former comparison then skipped its radial
+margin. The retained fix recovers the addition residual and clamps a positive
+residual at equality as well as an above-limit sum. Subnormal speed limits use
+an absolute representable step of radial margin. Focused regressions cover the
+hidden orthogonal component, exact axial boundary and subnormal limits.
+
+This changes only the ORCA speed clamp. No acceleration, corridor, neighbour or
+position-correction policy change is retained. Under the same fixture and source
+build, circle-512 now reaches maximum penetration `0.127451062 m` and arrival
+p100 `190.80 s`, passing `0.144895742 m` and `199.08 s` respectively. Small
+boundary changes alter the interacting trajectory; this is measured fixture
+acceptance, not a general multi-agent separation guarantee. The equal-navigation
+control used the earlier clamp and recorded two strictly positive speed counts
+whose excess rounds to zero at twelve decimal places. These are retained as
+failures of that diagnostic clamp, not attributed to the final candidate.
+
+The relative evaluator also now requires candidate zero deadlocks even when the
+reference deadlocks. Three synthetic cases verify zero/zero acceptance and
+rejection of candidate-only and shared deadlocks. This strengthens the existing
+zero-deadlock bar.
+
+### Identical navigation and integration control
+
+All rows below use reference velocity selection inside the crowd pipeline.
+The raw collector's generic mode label is not an executable-identity claim.
+
+| Scene | Maximum penetration, m | Positive-depth p99, m | Arrival p100, s | Unreached | Stationary deadlocks |
+|---|---:|---:|---:|---:|---:|
+| circle 64 | 0.034270525 | 0.016439557 | 52.90 | 0 | 0 |
+| circle 512 | 0.155890822 | 0.034852326 | 199.05 | 0 | 0 |
+| crossing 128 | 0.011043131 | 0.004558265 | 103.80 | 0 | 0 |
+| corridor 64 | 0.040272295 | 0.026745856 | unmeasured | 1 | 0 |
+| doorway 64 | 0.015406430 | 0.005212128 | unmeasured | 32 | 0 |
+| dense 2000 | 0.000000000 | 0.000000000 | 50.40 | 0 | 0 |
+
+### Final native reference and candidate
+
+The original inputs, horizons, caps, speed, step, metric definitions and timeouts
+are unchanged. All six candidate scenes have zero strict speed excess and zero
+stationary deadlocks. Standalone doorway reference steering still differs; the
+control above separately measures the identical crowd steering policy.
+
+| Scene | Reference / candidate maximum penetration, m | Reference / candidate positive-depth p99, m | Reference / candidate arrival p100, s | Reference / candidate unreached |
+|---|---:|---:|---:|---:|
+| circle 64 | 0.068525612 / 0.034274042 | 0.025568247 / 0.016960919 | 60.50 / 49.35 | 0 / 0 |
+| circle 512 | 0.134895742 / 0.127451062 | 0.036157608 / 0.040486455 | 189.60 / 190.80 | 0 / 0 |
+| crossing 128 | 0.035444796 / 0.014600396 | 0.008958638 / 0.004372895 | 101.90 / 102.90 | 0 / 0 |
+| corridor 64 | 0.060882211 / 0.040270925 | 0.048327625 / 0.027207255 | unmeasured / unmeasured | 1 / 1 |
+| doorway 64 | 0.031862676 / 0.021192491 | 0.011198580 / 0.005482495 | unmeasured / unmeasured | 24 / 28 |
+| dense 2000 | 0.000000000 / 0.000000000 | 0.000000000 / 0.000000000 | 50.40 / 50.40 | 0 / 0 |
+
+### All 61 fallback residuals explained
+
+The original frozen comparison still reports 202 random velocity mismatches at
+`1e-4 m/s`, and zero in the four frozen scenarios. The priority classes remain
+108 reference speed contradictions, 33 demonstrated extended-precision-sensitive
+fallbacks, and 61 bounded fallback residuals. No case is double-counted.
+
+For this diagnosis the reference implementation source was inspected as test
+oracle data. No reference implementation was copied or translated into the
+crate. An instrumented reference reproduces every original residual output
+exactly. Its projected-line construction stores a distant line intersection in
+f32 and later evaluates its offset with a rounded projected direction. That
+representation amplifies cancellation. Measured projected-offset errors across
+the 61 cases range from approximately `6.04e-8` to `1.50e-4 m/s`; small offset
+errors can yield much larger velocity differences in these conditioned programs.
+
+An isolated oracle-only intervention retains the original projected direction,
+parallel cutoff, state and constraints, but represents the same projected line
+near the origin using `(n_j-n_i).v = c_j-c_i`. All 61 outputs then agree with the
+candidate within `0.000004540184 m/s`. Tightening the parallel cutoff as a separate
+probe resolves no additional cases. Eight exact coordinate symmetries resolve
+none and change none beyond tolerance; no coordinate-order exemption is inferred.
+Each case retains its input hash, original and intervened outputs, projection
+trace, and source/executable hashes. This establishes projection-representation
+sensitivity for all 61, beyond the earlier optimality-only classification.
+
+The candidate already uses stable distance equations and remains independently
+certified within `0.000000731 m/s` of the minimax objective. Reproducing the
+original reference's inaccurate fallback would discard that evidence. The
+unmodified reference still differs by up to `1.550569510 m/s` in this class;
+the diagnostic intervention is an explanation, not a replacement qualification
+oracle or a relaxed velocity threshold. The original frozen and classification
+acceptance commands therefore retain exit 1.
+
+### Rejected integration probes
+
+Both probes use the final clamp and retain sampled behavior in their scratch
+sources. Neither is adopted.
+
+| Probe | Circle-512 maximum penetration, m | Circle-512 arrival p100, s | Additional failure |
+|---|---:|---:|---|
+| Directly assign reachable ORCA velocity | 0.152106047 | 234.00 | One stationary crossing deadlock; circle penetration and arrival fail. |
+| Up to twelve ORCA position-correction iterations, with early convergence | 0.127242744 | 223.30 | Circle arrival fails; circle-64 arrival also fails its relative deadline. |
+
+### Final cost and gates
+
+The unchanged timing method uses ten warmup ticks and nine alternating pairs of
+ten ticks on one allowed CPU. Ratios are from the same shared-host run and include
+preferred-velocity preparation and crowd update.
+
+| Agents | Sampled, microseconds/agent-tick | Candidate, microseconds/agent-tick | Ratio |
+|---:|---:|---:|---:|
+| 100 | 2.518288 | 2.490980 | 0.989156 |
+| 1000 | 2.500716 | 3.035481 | 1.213845 |
+| 5000 | 2.248246 | 2.987633 | 1.328873 |
+
+All 24 repeated final-source implementation and replay checks exit 0: formatting;
+four Clippy configurations with warnings denied; default, parallel and 32-bit
+tests; no_std and tile-cache variants; rustdoc; WebAssembly; MSRV; all fuzz-target
+builds; the unchanged public-text guard; sampled and ORCA native/WASI determinism;
+and both corpus budget cases. No fuzz campaign ran.
+
+The 3,116 sampled and 27 corrected sampled records remain byte-identical. Only the
+ORCA circle-512 digest changes, from `3159a1e880a76949` to `5a610dca209a2597`.
+The explicit comparison with the prior ORCA golden exits 1; replacement native
+and WASI comparisons exit 0. Native source compilation precedes measurement,
+and retained measured and final replay executable identities are checked.
+
+| Receipt | Exit code |
+|---|---:|
+| Six-scene identical-navigation control collection | 0 |
+| Numerical intervention and deadlock-gate regression runner | 0 |
+| All 202 mismatch explanations validated against fresh inputs and outputs | 0 |
+| Final candidate/reference metric collection and cost collection | 0 |
+| All 24 final-source implementation/replay checks | 0 |
+| Original frozen-reference matching | 1 |
+| Original mismatch-classification acceptance | 1 |
+| Full relative acceptance, including missing arrival tails | 1 |
+| Explicit prior ORCA-golden comparison | 1 |
+
+Decision: retain the minimal hard-bound fix, the stricter deadlock evaluator and
+only the changed ORCA digest. The circle-512 physical gap and the 61 explanatory
+gaps are closed. **Full integration qualification remains rejected** because
+corridor and doorway arrival p100 are still unmeasured at the frozen timeouts;
+the original strict reference-compatibility commands also remain nonpassing.
+Do not promote those missing tails or diagnostic oracle interventions to passes.
+Stop with the bounded result and all counterexamples retained. No Git integration,
+index/branch changes, commits or fuzz campaigns were performed.

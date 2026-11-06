@@ -34,7 +34,7 @@ def main():
         a, b = ours['arrival_p100'], oracle['arrival_p100']
         checks['arrival_p100'] = (a is not None and b is not None and
                                   math.isfinite(a) and math.isfinite(b) and a <= b * 1.05)
-        checks['deadlocks'] = oracle['deadlocks'] != 0 or ours['deadlocks'] == 0
+        checks['deadlocks'] = ours['deadlocks'] == 0
         checks['speed'] = (ours['strict_speed_violations'] == 0 and
                            ours['max_speed_excess'] == 0)
         scenes.append(dict(scene=key[0], agents=key[1], checks=checks))
