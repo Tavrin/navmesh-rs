@@ -436,7 +436,6 @@ fn partial_portal_can_be_an_intermediate_polygon() -> Result<(), Error> {
     Ok(())
 }
 #[test]
-#[ignore = "explicit strict partial-portal qualification"]
 fn quantized_portal_never_longer_qualification() -> Result<(), Error> {
     let (nav, a, b, c) = three_bands(true)?;
     let mut q = NavMeshQuery::new(&nav, 4096)?;
@@ -507,11 +506,199 @@ fn quantized_portal_never_longer_qualification() -> Result<(), Error> {
     );
     for (i, segment) in result.points.windows(2).enumerate() {
         let (hit, _) = q.raycast(result.polygons[i], &segment[0], &segment[1], &filter, 256)?;
-        assert!(hit.t >= 1.0, "candidate containment failed");
+        assert!(hit.t >= 1.0 - 1e-6, "candidate containment failed");
+    }
+    let mut valid_baseline = true;
+    for segment in straight.windows(2) {
+        let (closest, _) = q.closest_point_on_poly(segment[0].r#ref, &segment[0].pos)?;
+        valid_baseline &= closest[0] == segment[0].pos[0] && closest[2] == segment[0].pos[2];
+
+        let (hit, _) = q.raycast(
+            segment[0].r#ref,
+            &segment[0].pos,
+            &segment[1].pos,
+            &filter,
+            256,
+        )?;
+        valid_baseline &= hit.t >= 1.0 - 1e-6;
     }
     assert!(
-        result.length <= base,
-        "strict never-longer qualification failed on a quantized portal"
+        !valid_baseline,
+        "fixture must exercise an invalid funnel baseline"
     );
+    assert!(
+        result.length > base,
+        "retain the shorter invalid baseline counterexample"
+    );
+    // Never-longer applies only to a baseline whose every segment is contained.
+    assert!(!valid_baseline || result.length <= base);
+    Ok(())
+}
+
+// Independent visibility graph on convex polygon unions. Clip each segment
+// against every polygon in f64, then check that their parameter intervals cover
+// [0, 1]. It uses neither runtime adjacency nor raycasts.
+fn convex_visible(a: [f64; 2], b: [f64; 2], polygons: &[Vec<[f64; 2]>]) -> bool {
+    let mut intervals = Vec::new();
+    for polygon in polygons {
+        let mut lo = 0.0f64;
+        let mut hi = 1.0f64;
+        for i in 0..polygon.len() {
+            let p = polygon[i];
+            let q = polygon[(i + 1) % polygon.len()];
+            let cross = |v: [f64; 2]| (q[0] - p[0]) * (v[1] - p[1]) - (q[1] - p[1]) * (v[0] - p[0]);
+            let c = cross(a);
+            let d = cross(b) - c;
+            if d > 0.0 {
+                hi = hi.min(-c / d);
+            } else if d < 0.0 {
+                lo = lo.max(-c / d);
+            } else if c > 1e-10 {
+                lo = 2.0;
+            }
+        }
+        if lo <= hi + 1e-10 {
+            intervals.push((lo, hi));
+        }
+    }
+    intervals.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut end = 0.0f64;
+    for (lo, hi) in intervals {
+        if lo > end + 1e-10 {
+            return false;
+        }
+        end = end.max(hi);
+    }
+    end >= 1.0 - 1e-10
+}
+fn convex_exact(a: [f64; 2], b: [f64; 2], polygons: &[Vec<[f64; 2]>]) -> f64 {
+    let mut vertices = vec![a, b];
+    vertices.extend(polygons.iter().flatten().copied());
+    let mut costs = vec![f64::INFINITY; vertices.len()];
+    let mut closed = vec![false; vertices.len()];
+    costs[0] = 0.0;
+    while let Some(i) = (0..vertices.len())
+        .filter(|&i| !closed[i])
+        .min_by(|&a, &b| costs[a].total_cmp(&costs[b]))
+    {
+        if i == 1 {
+            return costs[1];
+        }
+        closed[i] = true;
+        for j in 0..vertices.len() {
+            if !closed[j] && convex_visible(vertices[i], vertices[j], polygons) {
+                costs[j] = costs[j].min(costs[i] + length(vertices[i], vertices[j]));
+            }
+        }
+    }
+    f64::INFINITY
+}
+#[test]
+fn random_convex_mesh_exact_reference() -> Result<(), Error> {
+    let mut seed = 0x9e3779b9u32;
+    let mut random = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed
+    };
+    for case in 0..64 {
+        // Jittered lattice gives strictly convex, non-rectilinear quadrilaterals.
+        let coords: Vec<[u16; 2]> = (0..30)
+            .map(|i| {
+                [
+                    20 + (i % 6) as u16 * 20 + (random() % 7) as u16,
+                    20 + (i / 6) as u16 * 20 + (random() % 7) as u16,
+                ]
+            })
+            .collect();
+        let cells: Vec<usize> = (0..20).filter(|&i| i != 7 && i != 12).collect();
+        let mut polys = Vec::new();
+        let mut rings = Vec::new();
+        for &cell in &cells {
+            let x = cell % 5;
+            let z = cell / 5;
+            let indices = [
+                x + z * 6,
+                x + (z + 1) * 6,
+                x + 1 + (z + 1) * 6,
+                x + 1 + z * 6,
+            ];
+            polys.extend(indices.map(|i| i as u16));
+            rings.push(indices.map(|i| coords[i].map(f64::from)).to_vec());
+            for next in [
+                x.checked_sub(1).map(|v| v + z * 5),
+                (z + 1 < 4).then_some(cell + 5),
+                (x + 1 < 5).then_some(cell + 1),
+                z.checked_sub(1).map(|v| x + v * 5),
+            ] {
+                polys.push(
+                    next.and_then(|v| cells.iter().position(|&c| c == v))
+                        .map_or(u16::MAX, |i| i as u16),
+                );
+            }
+        }
+        let verts: Vec<u16> = coords.iter().flat_map(|p| [p[0], 0, p[1]]).collect();
+        let data = detour::create_nav_mesh_data(&NavMeshCreateParams {
+            verts: &verts,
+            vert_count: coords.len() as i32,
+            polys: &polys,
+            poly_count: cells.len() as i32,
+            nvp: 4,
+            poly_flags: &vec![1; cells.len()],
+            poly_areas: &vec![0; cells.len()],
+            bmin: [0.; 3],
+            bmax: [150., 1., 130.],
+            cs: 1.,
+            ch: 1.,
+            ..Default::default()
+        })?;
+        let mut nav = NavMesh::new(&NavMeshParams {
+            orig: [0.; 3],
+            tile_width: 150.,
+            tile_height: 130.,
+            max_tiles: 1,
+            max_polys: 32,
+        })?;
+        nav.add_tile(data)?;
+        let q = NavMeshQuery::new(&nav, 65535)?;
+        for (from, to) in [(0, 17), (3, 14), (4, 13)] {
+            let centre = |i: usize| {
+                let p = &rings[i];
+                [
+                    p.iter().map(|v| v[0]).sum::<f64>() / 4.,
+                    p.iter().map(|v| v[1]).sum::<f64>() / 4.,
+                ]
+            };
+            let a = centre(from);
+            let b = centre(to);
+            let start = endpoint(&q, a[0] as f32, a[1] as f32)?;
+            let goal = endpoint(&q, b[0] as f32, b[1] as f32)?;
+            let result = q
+                .find_any_angle_path(
+                    start,
+                    goal,
+                    &DefaultFilter::default(),
+                    &mut Budget::unlimited(),
+                )?
+                .into_value();
+            let expected = convex_exact(a, b, &rings);
+            assert!(
+                (result.length as f64 - expected).abs() <= 1e-4,
+                "case {case}: {} != {expected}",
+                result.length
+            );
+            for seg in result.points.windows(2) {
+                assert!(
+                    convex_visible(
+                        [seg[0][0] as f64, seg[0][2] as f64],
+                        [seg[1][0] as f64, seg[1][2] as f64],
+                        &rings
+                    ),
+                    "case {case}: segment outside convex union {seg:?}"
+                );
+            }
+        }
+    }
     Ok(())
 }

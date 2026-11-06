@@ -34,6 +34,40 @@ fn baseline(
             .sum(),
     ))
 }
+// Qualification tolerance applies only at the segment endpoint.
+const CONTAINED_T: f32 = 1.0 - 1e-6;
+fn baseline_containment(
+    q: &mut NavMeshQuery<'_>,
+    a: AnyAnglePoint,
+    b: AnyAnglePoint,
+) -> Result<(bool, usize), Error> {
+    let filter = DefaultFilter::default();
+    let mut corridor = Vec::new();
+    let mut points = Vec::new();
+    q.find_path(
+        a.polygon,
+        b.polygon,
+        &a.position,
+        &b.position,
+        &filter,
+        &mut corridor,
+        65535,
+    )?;
+    q.find_straight_path(&a.position, &b.position, &corridor, &mut points, 65535, 0)?;
+    let mut valid = true;
+    let mut tolerance_segments = 0;
+    for seg in points.windows(2) {
+        // Raycast assumes its start belongs to start_ref; a quantized funnel
+        // corner may violate that precondition and still return t = MAX.
+        let (closest, _) = q.closest_point_on_poly(seg[0].r#ref, &seg[0].pos)?;
+        valid &= closest[0] == seg[0].pos[0] && closest[2] == seg[0].pos[2];
+
+        let (hit, _) = q.raycast(seg[0].r#ref, &seg[0].pos, &seg[1].pos, &filter, 65535)?;
+        valid &= hit.t >= CONTAINED_T;
+        tolerance_segments += usize::from(hit.t >= CONTAINED_T && hit.t < 1.0);
+    }
+    Ok((valid, tolerance_segments))
+}
 fn candidate(
     q: &NavMeshQuery<'_>,
     a: AnyAnglePoint,
@@ -64,11 +98,23 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
     if let Some(dir) = &dump {
         export(&nav, dir).map_err(|e| e.to_string())?;
     }
+    let repeats = match std::env::var("NAV_ANY_ANGLE_REPEATS") {
+        Ok(v) => v.parse::<usize>().map_err(|e| e.to_string())?,
+        Err(_) => 4,
+    };
+    if repeats == 0 || repeats > 100_000 {
+        return Err("repeat count must be in 1..=100000".into());
+    }
     let mut dump_queries = String::new();
     let mut digest = navmesh_parity::encode::Payload::new();
     let mut failures = 0;
     let mut skipped = 0;
+    let mut invalid_baselines = 0;
+    let mut tolerance_queries = 0;
+    let mut tolerance_segments = 0;
+    let mut baseline_tolerance_segments = 0;
     let mut passed = 0;
+    let mut timed_queries = 0;
     let mut base_ns = 0;
     let mut query_ns = 0;
     let mut max_ratio = 0.0f32;
@@ -83,15 +129,20 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
             skipped += 1;
             continue;
         }
+        let (valid_baseline, baseline_tolerance) =
+            baseline_containment(&mut q, a, b).map_err(|e| e.to_string())?;
+        invalid_baselines += usize::from(!valid_baseline);
+        baseline_tolerance_segments += baseline_tolerance;
         let expected = candidate(&q, a, b);
         if let Err(error) = &expected {
             failures += 1;
             eprintln!("query {i}: {error} during untimed warmup; timed comparison not run");
-            break;
+            continue;
         }
+        timed_queries += 1;
         let mut base = None;
         let mut result = Err(Error::Failed);
-        for repeat in 0..4 {
+        for repeat in 0..repeats {
             if (i + repeat) % 2 == 0 {
                 let t = Instant::now();
                 base = baseline(&mut q, a, b).map_err(|e| e.to_string())?;
@@ -119,15 +170,16 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
                 ));
                 expanded += path.expanded;
                 peak_bytes = peak_bytes.max(path.search_bytes);
-                if base > 0.0 {
+                if valid_baseline && base > 0.0 {
                     max_ratio = max_ratio.max(path.length / base);
                 }
-                if path.length > base {
+                if valid_baseline && path.length > base {
                     failures += 1;
                     eprintln!("query {i}: interval {} exceeds funnel {base}", path.length);
-                    break;
+                    continue;
                 }
                 let mut valid = true;
+                let mut used_tolerance = false;
                 for (j, seg) in path.points.windows(2).enumerate() {
                     let (hit, _) = q
                         .raycast(
@@ -138,14 +190,36 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
                             65535,
                         )
                         .map_err(|e| e.to_string())?;
-                    if hit.t < 1.0 {
+                    if hit.t >= CONTAINED_T && hit.t < 1.0 {
+                        tolerance_segments += 1;
+                        used_tolerance = true;
+                    }
+                    if hit.t < CONTAINED_T {
                         valid = false;
+                        let mut alternatives = Vec::new();
+                        q.query_polygons_with(
+                            &seg[0],
+                            &[0.001, 1.0, 0.001],
+                            &DefaultFilter::default(),
+                            &mut |_, _, r| alternatives.push(r),
+                        )
+                        .map_err(|e| e.to_string())?;
+                        for r in alternatives {
+                            let (alternative, _) = q
+                                .raycast(r, &seg[0], &seg[1], &DefaultFilter::default(), 65535)
+                                .map_err(|e| e.to_string())?;
+                            eprintln!(
+                                "query {i} segment {j}: alternative_ref={r} t={}",
+                                alternative.t
+                            );
+                        }
                         eprintln!(
                             "query {i} segment {j}: ray stopped at {} from {:?} to {:?} ref {}",
                             hit.t, seg[0], seg[1], path.polygons[j]
                         );
                     }
                 }
+                tolerance_queries += usize::from(used_tolerance);
                 if !valid {
                     failures += 1;
                     let mut corridor = Vec::new();
@@ -184,7 +258,7 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
                             hit.t, segment[0].pos, segment[1].pos
                         );
                     }
-                    break;
+                    continue;
                 }
 
                 digest.f32(path.length);
@@ -196,7 +270,7 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
             (Some(_), Err(e)) => {
                 failures += 1;
                 eprintln!("query {i}: {e}");
-                break;
+                continue;
             }
             (None, _) => {}
         }
@@ -205,7 +279,7 @@ pub(super) fn verify(c: &Case, g: &Geometry) -> Result<(), String> {
         std::fs::write(dir.join("queries.txt"), dump_queries).map_err(|e| e.to_string())?;
     }
     println!(
-        "queries={passed} failures={failures} max_length_ratio={max_ratio:.8} expanded={expanded} peak_search_bytes={peak_bytes} baseline_ns={base_ns} interval_ns={query_ns} digest={:016x} skipped={skipped}",
+        "queries={passed} failures={failures} max_length_ratio={max_ratio:.8} expanded={expanded} peak_search_bytes={peak_bytes} baseline_ns={base_ns} interval_ns={query_ns} digest={:016x} repeats={repeats} timed_queries={timed_queries} skipped={skipped} invalid_baselines={invalid_baselines} tolerance_queries={tolerance_queries} tolerance_segments={tolerance_segments} baseline_tolerance_segments={baseline_tolerance_segments}",
         navmesh_parity::fnv1a64(digest.as_bytes())
     );
     if failures > 0 || passed == 0 {

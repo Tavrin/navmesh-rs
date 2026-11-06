@@ -1,49 +1,189 @@
 # Any-angle query and traversal extraction results
 
-Status: **NOT QUALIFIED — strict acceptance rejected** (2026-11-06).
+Status: **NOT QUALIFIED — corrected containment bar still fails** (2026-11-06).
 
-The implementation is additive. Existing queries retain their behavior, and
-`BakeConfig::links` defaults to `None`. No existing golden file has been edited.
-Default-output checks passed: native and WASI determinism retained all 3,116
-default and 27 corrected golden digests. Fresh parity against the clean, pinned
-C++ reference matched 38,272 records per reference width: 76,544 records across
-42 files for 32-bit and 64-bit references, with zero differences.
+The corrected quantized-portal test passes, but the complete corpus sweep exposes
+interior segment failures that the previous stop-at-first-error driver never
+reached. 12 of 21 cases exit zero. Failing cases and cases with no
+complete baseline pairs remain unqualified. Experimental queries and traversal
+extraction remain opt-in; extraction still defaults to `None`.
 
-The host regression, lint, no_std, documentation, minimum-toolchain, WASI and
-fuzz-build gates passed. These results qualify default preservation on the
-exercised configurations, not the new features. AArch64 runtime CI was not run.
-The measured counterexample below prevents satisfying all strict acceptance
-requirements simultaneously while retaining existing default outputs. The
-implementation remains experimental; no acceptance threshold was relaxed.
+## Corrected contract and harness
 
-## Implemented API
+Never-longer compares only against a complete funnel path whose segment starts
+belong to their assigned polygons and whose every segment passes raycast.
+Checking the start is necessary: raycast assumes that precondition and can
+otherwise return completion for a quantized corner outside its assigned polygon.
+Invalid baselines are counted and excluded from the length comparison; the
+candidate is still checked for containment and deterministic repetition.
 
-- `QueryFilter::uniform_cost()` defaults to `None`; `DefaultFilter` opts in when
-  every configured area has the same finite positive multiplier.
-- `AnyAnglePoint`, `AnyAnglePath`, `AnyAngleSearch::{begin,resume}`, and
-  `NavMeshQuery::find_any_angle_path`: root/interval search in xz, detail-surface
-  heights, deterministic queue ordering, expansion budgets, bounded retained
-  states, mesh ownership checks and touched-tile removal checks. Search errors
-  are terminal. Allocated search storage is reported separately from results.
-- `BakeConfig::links: Option<LinkExtraction>`, `LinkLimits`, `LinkKind`, and
-  `ExtractedLink`: boundary sampling, drop/jump/climb clearance checks, caller
-  flags/areas, generated connections installed in DNAV and exposed on `Tile` and
-  `TileOutput`. Extraction runs after detail generation as a separate job stage.
-  Its reach widens the source/dependency halo and participates in configuration
-  hashing; the disabled configuration retains its previous hash sequence.
+A raycast segment is contained when `t >= 1 - 1e-6`. This is an endpoint tolerance,
+not a spatial tolerance for interior hits. The sweep records 15 candidate queries
+using it across 17 segments, and 25 baseline segments using it. Counts include
+otherwise failing queries or baselines; they are not qualification counts.
+There are 25 invalid baselines. All independent length comparisons retain
+an absolute `1e-4` tolerance.
 
-## Recorded verification
+The driver checks at most 32 deterministic consecutive random endpoint pairs per
+case (fewer when configured). Incomplete or disconnected baseline pairs are
+reported as skipped, never passing paths. It now continues after counterexamples.
+Off-mesh rejections remain typed `Unsupported` and visible as rejected queries;
+they are not silently counted as ground-path passes.
 
-The initial workspace check exited 101 on six new test-call argument-order
-errors, subsequently corrected. The table records the later suite; exit codes
-are observations, not a substitute for the remaining qualification proofs.
+## Corpus results
+
+The native run uses `libm`; WASI uses the same feature and case inputs. `Q/F/S`
+means qualified pairs, rejected pairs (including typed restrictions) and skipped
+pairs. `T` counts candidate queries
+using the endpoint tolerance. A matching digest from a failed case proves only
+repeatability of its accepted subset, not complete qualification.
+
+| Case | Native Q/F/S | Invalid baseline | T | Native exit | WASI Q/F/S | WASI exit |
+| --- | --- | ---: | ---: | ---: | --- | ---: |
+| `corridors_solo` | 32/0/0 | 0 | 0 | 0 | 32/0/0 | 0 |
+| `degenerate_solo` | 15/1/0 | 2 | 0 | 1 | 15/1/0 | 1 |
+| `dungeon_solo` | 14/10/8 | 4 | 1 | 1 | 14/10/8 | 1 |
+| `dungeon_tilecache` | 8/12/12 | 5 | 0 | 1 | 8/12/12 | 1 |
+| `dungeon_tiled` | 7/22/3 | 9 | 0 | 1 | 7/22/3 | 1 |
+| `public_solo_fixture` | 12/0/20 | 0 | 2 | 0 | 12/0/20 | 0 |
+| `islands_offmesh` | 3/6/23 | 0 | 0 | 1 | 3/6/23 | 1 |
+| `multilevel_solo` | 32/0/0 | 0 | 0 | 0 | 32/0/0 | 0 |
+| `multilevel_tilecache` | 20/0/4 | 0 | 1 | 0 | 20/0/4 | 0 |
+| `nav_test_areas` | 3/0/29 | 0 | 0 | 0 | 3/0/29 | 0 |
+| `nav_test_solo` | 8/0/24 | 0 | 3 | 0 | 8/0/24 | 0 |
+| `nav_test_tiled` | 5/5/22 | 3 | 0 | 1 | 5/5/22 | 1 |
+| `queued_tilecache` | 20/0/4 | 0 | 1 | 0 | 20/0/4 | 0 |
+| `seams_tilecache` | 32/0/0 | 0 | 2 | 0 | 32/0/0 | 0 |
+| `seams_tiled` | 32/0/0 | 0 | 1 | 0 | 32/0/0 | 0 |
+| `slopes_solo` | 16/0/0 | 0 | 0 | 0 | 16/0/0 | 0 |
+| `stairs_monotone` | 30/0/2 | 0 | 2 | 0 | 30/0/2 | 0 |
+| `terrain_large_solo` | 0/0/32 | 0 | 0 | 1 | 0/0/32 | 1 |
+| `terrain_large_tiled` | 0/0/32 | 0 | 0 | 1 | 0/0/32 | 1 |
+| `terrain_small_tiled` | 19/13/0 | 2 | 0 | 1 | 19/13/0 | 1 |
+| `undulating_crowd` | 32/0/0 | 0 | 2 | 0 | 32/0/0 | 0 |
+
+## Decisive containment witness and rejected repair
+
+In `dungeon_solo`, query 4 segment 2 runs from
+`[1.9847851, 10.197294, -9.941269]` to
+`[1.9847851, 10.197294, -31.241272]`. Its raycast stops at
+`t = 0.92957747`, well before the allowed endpoint window. The alternative
+polygon containing the departure produces the same interior stop. Other dungeon
+queries reproduce this leg in both directions. Query 26 separately starts its
+last leg from a polygon that yields `t = 0`; alternative departure polygons can
+raycast that leg successfully. These are distinct from the old query 2 endpoint
+hit at `0.99999994`, which the corrected tolerance accepts.
+
+A result-finalization attempt that split legs at ray hits and searched adjacent
+containing polygons improved only one of the ten dungeon failures. Nine remained;
+that repair was removed. Collapsing root height out of the xz state identity did
+not reduce the recorded expansion count in this probe and was also removed.
+The final implementation retains neither attempted change. Further numeric and
+corridor reconstruction work is required; the measured interior failures cannot
+be admitted by the corrected endpoint rule. Qualification is rejected at this
+bar, and unfinished proofs below remain unfinished.
+
+## Exact references and typed traversal restriction
+
+The ordinary test suite now includes the quantized-portal qualification. Its
+independent analytic optimum is `28.681541692`; the interval result is
+`28.681541443`. The shorter funnel, `28.676330566`, has a corner outside the middle
+rectangle and is an invalid baseline. Default funnel output is preserved.
+
+The independent f64 visibility graph passes 192 routes on 64 deterministic
+jittered meshes of strictly convex, non-rectilinear quadrilaterals, plus the
+existing eleven rectilinear queries. Convex segment visibility uses independent
+half-plane clipping and union coverage, without runtime adjacency or raycasts.
+The analytic three-tile test also remains within `1e-4`.
+
+The independent external length oracle reports:
+
+- `nav_test_solo`: export rejected overlapping projected vertices; no valid external length comparison.
+- `dungeon_solo`: `oracle=polyanya-0.18.0 queries=24 max_absolute_error=0.0000076293945`.
+- `corridors_solo`: `oracle=polyanya-0.18.0 queries=32 max_absolute_error=0`.
+- `slopes_solo`: `oracle=polyanya-0.18.0 queries=16 max_absolute_error=0`.
+
+These external comparisons include candidates that fail the separate containment
+bar. Length agreement does not certify their geometry. Complete solo-corpus
+external-oracle coverage remains unqualified.
+
+Passable off-mesh neighbours encountered during expansion return
+`Error::Unsupported`, even if a ground-only route exists. Encounter order is the
+deterministic search order. Callers requiring ground-only queries must filter
+out off-mesh polygons; this version does not compare their costs with ground
+routes. Both query entry points document this conservative typed restriction.
+Internal clipped portal endpoints obtain height from the nearest detail boundary;
+caller endpoints retain strict validation.
+
+## Extraction clearance and remaining extraction proof
+
+Clearance now uses a continuous swept square of half-width `walkable_radius`,
+including departure, landing and the vertical legs of raised jumps, drops and
+climbs. The square encloses a cylindrical agent and can conservatively reject
+corner contacts. Solid spans are expanded by the body dimensions, then intersected
+against the continuous trajectory in f64; there are no half-cell temporal gaps.
+
+An independent exhaustive plane-partition calculation agrees on 3,072 trajectories
+at three radii. A stationary side-obstacle witness passes the former centre-line
+check but fails the radius check. Existing slab tests verify installed metadata,
+job/serial equality and dirty/full rebakes; parallel runs exercise 1, 4 and 16
+threads. Native and WASI extraction digests are compared in the receipts.
+
+**Not completed:** independent brute-force comparison of complete generated link
+sets on a corpus subset. The clearance oracle is not that proof. Halo landings
+still lack local target polygon IDs and remain separate. The minimum-height rule
+still excludes equal-height gap jumps. No fuzz sources were edited or executed.
+
+## Diagnostic query costs
+
+Shared-host monotonic wall time with logical CPU 2 affinity. Each pair is warmed,
+then measured four times in alternating baseline/candidate order. Means below
+include every timed pair, including paths subsequently rejected for containment;
+failed untimed warmups are excluded. Timing includes each query's allocations,
+not qualification raycasts. Peak storage and expansion totals cover returned
+paths; storage on typed failures is unmeasured. This is cost disclosure, not performance acceptance.
+
+| Case | Timed pairs | Funnel us/query | Interval us/query | Expanded states | Peak search bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `corridors_solo` | 32 | 2.551 | 19.795 | 397 | 313344 |
+| `degenerate_solo` | 16 | 3.450 | 98.528 | 1477 | 362496 |
+| `dungeon_solo` | 24 | 7.384 | 727.836 | 14813 | 663552 |
+| `dungeon_tilecache` | 8 | 4.712 | 107.452 | 898 | 315392 |
+| `dungeon_tiled` | 7 | 2.502 | 23.831 | 201 | 288768 |
+| `public_solo_fixture` | 12 | 1.707 | 10.265 | 87 | 275456 |
+| `islands_offmesh` | 3 | 1.286 | 11.181 | 3 | 262592 |
+| `multilevel_solo` | 32 | 2.365 | 34.413 | 1614 | 315392 |
+| `multilevel_tilecache` | 20 | 3.502 | 203.194 | 4347 | 466944 |
+| `nav_test_areas` | 3 | 2.078 | 10.686 | 21 | 269312 |
+| `nav_test_solo` | 8 | 2.597 | 19.257 | 195 | 288768 |
+| `nav_test_tiled` | 6 | 3.463 | 179.284 | 1280 | 475136 |
+| `queued_tilecache` | 20 | 3.488 | 200.715 | 4347 | 466944 |
+| `seams_tilecache` | 32 | 2.161 | 12.022 | 365 | 290816 |
+| `seams_tiled` | 32 | 2.171 | 13.357 | 345 | 288768 |
+| `slopes_solo` | 16 | 2.245 | 12.764 | 204 | 288768 |
+| `stairs_monotone` | 30 | 2.869 | 96.380 | 4768 | 364544 |
+| `terrain_large_solo` | 0 | unmeasured | unmeasured | 0 | 0 |
+| `terrain_large_tiled` | 0 | unmeasured | unmeasured | 0 | 0 |
+| `terrain_small_tiled` | 20 | 17.928 | 770.982 | 12960 | 1064960 |
+| `undulating_crowd` | 32 | 4.267 | 56.611 | 1660 | 376832 |
+
+IBS outcome (full receipt retained externally):
+
+The initial IBS attempt used an unsupported per-thread mode. The system-wide
+retry was denied by performance-monitoring permissions. No symbol report was
+produced: function-level cost attribution remains unmeasured, and wall-time
+totals do not establish where it goes.
+
+Extraction cost receipt:
+
+```text
+test extraction_costs ... fixture=two_slabs repeats=16 default_ns=2976595 extraction_ns=5276417 default_dnav_bytes=828 extraction_dnav_bytes=1140 links=2
+```
+
+## Exit codes and preservation
 
 | Check | Exit |
 | --- | ---: |
-| `format` | 0 |
-| `format-fuzz` | 0 |
-| `source-pin` | 0 |
-| `focused` | 0 |
 | `fmt` | 0 |
 | `clippy-default` | 0 |
 | `clippy-parallel` | 0 |
@@ -61,14 +201,23 @@ are observations, not a substitute for the remaining qualification proofs.
 | `msrv` | 0 |
 | `public-text` | 0 |
 | `determinism` | 0 |
+| `budgets-solo` | 0 |
+| `budgets-tiled` | 0 |
+| `determinism-wasi` | 0 |
 | `release` | 0 |
-| `binary-pin` | 0 |
-| `any-angle-nav_test_solo` | 1 |
-| `any-angle-dungeon_solo` | 1 |
-| `any-angle-corridors_solo` | 0 |
-| `any-angle-multilevel_solo` | 0 |
-| `any-angle-slopes_solo` | 0 |
-| `any-angle-seams_tiled` | 1 |
+| `export-nav_test_solo` | 1 |
+| `external-nav_test_solo` | 1 |
+| `export-dungeon_solo` | 1 |
+| `external-dungeon_solo` | 0 |
+| `export-corridors_solo` | 0 |
+| `external-corridors_solo` | 0 |
+| `export-slopes_solo` | 0 |
+| `external-slopes_solo` | 0 |
+| `extraction-costs` | 0 |
+| `wasi-focused` | 0 |
+| `new-feature-digests` | 1 |
+| `ibs` | 255 |
+| `parity-release` | 0 |
 | `records-corridors_solo` | 0 |
 | `records-degenerate_solo` | 0 |
 | `records-dungeon_solo` | 0 |
@@ -90,53 +239,8 @@ are observations, not a substitute for the remaining qualification proofs.
 | `records-terrain_large_tiled` | 0 |
 | `records-terrain_small_tiled` | 0 |
 | `records-undulating_crowd` | 0 |
-| `parity` | 1 |
-| `budget-solo` | 0 |
-| `budget-tiled` | 0 |
-| `fuzz-build` | 0 |
-| `fuzz-links-build` | 0 |
-| `determinism-wasi` | 0 |
-| `wasi-tests` | 0 |
-| `external-oracle-build` | 0 |
-| `export-nav_test_solo` | 1 |
-| `external-nav_test_solo` | 1 |
-| `export-dungeon_solo` | 1 |
-| `external-dungeon_solo` | 0 |
-| `export-corridors_solo` | 0 |
-| `external-corridors_solo` | 0 |
-| `export-slopes_solo` | 0 |
-| `external-slopes_solo` | 0 |
-| `any-angle-wasi-nav_test_solo` | 1 |
-| `any-angle-wasi-dungeon_solo` | 1 |
-| `any-angle-wasi-corridors_solo` | 1 |
-| `any-angle-wasi-multilevel_solo` | 1 |
-| `any-angle-wasi-slopes_solo` | 1 |
-| `any-angle-wasi-seams_tiled` | 1 |
-| `extraction-costs` | 0 |
-| `new-feature-digests` | 1 |
-| `fuzz-incremental-build` | 0 |
-| `partial-portal-qualification` | 101 |
-| `record-results` | 0 |
-| `public-text-final` | 0 |
-| `public-text-verified` | 0 |
-| `any-angle-wasi-nav_test_solo-corrected` | 1 |
-| `any-angle-wasi-dungeon_solo-corrected` | 1 |
-| `any-angle-wasi-corridors_solo-corrected` | 0 |
-| `any-angle-wasi-multilevel_solo-corrected` | 0 |
-| `any-angle-wasi-slopes_solo-corrected` | 0 |
-| `any-angle-wasi-seams_tiled-corrected` | 1 |
-| `cpp-config` | 0 |
-| `cpp-build` | 0 |
-| `cpp-binary-pin` | 0 |
-| `cpp-records` | 0 |
-| `parity-cpp` | 0 |
-| `supported-digests` | 0 |
-| `record-results-corrected` | 0 |
-| `public-text-corrected` | 0 |
-| `cpp32-build` | 0 |
-| `release32` | 0 |
-| `binary32-pin` | 0 |
-| `cpp32-records` | 0 |
+| `parity` | 0 |
+| `parity32-release` | 0 |
 | `records32-corridors_solo` | 0 |
 | `records32-degenerate_solo` | 0 |
 | `records32-dungeon_solo` | 0 |
@@ -158,124 +262,23 @@ are observations, not a substitute for the remaining qualification proofs.
 | `records32-terrain_large_tiled` | 0 |
 | `records32-terrain_small_tiled` | 0 |
 | `records32-undulating_crowd` | 0 |
-| `parity-cpp32` | 0 |
-| `retained-binary-pins` | 0 |
+| `parity32` | 0 |
+| `public-text-final` | 0 |
+| `fmt-final` | 0 |
+| `diff-check` | 0 |
+| `fuzz-unchanged` | 0 |
+| `unchanged-contracts` | 0 |
+| `corpus-unchanged` | 0 |
+| `ibs-system` | 255 |
+| `public-text-delivery` | 0 |
 
-Timing below is diagnostic shared-host wall time with logical CPU 2 affinity.
-Each query pair is warmed and then measured four times in alternating order;
-the totals include all attempted pairs, including failures. No speed threshold
-or dedicated-host performance qualification is asserted.
+Default golden files and existing query behavior were not changed. The native
+and WASI determinism receipts test the 3,116 default and 27 corrected records.
+Fresh native parity matches the retained pinned references in both widths:
+76,544 records across 42 files, zero differences. AArch64 runtime execution was
+not performed. A passing regression or
+matching partial digest does not override the failed new-feature containment bar.
 
-| Native case | Validated | Failures | Maximum length ratio | Expanded | Peak search bytes | Baseline total ms | Interval total ms |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `corridors_solo` | 32 | 0 | 1.00000000 | 397 | 313344 | 0.287 | 2.529 |
-| `dungeon_solo` | 2 | 1 | 1.00000000 | 426 | 368640 | 0.064 | 2.280 |
-| `multilevel_solo` | 32 | 0 | 1.00000000 | 1614 | 315392 | 0.393 | 8.468 |
-| `nav_test_solo` | 0 | 1 | 0.96222180 | 111 | 288768 | 0.027 | 0.553 |
-| `seams_tiled` | 13 | 1 | 1.00000000 | 167 | 276480 | 0.173 | 1.466 |
-| `slopes_solo` | 16 | 0 | 1.00000000 | 204 | 288768 | 0.199 | 1.395 |
-
-| Extraction fixture | Repeats | Default total ms | Extraction total ms | Default DNAV bytes | Extraction DNAV bytes | Links |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Two slabs | 16 | 5.083 | 8.944 | 828 | 1140 | 2 |
-
-Missing metrics are unmeasured. A nonzero check remains a failure even when
-its log contains some passing queries or a digest. The external receipts retain
-full logs and earlier failures. Fuzz campaigns were not run.
-
-## Qualification harness and remaining limits
-
-Eleven independent visibility-graph queries and the analytic three-tile check
-meet the exact-length tolerance. The separate external oracle agrees on 51
-returned lengths (32 corridor, 16 slope and three dungeon samples), with maximum
-reported absolute error zero. One dungeon candidate separately fails strict
-containment; these 51 comparisons establish length agreement only.
-
-Three complete corpus cases pass all checks for 80 query pairs. Their native
-and WASI digests match, as does the extraction fixture digest. The remaining
-three attempted cases fail strict raycast containment near segment endpoints
-(`t = 0.99999994`, and one `0.9999998`). Identical baseline segments reproduce
-the endpoint failures in two cases; that does not turn either failure into a
-pass. Full corpus acceptance and new-feature determinism remain rejected.
-
-The earlier `parity` exit 1 compared against a directory without record files;
-the fresh `parity-cpp` and `parity-cpp32` checks supersede that harness failure.
-The first WASI corpus invocations used unresolved relative case paths; the
-`-corrected` checks use absolute inputs and reproduce the native outcomes.
-Earlier receipts remain preserved. The `supported-digests` exit 0 covers only
-the three passing cases plus extraction; `new-feature-digests` is not a pass.
-
-The new correctness tests include an independent visibility-graph oracle on
-small rectilinear obstacle meshes, comparison with A* plus funnel, segment
-containment, partial portals, stacked disconnected floors, portal-boundary
-endpoints, one-expansion resumes and mesh changes. Extraction tests cover
-metadata, installed connections, serial/job equivalence, dirty/full rebakes and
-thread counts 1, 4 and 16. Their execution outcomes are reported above; these focused fixtures do not establish the remaining corpus proofs.
-
-The corpus driver adds `nav-port verify-any-angle <case>` with alternating
-baseline/candidate timings on identical endpoints, segment raycasts, path-length
-checks, expansion/storage counts and deterministic digests. The separate external
-oracle adapter rejects overlapping projected vertices and tile portals rather
-than merging their topology. Its execution outcome is reported above. This is not yet the
-complete small-mesh/random-convex oracle proof required for qualification.
-
-Known restrictions requiring review:
-
-1. Passable off-mesh traversal encountered before settling a ground path is
-   rejected conservatively; this is stricter than rejecting only necessary
-   off-mesh corridors. Non-observable successors retain extra endpoint states
-   instead of implementing the paper's full tautness/corner pruning.
-2. Extraction checks sampled solid-span clearance and vertical endpoint travel;
-   it has not established a swept-radius clearance proof or the independent
-   brute-force corpus comparison. Halo landings lack local target polygon IDs
-   and are kept separate instead of merging across an unknown target polygon.
-   The specified minimum-height rule applies to every kind, so equal-height gap
-   jumps are excluded.
-3. The independent exact tests currently use rectilinear meshes. The full solo
-   corpus, random convex meshes, complete external-oracle agreement, full
-   new-feature native/WASI digests and corpus-wide never-longer invariant are
-   unqualified. The independent brute-force extraction corpus proof is also
-   deferred. Focused passing samples do not replace these missing proofs.
-
-Fuzz target sources `any_angle_query` and `link_extract` were added. The existing
-incremental-bake target can enable extraction. Build outcomes are listed above; no campaigns have been run.
-
-## Measured blocking counterexample
-
-`quantized_portal_never_longer_qualification` constructs three flat tiles. The
-middle rectangle covers x = 10..20, z = 3..7; the outer rectangles cover z =
-0..10. Endpoints are (1, 0.5) and (29, 0.5) in xz.
-
-| Reference | xz length |
-| --- | ---: |
-| Independent analytic optimum over the closed walkable rectangles | 28.681541692 |
-| Interval search, with portals intersected with receiving polygons | 28.681541443 |
-| Detour path plus funnel | 28.676330566 |
-
-The interval path passes the `1e-4` exact-reference check and every strict
-segment raycast. The funnel uses (10, 2.980392), outside the receiving polygon,
-then (20, 3): the segment between them lies below the middle rectangle. Link
-quantization gives the first portal endpoints z = 6.980392 and 2.980392.
-
-The explicit strict never-longer qualification exits **101**. An on-mesh shortest
-path cannot also be no longer than this shorter off-mesh baseline. The search
-keeps the receiving-polygon intersection; default Detour output is preserved.
-This is a failed acceptance bar, not an accepted approximation. The fixture is
-ignored by ordinary tests and explicitly executed as a separate mandatory
-qualification check, so green regression tests do not imply qualification.
-
-Reproduce this failed bar explicitly with
-`cargo test --test any_angle quantized_portal_never_longer_qualification -- --ignored --exact --nocapture`.
-
-Corpus cases stop at their first counterexample. A failure during untimed warmup
-has no timed comparison. External length-oracle inputs may include candidates
-that failed a separate containment check; agreement there proves only length
-agreement on those samples.
-
-## Sources
-
-The interval model and heuristic derive from the
-[IJCAI 2017 paper](https://doi.org/10.24963/ijcai.2017/70).
-The separate comparison oracle uses the MIT/Apache-2.0
-[`polyanya` library](https://github.com/vleue/polyanya); its source was not
-translated into the implementation.
+The full earlier report, failed attempts, exact commands, source and binary pins,
+case logs and this report's receipts are retained externally. No Git state was
+mutated. The temporary build target is removed after verification.

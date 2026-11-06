@@ -19,6 +19,8 @@ pub struct LinkLimits {
 }
 
 /// Opt-in extraction settings. Indices in `area_ids` and `flags` are drop, jump, climb.
+/// Clearance uses a continuous swept square of half-width `walkable_radius`,
+/// conservatively enclosing a cylindrical agent; corner contacts may reject links.
 /// Every kind requires an absolute height change greater than `walkable_climb`;
 /// in particular, equal-height gap jumps are excluded by this minimum-height rule.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -130,6 +132,10 @@ fn column(h: &CompactHeightfield, p: [f32; 3]) -> Option<usize> {
     }
 }
 
+// Continuous swept box with square horizontal radius. This conservatively
+// encloses a cylindrical agent: a corner contact may reject a safe cylinder,
+// but no span intersecting the cylinder can escape the test.
+#[allow(clippy::too_many_arguments)]
 fn clear(
     ws: &mut Workspace,
     solid: &Heightfield,
@@ -137,33 +143,49 @@ fn clear(
     b: [f32; 3],
     lift: f32,
     height: f32,
+    radius: f32,
 ) -> Result<bool, Error> {
-    let dx = b[0] - a[0];
-    let dz = b[2] - a[2];
-    let horizontal = dx.abs().max(dz.abs()) / solid.cs;
-    let vertical = (b[1] - a[1]).abs() / solid.ch;
-    let steps = ceilf(horizontal.max(vertical) * 2.0).max(1.0);
-    if !steps.is_finite() || steps > i32::MAX as f32 {
-        return Err(Error::SizeOverflow);
+    let min_x = floorf((a[0].min(b[0]) - radius - solid.bmin[0]) / solid.cs) as i32;
+    let max_x = floorf((a[0].max(b[0]) + radius - solid.bmin[0]) / solid.cs) as i32;
+    let min_z = floorf((a[2].min(b[2]) - radius - solid.bmin[2]) / solid.cs) as i32;
+    let max_z = floorf((a[2].max(b[2]) + radius - solid.bmin[2]) / solid.cs) as i32;
+    if min_x < 0 || min_z < 0 || max_x >= solid.width || max_z >= solid.height {
+        return Ok(false);
     }
-    let n = steps as usize;
-    // The departure and landing are included. Each half-cell step checks the full
-    // swept body's vertical extent; solid spans remain available after erosion.
-    for i in 0..=n {
-        ws.work(1)?;
-        let t = i as f32 / n as f32;
-        let x = floorf((a[0] + dx * t - solid.bmin[0]) / solid.cs) as i32;
-        let z = floorf((a[2] + dz * t - solid.bmin[2]) / solid.cs) as i32;
-        if x < 0 || z < 0 || x >= solid.width || z >= solid.height {
-            return Ok(false);
-        }
-        let y = a[1] + (b[1] - a[1]) * t + lift;
-        for span in solid.column((x + z * solid.width) as usize) {
+    for z in min_z..=max_z {
+        for x in min_x..=max_x {
             ws.work(1)?;
-            let lo = solid.bmin[1] + span.smin as f32 * solid.ch;
-            let hi = solid.bmin[1] + span.smax as f32 * solid.ch;
-            if hi > y && lo < y + height {
-                return Ok(false);
+            for span in solid.column((x + z * solid.width) as usize) {
+                ws.work(1)?;
+                let lo = [
+                    solid.bmin[0] as f64 + x as f64 * solid.cs as f64 - radius as f64,
+                    (solid.bmin[1] + span.smin as f32 * solid.ch) as f64 - height as f64,
+                    solid.bmin[2] as f64 + z as f64 * solid.cs as f64 - radius as f64,
+                ];
+                let hi = [
+                    solid.bmin[0] as f64 + (x + 1) as f64 * solid.cs as f64 + radius as f64,
+                    (solid.bmin[1] + span.smax as f32 * solid.ch) as f64,
+                    solid.bmin[2] as f64 + (z + 1) as f64 * solid.cs as f64 + radius as f64,
+                ];
+                let mut enter = 0.0f64;
+                let mut exit = 1.0f64;
+                let mut overlaps = true;
+                for axis in 0..3 {
+                    let origin = (a[axis] + if axis == 1 { lift } else { 0.0 }) as f64;
+                    let delta = b[axis] as f64 - a[axis] as f64;
+                    if delta == 0.0 {
+                        // Boundary contact is allowed; positive volume is blocked.
+                        overlaps &= origin > lo[axis] && origin < hi[axis];
+                    } else {
+                        let u = (lo[axis] - origin) / delta;
+                        let v = (hi[axis] - origin) / delta;
+                        enter = enter.max(u.min(v));
+                        exit = exit.min(u.max(v));
+                    }
+                }
+                if overlaps && enter < exit {
+                    return Ok(false);
+                }
             }
         }
     }
@@ -307,22 +329,52 @@ pub(super) fn extract(
                                 let raised_start =
                                     [start[0], start[1] + limits.clearance, start[2]];
                                 let raised_end = [end[0], end[1] + limits.clearance, end[2]];
-                                clear(ws, solid, start, raised_start, 0.0, c.walkable_height)?
-                                    && clear(ws, solid, end, raised_end, 0.0, c.walkable_height)?
-                                    && clear(
-                                        ws,
-                                        solid,
-                                        start,
-                                        end,
-                                        limits.clearance,
-                                        c.walkable_height,
-                                    )?
+                                clear(
+                                    ws,
+                                    solid,
+                                    start,
+                                    raised_start,
+                                    0.0,
+                                    c.walkable_height,
+                                    c.walkable_radius,
+                                )? && clear(
+                                    ws,
+                                    solid,
+                                    end,
+                                    raised_end,
+                                    0.0,
+                                    c.walkable_height,
+                                    c.walkable_radius,
+                                )? && clear(
+                                    ws,
+                                    solid,
+                                    start,
+                                    end,
+                                    limits.clearance,
+                                    c.walkable_height,
+                                    c.walkable_radius,
+                                )?
                             } else {
                                 let (upper, lower) =
                                     if dy < 0.0 { (start, end) } else { (end, start) };
                                 let over = [lower[0], upper[1], lower[2]];
-                                clear(ws, solid, upper, over, 0.0, c.walkable_height)?
-                                    && clear(ws, solid, lower, over, 0.0, c.walkable_height)?
+                                clear(
+                                    ws,
+                                    solid,
+                                    upper,
+                                    over,
+                                    0.0,
+                                    c.walkable_height,
+                                    c.walkable_radius,
+                                )? && clear(
+                                    ws,
+                                    solid,
+                                    lower,
+                                    over,
+                                    0.0,
+                                    c.walkable_height,
+                                    c.walkable_radius,
+                                )?
                             };
                             if !clear_path {
                                 continue;
@@ -373,4 +425,102 @@ fn flush(
         run.clear();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    // Independent exhaustive reference: collect every time the moving box crosses
+    // a span plane, then inspect each resulting open interval. Membership is
+    // constant between consecutive crossings; no temporal sampling gap remains.
+    fn brute(solid: &Heightfield, a: [f32; 3], b: [f32; 3], height: f32, radius: f32) -> bool {
+        for z in 0..solid.height {
+            for x in 0..solid.width {
+                for span in solid.column((x + z * solid.width) as usize) {
+                    let lo = [
+                        x as f64 - radius as f64,
+                        (span.smin as f32 * solid.ch) as f64 - height as f64,
+                        z as f64 - radius as f64,
+                    ];
+                    let hi = [
+                        (x + 1) as f64 + radius as f64,
+                        (span.smax as f32 * solid.ch) as f64,
+                        (z + 1) as f64 + radius as f64,
+                    ];
+                    let mut times = vec![0.0, 1.0];
+                    for axis in 0..3 {
+                        let delta = b[axis] as f64 - a[axis] as f64;
+                        if delta != 0.0 {
+                            for plane in [lo[axis], hi[axis]] {
+                                let t = (plane - a[axis] as f64) / delta;
+                                if t > 0.0 && t < 1.0 {
+                                    times.push(t);
+                                }
+                            }
+                        }
+                    }
+                    times.sort_by(f64::total_cmp);
+                    for pair in times.windows(2) {
+                        let t = (pair[0] + pair[1]) * 0.5;
+                        if (0..3).all(|axis| {
+                            let p = a[axis] as f64 + (b[axis] as f64 - a[axis] as f64) * t;
+                            p > lo[axis] && p < hi[axis]
+                        }) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    #[test]
+    fn swept_radius_matches_independent_plane_partition() -> Result<(), Error> {
+        let mut ws = Workspace::new();
+        let mut solid = Heightfield::new(&mut ws, 8, 8, [0.; 3], [8., 8., 8.], 1., 0.25)?;
+        for (x, z, lo, hi) in [(3, 3, 0, 16), (5, 4, 8, 12), (2, 6, 0, 6), (4, 2, 20, 24)] {
+            solid.add_span(&mut ws, x, z, lo, hi, 1, 0)?;
+        }
+        // Side collision is missed by centre-column tests, even for a stationary body.
+        assert!(clear(
+            &mut ws,
+            &solid,
+            [2.75, 1., 3.5],
+            [2.75, 1., 3.5],
+            0.,
+            1.,
+            0.
+        )?);
+        assert!(!clear(
+            &mut ws,
+            &solid,
+            [2.75, 1., 3.5],
+            [2.75, 1., 3.5],
+            0.,
+            1.,
+            0.5
+        )?);
+        let mut seed = 0x12345678u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            1. + (seed % 600) as f32 / 100.
+        };
+        for _ in 0..1024 {
+            let a = [random(), random(), random()];
+            let b = [random(), random(), random()];
+            for radius in [0., 0.25, 0.75] {
+                assert_eq!(
+                    clear(&mut ws, &solid, a, b, 0., 1., radius)?,
+                    brute(&solid, a, b, 1., radius),
+                    "{a:?} {b:?} radius {radius}"
+                );
+            }
+        }
+        Ok(())
+    }
 }

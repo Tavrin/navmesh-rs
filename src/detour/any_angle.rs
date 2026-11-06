@@ -298,6 +298,11 @@ fn contains(outer: [[f32; 3]; 2], inner: [[f32; 3]; 2]) -> bool {
 impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
     /// Validate endpoints and begin without expanding a node.
     /// Non-uniform costs and off-mesh endpoints return [`Error::Unsupported`].
+    /// A passable off-mesh neighbour encountered while expanding ground polygons
+    /// also returns `Unsupported`, even if a ground-only route exists. Which
+    /// neighbours are encountered depends on the deterministic search order;
+    /// callers requiring ground-only queries must filter out off-mesh polygons.
+    /// This version does not compare ground paths with off-mesh routes.
     pub fn begin(
         query: &NavMeshQuery<'_>,
         mut start: AnyAnglePoint,
@@ -613,7 +618,11 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
                         if !node.turns[side] {
                             continue;
                         }
-                        root[1] = surface_height(query, node.poly, root)?;
+                        // Clipped portal endpoints are rounded to f32. Height
+                        // lookup at the closest boundary point avoids requiring
+                        // exact collinearity after that rounding. Caller endpoints
+                        // still use the strict validation in begin.
+                        root[1] = query.closest_point_on_poly(node.poly, &root)?.0[1];
                         if same(root, node.root) {
                             continue;
                         }
@@ -636,6 +645,9 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
 }
 impl NavMeshQuery<'_> {
     /// Find an xz shortest path with a uniform-cost filter and no off-mesh edges.
+    /// Passable off-mesh neighbours encountered during expansion return
+    /// [`Error::Unsupported`], even if a ground-only route exists. See
+    /// [`AnyAngleSearch::begin`] for the filter contract.
     /// Use [`AnyAngleSearch`] to retain progress across exhausted budgets.
     pub fn find_any_angle_path<F: QueryFilter + ?Sized>(
         &self,

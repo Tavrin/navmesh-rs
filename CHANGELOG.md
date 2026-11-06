@@ -18,6 +18,17 @@ All notable changes to this project are documented in this file. The format foll
   on `Tile`/`TileOutput`, and extraction reach included in incremental halos and
   configuration hashes. Disabled extraction preserves the existing pipeline.
 
+### Changed
+
+- Any-angle qualification validates the funnel baseline before applying the
+  never-longer rule and accepts raycast hits at `t >= 1 - 1e-6` as endpoint
+  containment. Invalid baselines and tolerance use are counted separately.
+- Traversal extraction checks a continuous swept square enclosing the agent's
+  radius, including the vertical portions of drops, climbs and raised jumps.
+- Internal clipped portal roots use closest detail-surface height lookup after
+  rounding; caller endpoints retain strict validation.
+- The any-angle API documents its conservative `Unsupported` result when search
+  encounters a passable off-mesh neighbour, even when a ground route exists.
 
 ## [0.2.1] - 2026-11-05
 
