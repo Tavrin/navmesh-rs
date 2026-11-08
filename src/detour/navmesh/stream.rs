@@ -177,7 +177,10 @@ impl PreparedTile {
         self.tile.header.layer
     }
 
-    /// [`content_hash`] of the tile bytes.
+    /// [`content_hash`] of the prepared tile bytes, including layout provenance
+    /// added during preparation. For a nondefault layout this can differ from
+    /// the hash of the original untagged geometry. Replacement, unload and
+    /// residency retain this prepared identity.
     pub fn content_hash(&self) -> [u8; 32] {
         self.hash
     }
@@ -263,7 +266,7 @@ pub fn prepare_tile_with_layout(
 fn prepare_with_layout(
     layout: RefLayout,
     limits: Limits,
-    bytes: Vec<u8>,
+    mut bytes: Vec<u8>,
 ) -> Result<PreparedTile, Error> {
     let poly_bits = u32::from(layout.poly_bits);
     let h = peek_header(&bytes)?;
@@ -275,6 +278,7 @@ fn prepare_with_layout(
     if h.poly_count < 0 || h.poly_count as u64 > (1u64 << poly_bits) {
         return Err(Error::InvalidTileData(TileDataError::TooManyPolys));
     }
+    super::super::tile::tag_layout(&mut bytes, layout)?;
     let mut tile = MeshTile::parse_with_limits(bytes, &limits)?;
     tile.links_free_list = tile.reset_links();
     NavMesh::prepare_internal_links(&mut tile, 0);
@@ -284,7 +288,12 @@ fn prepare_with_layout(
 
 /// Checks a tile state blob against the ref and polygon count it will be applied
 /// to; returns the state's size.
-pub(super) fn check_state(tile: TileRef, polys: usize, data: &[u8]) -> Result<usize, Error> {
+pub(super) fn check_state(
+    tile: TileRef,
+    polys: usize,
+    data: &[u8],
+    layout: RefLayout,
+) -> Result<usize, Error> {
     let size = polys
         .checked_mul(super::TILE_POLY_STATE_SIZE)
         .and_then(|n| n.checked_add(super::TILE_STATE_HEADER_SIZE))
@@ -297,15 +306,50 @@ pub(super) fn check_state(tile: TileRef, polys: usize, data: &[u8]) -> Result<us
     if le_i32(0) != NAVMESH_STATE_MAGIC {
         return Err(Error::InvalidTileState(TileStateError::WrongMagic));
     }
-    if le_i32(4) != NAVMESH_STATE_VERSION {
-        return Err(Error::InvalidTileState(TileStateError::WrongVersion));
+    let version = le_i32(4);
+    let explicit = PolyRef::BITS == 64 && layout != RefLayout::default();
+    let prefix = match version {
+        NAVMESH_STATE_VERSION => {
+            if explicit {
+                return Err(Error::RefLayoutMismatch);
+            }
+            size
+        }
+        2 => {
+            let tag = data
+                .get(size..size + 4)
+                .ok_or(Error::InvalidTileState(TileStateError::TooShort))?;
+            if tag != [layout.salt_bits, layout.tile_bits, layout.poly_bits, 0] {
+                return Err(Error::RefLayoutMismatch);
+            }
+            size + 4
+        }
+        _ => return Err(Error::InvalidTileState(TileStateError::WrongVersion)),
+    };
+    // Bare restore also checks an unload footer if supplied.
+    if data.get(prefix..prefix + 4) == Some(&STREAM_STATE_MAGIC) {
+        let footer = &data[prefix..];
+        if footer.len() < 40 {
+            return Err(Error::InvalidTileState(TileStateError::TooShort));
+        }
+        if footer[4..8] == 3u32.to_le_bytes() {
+            if footer.get(40..44)
+                != Some(&[layout.salt_bits, layout.tile_bits, layout.poly_bits, 0])
+            {
+                return Err(Error::RefLayoutMismatch);
+            }
+        } else if footer[4..8] != 2u32.to_le_bytes() {
+            return Err(Error::InvalidTileState(TileStateError::WrongVersion));
+        } else if explicit {
+            return Err(Error::RefLayoutMismatch);
+        }
     }
     let mut stored = [0u8; (PolyRef::BITS / 8) as usize];
     stored.copy_from_slice(&data[8..super::TILE_STATE_HEADER_SIZE]);
     if PolyRef::from_le_bytes(stored) != tile {
         return Err(Error::InvalidTileState(TileStateError::WrongTile));
     }
-    Ok(size)
+    Ok(prefix)
 }
 
 /// Writes a checked state blob into a tile's polygons.
@@ -645,7 +689,7 @@ impl NavMesh {
             _ => target.salt,
         };
         let would = self.encode_poly_id(salt, target.ti as u32, 0);
-        let size = check_state(would, t.tile.polys.len(), state)?;
+        let size = check_state(would, t.tile.polys.len(), state, self.ref_layout())?;
         let (version, layout) = self.state_footer_kind();
         let expected = size
             .checked_add(STREAM_STATE_FOOTER + layout.map_or(0, |l| l.len()))

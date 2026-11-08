@@ -370,6 +370,7 @@ impl MeshTile {
         if total > data.len() {
             return Err(bad(TileDataError::BadSize));
         }
+        stored_layout(&data)?;
         check_limits(&h, data.len(), limits)?;
         // Every read below stays inside the sections, which fit `data` (checked above).
         let mut r = Reader {
@@ -564,4 +565,50 @@ impl MeshTile {
 #[cfg(feature = "recast")]
 pub(crate) fn check_bake_tile_limits(data: &[u8], limits: &Limits) -> Result<(), Error> {
     check_limits(&peek_header(data)?, data.len(), limits)
+}
+
+/// Optional provenance at the end of the canonical tile sections. Untagged
+/// geometry is default-layout when paired with a saved ref.
+pub(crate) fn stored_layout(data: &[u8]) -> Result<Option<super::RefLayout>, Error> {
+    let h = peek_header(data)?;
+    let at = Sections::of(&h)
+        .and_then(|s| s.total())
+        .ok_or(Error::InvalidTileData(TileDataError::BadSize))?;
+    if data.len() < at {
+        return Err(Error::InvalidTileData(TileDataError::BadSize));
+    }
+    let tail = &data[at..];
+    if !tail.is_empty() && tail.len() < 4 && b"NRFL".starts_with(tail) {
+        return Err(Error::RefLayoutMismatch);
+    }
+    if !tail.starts_with(b"NRFL") {
+        return Ok(None);
+    }
+    if tail.len() != 12 || tail[4..8] != 1u32.to_le_bytes() || tail[11] != 0 {
+        return Err(Error::RefLayoutMismatch);
+    }
+    Ok(Some(super::RefLayout::new(tail[8], tail[9], tail[10])))
+}
+
+/// Checks provenance before allocating and tags nondefault resident geometry so
+/// every byte export (including MeshTile::data) keeps its saved-ref provenance.
+pub(crate) fn tag_layout(data: &mut Vec<u8>, layout: super::RefLayout) -> Result<(), Error> {
+    if let Some(stored) = stored_layout(data)? {
+        if stored != layout {
+            return Err(Error::RefLayoutMismatch);
+        }
+    } else if PolyRef::BITS == 64 && layout != super::RefLayout::default() {
+        let h = peek_header(data)?;
+        let at = Sections::of(&h)
+            .and_then(|s| s.total())
+            .ok_or(Error::InvalidTileData(TileDataError::BadSize))?;
+        if data.len() != at {
+            return Err(Error::InvalidTileData(TileDataError::BadSize));
+        }
+        data.try_reserve(12).map_err(|_| Error::AllocationFailed)?;
+        data.extend_from_slice(b"NRFL");
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&[layout.salt_bits, layout.tile_bits, layout.poly_bits, 0]);
+    }
+    Ok(())
 }

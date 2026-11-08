@@ -727,3 +727,56 @@ fn failed_unload_preserves_obstacle_associations_across_hash_chain() {
         "removing the obstacle queued the retained tile"
     );
 }
+
+#[test]
+fn processor_cannot_retarget_cached_tile() {
+    struct Retarget(usize);
+    impl MeshProcess for Retarget {
+        fn process(&self, areas: &mut [u8], flags: &mut [u16]) {
+            DefaultMeshProcess.process(areas, flags);
+        }
+        fn configure<'a>(&'a self, p: &mut navmesh_rs::detour::NavMeshCreateParams<'a>) {
+            match self.0 {
+                0 => p.tile_x += 1,
+                1 => p.tile_y += 1,
+                _ => p.tile_layer += 1,
+            }
+        }
+    }
+    for field in 0..3 {
+        let mut n = nav(4);
+        let mut normal = TileCache::new(
+            params(4),
+            RawCompressor,
+            DefaultMeshProcess,
+            Limits::default(),
+        )
+        .unwrap();
+        let r = normal.add_tile(data(1)).unwrap();
+        normal.build_nav_mesh_tile(r, &mut n).unwrap();
+        let before = (n.epoch(), n.residency().to_bytes());
+        let mut c =
+            TileCache::new(params(4), RawCompressor, Retarget(field), Limits::default()).unwrap();
+        let r = c.add_tile(data(0)).unwrap();
+        assert_eq!(
+            c.build_nav_mesh_tile(r, &mut n),
+            Err(Error::TileCacheRetargeted)
+        );
+        assert_eq!((n.epoch(), n.residency().to_bytes()), before);
+    }
+}
+
+#[test]
+fn layer_header_short_odd_and_unaligned_inputs() {
+    let good = data(0);
+    for len in 0..56 {
+        assert!(LayerHeader::decode(&good[..len]).is_err());
+    }
+    let mut unaligned = vec![0];
+    unaligned.extend_from_slice(&good);
+    assert_eq!(LayerHeader::decode(&unaligned[1..57]).unwrap(), header(0));
+    assert_eq!(LayerHeader::decode(&good[..57]).unwrap(), header(0));
+    let mut bad = good;
+    bad[48] = 0;
+    assert!(LayerHeader::decode(&bad).is_err());
+}

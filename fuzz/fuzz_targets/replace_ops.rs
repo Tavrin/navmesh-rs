@@ -191,6 +191,9 @@ fuzz_target!(|data: &[u8]| {
                 if t.key() != (TileKey { x, y }) || t.layer() != 0 {
                     continue;
                 }
+                // Preparation adds persisted layout provenance. Model the bytes
+                // actually installed, whose hash unload and residency retain.
+                let bytes = t.tile().data.clone();
                 let out = if code == 1 {
                     let cost = nav.replace_cost(&t);
                     let mut budget = Budget::new(u64::from(arg & 31));

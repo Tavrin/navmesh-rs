@@ -23,6 +23,19 @@ All notable changes to this project are documented in this file. The format foll
   before.
 - `replace_ops` fuzz target.
 
+### Fixed
+
+- Persisted nondefault ref layouts now tag bare tile state (DNMS version 2)
+  and exported tile bytes (NRFL version 1 trailer). All restore paths check
+  provenance before mutation, including colliding numeric refs and bare restore
+  of unload state. Untagged legacy files mean default layout; default output is
+  unchanged. Old default files load; new readers reject unknown layouts.
+- Tile-cache processors cannot retarget a rebuild to another tile or layer.
+- Layer-header decoding and cache rebuild use checked or infallible conversions
+  instead of unwraps.
+- Document prepared content identity, including nondefault layout provenance,
+  and make the replacement property model retain those installed bytes.
+
 ### Changed
 
 - `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of

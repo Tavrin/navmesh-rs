@@ -1139,10 +1139,21 @@ impl NavMesh {
         let polys = usize::try_from(t.header.poly_count).map_err(|_| Error::InvalidRef)?;
         polys
             .checked_mul(TILE_POLY_STATE_SIZE)
-            .and_then(|n| n.checked_add(TILE_STATE_HEADER_SIZE))
+            .and_then(|n| {
+                n.checked_add(TILE_STATE_HEADER_SIZE + usize::from(self.has_explicit_layout()) * 4)
+            })
             .ok_or(Error::SizeOverflow)
     }
 
+    /// Persisted layout checks cover `restore_tile_state`, `restore_tile`,
+    /// `restore_tile_allow_stale`, `add_tile`, `prepare_tile`,
+    /// `prepare_tile_with_layout`, `commit`, `commit_budgeted`,
+    /// `commit_with_state`, `replace_tile`, `replace_tile_budgeted` and
+    /// `restore_residency` (also after `ResidencyRecord::from_bytes`). Untagged
+    /// legacy artifacts mean default layout; unknown layouts are rejected.
+    /// Nondefault state uses version 2 and four layout bytes after the polygons;
+    /// default state retains version 1 byte for byte.
+    ///
     /// Writes the state of a resident tile into `out` (`dtNavMesh::storeTileState`)
     /// and returns the bytes written, [`NavMesh::tile_state_size`].
     ///
@@ -1159,7 +1170,12 @@ impl NavMesh {
         }
         let t = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?;
         out[0..4].copy_from_slice(&NAVMESH_STATE_MAGIC.to_le_bytes());
-        out[4..8].copy_from_slice(&NAVMESH_STATE_VERSION.to_le_bytes());
+        let version = if self.has_explicit_layout() {
+            2
+        } else {
+            NAVMESH_STATE_VERSION
+        };
+        out[4..8].copy_from_slice(&version.to_le_bytes());
         out[8..TILE_STATE_HEADER_SIZE].copy_from_slice(&tile.to_le_bytes());
         for (p, s) in t
             .polys
@@ -1169,6 +1185,10 @@ impl NavMesh {
             s[0..2].copy_from_slice(&p.flags.to_le_bytes());
             s[2] = p.area();
             s[3] = 0;
+        }
+        if self.has_explicit_layout() {
+            let l = self.ref_layout();
+            out[size - 4..size].copy_from_slice(&[l.salt_bits, l.tile_bits, l.poly_bits, 0]);
         }
         Ok(size)
     }
@@ -1182,11 +1202,13 @@ impl NavMesh {
     /// resident tile; [`Error::InvalidTileState`] with
     /// [`TileStateError::TooShort`](crate::TileStateError::TooShort) when `data` is shorter than the tile's state,
     /// `WrongMagic`, `WrongVersion`, or `WrongTile` when the stored ref differs from
-    /// `tile`. Bytes after the state and the pad bytes are ignored. Area ids are
+    /// `tile`. Layout mismatches return [`Error::RefLayoutMismatch`]. A supplied
+    /// unload footer is also checked for layout. Other trailing bytes and pad
+    /// bytes are ignored. Area ids are
     /// masked to 6 bits, as `setPolyArea` does.
     pub fn restore_tile_state(&mut self, tile: TileRef, data: &[u8]) -> Result<(), Error> {
         let polys = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?.polys.len();
-        let size = stream::check_state(tile, polys, data)?;
+        let size = stream::check_state(tile, polys, data, self.ref_layout())?;
         let (_, it, _) = self.decode_poly_id(tile);
         let t = self
             .slots
@@ -1209,6 +1231,9 @@ impl NavMesh {
     /// saved navmesh with the same refs. The slot must be free, and either have
     /// never held a tile (any salt is accepted) or `tile_ref` must carry the slot's
     /// current salt, so a ref to a removed tile can never become valid again.
+    /// Bytes exported by nondefault meshes carry an NRFL layout trailer;
+    /// untagged bytes mean default layout. A different or unknown layout returns
+    /// [`Error::RefLayoutMismatch`] before mutation.
     /// Errors: [`Error::InvalidRef`] for a null ref, a ref with bits outside the
     /// layout, salt 0 or a stale salt; [`Error::NoFreeTile`] when the slot is out
     /// of range or in use; otherwise as [`NavMesh::add_tile`].
@@ -1237,6 +1262,10 @@ impl NavMesh {
         if tile_ref == 0 || !self.ref_in_layout(tile_ref) {
             return Err(Error::InvalidRef);
         }
+        let stored = super::tile::stored_layout(&data)?;
+        if stored.map_or(self.has_explicit_layout(), |l| l != self.ref_layout()) {
+            return Err(Error::RefLayoutMismatch);
+        }
         let (salt, idx, _) = self.decode_poly_id(tile_ref);
         if salt == 0 {
             return Err(Error::InvalidRef);
@@ -1244,7 +1273,7 @@ impl NavMesh {
         self.insert_tile(data, Placement::Restore { idx, salt, stale })
     }
 
-    fn insert_tile(&mut self, data: Vec<u8>, place: Placement) -> Result<TileRef, Error> {
+    fn insert_tile(&mut self, mut data: Vec<u8>, place: Placement) -> Result<TileRef, Error> {
         let h = peek_header(&data)?;
         if PolyRef::BITS == 32
             && (h.poly_count < 0 || self.poly_bits < ilog2(next_pow2(h.poly_count as u32)))
@@ -1257,6 +1286,7 @@ impl NavMesh {
         if h.poly_count < 0 || h.poly_count as u64 > (1u64 << self.poly_bits) {
             return Err(Error::InvalidTileData(TileDataError::TooManyPolys));
         }
+        super::tile::tag_layout(&mut data, self.ref_layout())?;
         // Find the slot (and its free-list predecessor) without changing anything, so
         // every check below can still fail with the navmesh untouched.
         let target = self.choose_slot(h.x, h.y, h.layer, place)?;
@@ -1452,7 +1482,8 @@ impl NavMesh {
     /// Removes a tile and returns the bytes it was added from (`removeTile`). The
     /// slot's salt is incremented, so refs to the removed tile no longer validate
     /// (see the salt exhaustion limit on [`NavMesh`]). All or nothing: on error the
-    /// navmesh is unchanged.
+    /// navmesh is unchanged. Nondefault-layout bytes include an NRFL provenance
+    /// trailer, which must be retained alongside saved refs.
     pub fn remove_tile(&mut self, r: TileRef) -> Result<Vec<u8>, Error> {
         let ti = self.resident_slot(r)?;
         let next = self.next_salt(self.slots[ti].salt)?;

@@ -1044,6 +1044,9 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             ..NavMeshCreateParams::default()
         };
         self.process.configure(&mut params);
+        if (params.tile_x, params.tile_y, params.tile_layer) != (h.tx, h.ty, h.tlayer) {
+            return Err(Error::TileCacheRetargeted);
+        }
         // Reserve a conservative bound for builder outputs and temporary arrays before entering Detour.
         let bound = nav_build_bound(&params)?;
         self.ws.charge_bytes::<u8>(bound)?;
@@ -1052,7 +1055,10 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
     }
     fn rebuild(&mut self, i: usize, nav: &mut NavMesh) -> Result<(), Error> {
         let data = self.build(i)?;
-        let h = self.tiles[i].header.as_ref().unwrap();
+        let h = self.tiles[i]
+            .header
+            .as_ref()
+            .ok_or(Error::InvalidInput("missing cached layer header"))?;
         match data {
             // Validated before the resident layer is touched.
             Some(data) => {
