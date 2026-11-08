@@ -47,17 +47,13 @@
 //!
 //! # Invalidation
 //!
-//! After a structural change ([`NavMesh::epoch`] moved), the next
-//! [`GoalField::step`] or [`GoalField::refresh`] compares the region's tiles with
-//! the ones the field was built from. A tile that was removed, unloaded or
-//! replaced makes its polygons unusable, and every polygon whose chain of next
-//! polygons passes through it as well (the field is stale from that tile
-//! outward); the remaining values are still served. A tile committed into the
-//! region invalidates nothing but can open shorter routes. Either way the field
-//! becomes [`FieldStatus::Stale`] and a fresh build starts, budgeted like the
-//! first one; when it completes it replaces the served values. With
-//! [`NavMesh::set_global_off_mesh_links`] on, any structural change rebuilds the
-//! field (a far tile can take over an off-mesh connection's landing).
+//! Every structural epoch change marks the whole field stale and starts a full,
+//! budgeted rebuild, including changes adjacent to the region and remote changes
+//! affecting global off-mesh links. Old values may be served during rebuilding;
+//! they are not exact. [`GoalField::freshness`] and [`GoalField::served_epoch`]
+//! distinguish them even before refresh. Exactness applies only to `Ready`
+//! fields whose served epoch matches the mesh. Lookups check current residency
+//! and salt, and never serve a dangling next reference. Steering reports freshness.
 //!
 //! # Steering
 //!
@@ -134,10 +130,10 @@ impl FieldRegion {
 pub enum FieldStatus {
     /// The first build is running; nothing is served yet.
     Building,
-    /// Values are complete for the current navmesh.
+    /// Values are complete for the last refreshed epoch; compare with the mesh
+    /// using [`GoalField::freshness`] before claiming exactness.
     Ready,
-    /// A structural change touched the region: values not affected by it are
-    /// served while a rebuild runs.
+    /// Previous, potentially inexact values are served while a full rebuild runs.
     Stale,
     /// The goal polygon is no longer resident; nothing is served. The field
     /// rebuilds if a later change brings the polygon back.
@@ -166,14 +162,6 @@ struct Layout {
     /// `(slot, index into tiles)`, sorted by slot.
     by_slot: Vec<(u32, u32)>,
     total: u32,
-}
-
-/// Result of comparing a layout with the navmesh.
-struct Changes {
-    /// Per layout tile: removed, unloaded or replaced.
-    lost: Vec<bool>,
-    /// Anything differs, including tiles added to a region column.
-    any: bool,
 }
 
 impl Layout {
@@ -245,43 +233,6 @@ impl Layout {
 
     fn bytes(&self) -> usize {
         self.tiles.capacity() * TILE_BYTES
-    }
-
-    /// Compares the tiles with the navmesh's current ones (`since`: the epoch the
-    /// layout was checked at; `all`: treat every tile as lost).
-    fn changes(&self, nav: &NavMesh, columns: &[TileKey], since: u64, all: bool) -> Changes {
-        let mut lost = vec![all; self.tiles.len()];
-        let mut any = all;
-        for c in columns {
-            let mut now: Vec<(i32, u32, PolyRef)> = nav
-                .tiles_at(c.x, c.y, usize::MAX)
-                .into_iter()
-                .filter_map(|s| {
-                    nav.tile(s)
-                        .map(|t| (t.header.layer, s as u32, nav.tile_ref(s)))
-                })
-                .collect();
-            now.sort_unstable();
-            let first = self.tiles.partition_point(|t| (t.x, t.y) < (c.x, c.y));
-            let mut count = 0;
-            for (i, t) in self.tiles[first..].iter().enumerate() {
-                if (t.x, t.y) != (c.x, c.y) {
-                    break;
-                }
-                count += 1;
-                let present = now
-                    .iter()
-                    .any(|&(l, s, b)| l == t.layer && s == t.slot && b == t.base);
-                if !present || nav.changed_since(since, &mut |s| s == t.slot) {
-                    lost[first + i] = true;
-                    any = true;
-                }
-            }
-            if now.len() != count {
-                any = true;
-            }
-        }
-        Changes { lost, any }
     }
 }
 
@@ -574,6 +525,8 @@ pub struct GoalField {
     goal: PolyRef,
     goal_pos: [f32; 3],
     columns: Vec<TileKey>,
+    region: FieldRegion,
+    served_epoch: Option<u64>,
     seen_epoch: u64,
     seen_global: bool,
     served: Option<Served>,
@@ -607,7 +560,12 @@ impl GoalField {
             identity: Arc::clone(nav.report_identity()),
             goal,
             goal_pos,
+            region: match region {
+                FieldRegion::Radius(r) => FieldRegion::Radius(*r),
+                FieldRegion::Tiles(_) => FieldRegion::Tiles(columns.clone()),
+            },
             columns,
+            served_epoch: None,
             seen_epoch: nav.epoch(),
             seen_global: nav.global_off_mesh_links(),
             served: None,
@@ -655,7 +613,15 @@ impl GoalField {
         let layout = Layout::resolve(nav, &columns)?;
         let estimate = (layout.total as usize)
             .checked_mul(SERVED_BYTES_PER_POLY + BUILD_BYTES_PER_POLY)
-            .and_then(|b| b.checked_add(layout.tiles.len().checked_mul(TILE_BYTES)?))
+            .and_then(|b| b.checked_add(layout.tiles.len().checked_mul(TILE_BYTES * 2)?))
+            // Columns, retained request, and the cache's two key copies.
+            .and_then(|b| {
+                b.checked_add(
+                    columns
+                        .capacity()
+                        .checked_mul(core::mem::size_of::<TileKey>() * 4)?,
+                )
+            })
             .ok_or(Error::SizeOverflow)?;
         Ok((columns, estimate))
     }
@@ -675,7 +641,8 @@ impl GoalField {
         &self.columns
     }
 
-    /// Where the field is in its life.
+    /// Where the field is in its life at the last refresh. Use
+    /// [`GoalField::freshness`] to check against the current mesh epoch.
     pub fn status(&self) -> FieldStatus {
         if self.lost {
             FieldStatus::GoalLost
@@ -695,7 +662,12 @@ impl GoalField {
 
     /// Bytes of heap memory the field holds now (served values and any build).
     pub fn bytes(&self) -> usize {
-        self.columns.capacity() * core::mem::size_of::<TileKey>()
+        (self.columns.capacity()
+            + match &self.region {
+                FieldRegion::Tiles(keys) => keys.capacity(),
+                FieldRegion::Radius(_) => 0,
+            })
+            * core::mem::size_of::<TileKey>()
             + self.served.as_ref().map_or(0, Served::bytes)
             + self.build.as_ref().map_or(0, Build::bytes)
     }
@@ -721,28 +693,27 @@ impl GoalField {
         if nav.epoch() == self.seen_epoch && global == self.seen_global {
             return Ok(false);
         }
-        let all = global || self.seen_global;
-        let mut restart = self.lost;
+        // Clear lost chains only as a validity optimization, never as an
+        // exactness proof. Every change restarts the entire build.
         if let Some(s) = &mut self.served {
-            let c = s.layout.changes(nav, &self.columns, self.seen_epoch, all);
-            if c.lost.iter().any(|&l| l) {
-                s.invalidate(&c.lost);
-            }
-            restart |= c.any;
-        }
-        if let Some(b) = &self.build {
-            restart |= b
+            let lost: Vec<bool> = s
                 .layout
-                .changes(nav, &self.columns, self.seen_epoch, all)
-                .any;
+                .tiles
+                .iter()
+                .map(|t| nav.tile_and_poly_by_ref(t.base).is_err())
+                .collect();
+            s.invalidate(&lost);
         }
+        self.build = None;
+        self.lost = true;
+        let columns = region_columns(nav, &self.goal_pos, &self.region)?;
+        let build = Build::start(nav, &columns, self.goal, &self.goal_pos)?;
+        self.columns = columns;
+        self.lost = build.is_none();
+        self.build = build;
         self.seen_epoch = nav.epoch();
         self.seen_global = global;
-        if restart {
-            self.build = Build::start(nav, &self.columns, self.goal, &self.goal_pos)?;
-            self.lost = self.build.is_none();
-        }
-        Ok(restart)
+        Ok(true)
     }
 
     /// Refreshes (see [`GoalField::refresh`]) and advances the build, if any, with
@@ -765,6 +736,7 @@ impl GoalField {
             return Ok(Progress::Exhausted);
         }
         if let Some(b) = self.build.take() {
+            self.served_epoch = Some(nav.epoch());
             self.served = Some(Served {
                 layout: b.layout,
                 goal: b.goal,
@@ -777,16 +749,39 @@ impl GoalField {
 
     /// Field index of `r` in the served values.
     fn served_index(&self, nav: &NavMesh, r: PolyRef) -> Option<(&Served, usize)> {
-        if !Arc::ptr_eq(&self.identity, nav.report_identity()) {
-            return None;
-        }
+        // Epoch-aware even before refresh: stale values remain usable, but the
+        // caller can distinguish them through freshness or the served epoch.
+        self.freshness(nav)?;
+        nav.tile_and_poly_by_ref(r).ok()?;
         let s = self.served.as_ref()?;
         let i = s.layout.local(nav, r)? as usize;
         Some((s, i))
     }
 
+    /// Epoch of the completed values, retained while a rebuild runs.
+    pub fn served_epoch(&self) -> Option<u64> {
+        self.served_epoch
+    }
+
+    /// Whether served values are exact for this mesh, even before refresh.
+    pub fn freshness(&self, nav: &NavMesh) -> Option<FieldFreshness> {
+        self.check(nav).ok()?;
+        let epoch = self.served_epoch?;
+        Some(
+            if self.status() == FieldStatus::Ready
+                && epoch == nav.epoch()
+                && self.seen_global == nav.global_off_mesh_links()
+            {
+                FieldFreshness::Fresh
+            } else {
+                FieldFreshness::Stale
+            },
+        )
+    }
+
     /// Cost to the goal from where polygon `r` is left (0 on the goal polygon);
     /// `None` outside the region, unreached, invalidated or not yet built.
+    /// May be stale; inspect [`GoalField::freshness`] or [`GoalField::served_epoch`].
     pub fn cost(&self, nav: &NavMesh, r: PolyRef) -> Option<f32> {
         let (s, i) = self.served_index(nav, r)?;
         let c = s.cost[i];
@@ -794,11 +789,17 @@ impl GoalField {
     }
 
     /// The next polygon towards the goal from `r`; `None` on the goal polygon and
-    /// wherever [`GoalField::cost`] is `None`.
+    /// wherever [`GoalField::cost`] is `None`. May be stale; inspect
+    /// [`GoalField::freshness`]. The returned reference is currently resident.
     pub fn next(&self, nav: &NavMesh, r: PolyRef) -> Option<PolyRef> {
         let (s, i) = self.served_index(nav, r)?;
         let n = s.next[i];
-        (n != NONE).then(|| s.layout.poly_ref(n))
+        if n == NONE || !s.cost[i].is_finite() {
+            return None;
+        }
+        let r = s.layout.poly_ref(n);
+        nav.tile_and_poly_by_ref(r).ok()?;
+        Some(r)
     }
 
     /// Steering for an agent at `pos` on polygon `poly` (see the module's steering
@@ -808,8 +809,8 @@ impl GoalField {
     /// unit per stub polygon; when they do not fit nothing is computed and the
     /// result is `Exhausted(false)`.
     ///
-    /// Call [`GoalField::refresh`] or [`GoalField::step`] after structural changes
-    /// before steering, so that invalidated values are not used.
+    /// Stale values may be used; inspect [`FieldSteer::freshness`]. Residency
+    /// checks apply even when refresh has not yet been called.
     ///
     /// # Errors
     /// [`Error::MeshChanged`] when `query` reads another navmesh,
@@ -831,6 +832,12 @@ impl GoalField {
         let Some((s, i)) = self.served_index(nav, poly) else {
             return Ok(Budgeted::Complete(false));
         };
+        if !s.cost[i].is_finite()
+            || !s.cost[s.goal as usize].is_finite()
+            || nav.tile_and_poly_by_ref(self.goal).is_err()
+        {
+            return Ok(Budgeted::Complete(false));
+        }
         let mut k = i as u32;
         if k != s.goal && s.next[i] == NONE {
             return Ok(Budgeted::Complete(false));
@@ -864,7 +871,11 @@ impl GoalField {
             if after == NONE {
                 return Ok(Budgeted::Complete(false));
             }
-            match query.portal_points(stub[len - 1], s.layout.poly_ref(after)) {
+            let after_ref = s.layout.poly_ref(after);
+            if nav.tile_and_poly_by_ref(after_ref).is_err() {
+                return Ok(Budgeted::Complete(false));
+            }
+            match query.portal_points(stub[len - 1], after_ref) {
                 Ok((l, r)) => mid(&l, &r),
                 Err(_) => return Ok(Budgeted::Complete(false)),
             }
@@ -879,6 +890,7 @@ impl GoalField {
         out.stub = stub;
         out.stub_len = len;
         out.cost = s.cost[i];
+        out.freshness = self.freshness(nav);
         out.reaches_goal = k == s.goal;
         Ok(Budgeted::Complete(true))
     }
@@ -927,6 +939,16 @@ fn region_columns(
     }
 }
 
+/// Validity of served values relative to the current mesh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FieldFreshness {
+    /// Complete values for the current epoch.
+    Fresh,
+    /// Previous values, potentially inexact, while rebuilding is required.
+    Stale,
+}
+
 /// Steering output of [`GoalField::steer`], reusable across calls (it keeps its
 /// corner buffer).
 #[derive(Clone, Debug, Default)]
@@ -938,6 +960,7 @@ pub struct FieldSteer {
     stub_len: usize,
     cost: f32,
     reaches_goal: bool,
+    freshness: Option<FieldFreshness>,
     corners: Vec<StraightPathPoint>,
 }
 
@@ -955,7 +978,13 @@ impl FieldSteer {
         self.stub_len = 0;
         self.cost = f32::INFINITY;
         self.reaches_goal = false;
+        self.freshness = None;
         self.corners.clear();
+    }
+
+    /// Freshness of successful steering; `None` when no result was produced.
+    pub fn freshness(&self) -> Option<FieldFreshness> {
+        self.freshness
     }
 
     /// The point to steer towards (the first corner of the funnel).
@@ -996,6 +1025,8 @@ pub struct FieldId(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct FieldKey {
+    identity: usize,
+    radius: Option<u32>,
     goal: PolyRef,
     pos: [u32; 3],
     filter: usize,
@@ -1009,6 +1040,12 @@ struct Entry {
     filter: usize,
     refs: u32,
     last_use: u64,
+}
+
+impl Entry {
+    fn bytes(&self) -> usize {
+        self.field.bytes() + self.key.columns.capacity() * core::mem::size_of::<TileKey>() * 2
+    }
 }
 
 /// Goal fields shared by `(goal polygon, goal point, filter index, region)`,
@@ -1047,7 +1084,7 @@ impl GoalFieldCache {
 
     /// Bytes held by all cached fields ([`GoalField::bytes`]).
     pub fn bytes(&self) -> usize {
-        self.entries.values().map(|e| e.field.bytes()).sum()
+        self.entries.values().map(Entry::bytes).sum()
     }
 
     /// Number of cached fields, referenced or not.
@@ -1081,19 +1118,26 @@ impl GoalFieldCache {
         self.entries.get(&id).map(|e| &e.field)
     }
 
-    fn tick(&mut self) -> u64 {
-        self.clock += 1;
-        self.clock
+    fn allocate_id(&mut self) -> Result<FieldId, Error> {
+        let next = self.next_id.checked_add(1).ok_or(Error::SizeOverflow)?;
+        let id = FieldId(self.next_id);
+        self.next_id = next;
+        Ok(id)
+    }
+
+    fn tick(&mut self) -> Result<u64, Error> {
+        self.clock = self.clock.checked_add(1).ok_or(Error::SizeOverflow)?;
+        Ok(self.clock)
     }
 
     /// A reference to the field for this goal, filter index and region: the
-    /// cached one when the key matches (regions compare by their resolved
-    /// columns), otherwise a new field, built by [`GoalFieldCache::step`].
+    /// cached one when the key matches (explicit regions compare by resolved columns; radius requests also
+    /// retain their original radius), otherwise a new field, built by [`GoalFieldCache::step`].
     ///
     /// # Errors
     /// As [`GoalField::new`], with [`Error::LimitExceeded`] when the new field's
     /// estimate does not fit beside the referenced fields after evicting every
-    /// unreferenced one.
+    /// unreferenced one; [`Error::SizeOverflow`] if the id or usage clock is exhausted.
     pub fn request(
         &mut self,
         nav: &NavMesh,
@@ -1104,13 +1148,18 @@ impl GoalFieldCache {
     ) -> Result<FieldId, Error> {
         let (columns, estimate) = GoalField::plan(nav, goal, &goal_pos, region)?;
         let key = FieldKey {
+            identity: Arc::as_ptr(nav.report_identity()) as usize,
+            radius: match region {
+                FieldRegion::Radius(r) => Some(r.to_bits()),
+                _ => None,
+            },
             goal,
             pos: goal_pos.map(f32::to_bits),
             filter,
             columns,
         };
         if let Some(&id) = self.keys.get(&key) {
-            let now = self.tick();
+            let now = self.tick()?;
             if let Some(e) = self.entries.get_mut(&id) {
                 e.refs = e.refs.checked_add(1).ok_or(Error::SizeOverflow)?;
                 e.last_use = now;
@@ -1121,16 +1170,16 @@ impl GoalFieldCache {
             .entries
             .values()
             .filter(|e| e.refs > 0)
-            .map(|e| e.field.bytes())
+            .map(Entry::bytes)
             .sum();
         if referenced.saturating_add(estimate) > self.max_bytes {
             return Err(Error::LimitExceeded);
         }
+        let id = self.allocate_id()?;
+        let now = self.tick()?;
         self.evict_to(self.max_bytes - estimate);
         let field = GoalField::new(nav, goal, goal_pos, region, &Limits::UNLIMITED)?;
-        let id = FieldId(self.next_id);
-        self.next_id += 1;
-        let now = self.tick();
+
         self.keys.insert(key.clone(), id);
         self.entries.insert(
             id,
@@ -1148,9 +1197,10 @@ impl GoalFieldCache {
     /// Drops one reference to `id`. The field stays cached until evicted.
     ///
     /// # Errors
-    /// [`Error::InvalidParameter`] for an unknown or unreferenced id.
+    /// [`Error::InvalidParameter`] for an unknown or unreferenced id,
+    /// [`Error::SizeOverflow`] if the usage clock is exhausted.
     pub fn release(&mut self, id: FieldId) -> Result<(), Error> {
-        let now = self.tick();
+        let now = self.tick()?;
         let e = self
             .entries
             .get_mut(&id)
@@ -1178,16 +1228,17 @@ impl GoalFieldCache {
                 return;
             };
             if let Some(e) = self.entries.remove(&id) {
-                total -= e.field.bytes();
+                total -= e.bytes();
                 self.keys.remove(&e.key);
             }
         }
     }
 
-    /// Refreshes and builds the referenced fields in id order, with
+    /// Refreshes every entry for `nav`, then builds referenced fields in id order, with
     /// `filters[filter index]` each, until `budget` runs out. `Done` when every
     /// referenced field is ready (or has lost its goal). Afterwards evicts
-    /// unreferenced fields while the cache is over its cap.
+    /// unreferenced fields while the cache is over its cap. Entries for other
+    /// meshes are advanced only when their mesh is passed.
     ///
     /// # Errors
     /// [`Error::InvalidParameter`] when a field's filter index is outside
@@ -1198,8 +1249,19 @@ impl GoalFieldCache {
         filters: &[F],
         budget: &mut Budget,
     ) -> Result<Progress, Error> {
+        // Refresh all entries belonging to this mesh before spending any budget,
+        // including unreferenced entries retained for reuse.
+        for e in self.entries.values_mut() {
+            if e.field.check(nav).is_ok() {
+                e.field.refresh(nav)?;
+            }
+        }
         let mut progress = Progress::Done;
-        for e in self.entries.values_mut().filter(|e| e.refs > 0) {
+        for e in self
+            .entries
+            .values_mut()
+            .filter(|e| e.refs > 0 && e.field.check(nav).is_ok())
+        {
             let filter = filters
                 .get(e.filter)
                 .ok_or(Error::InvalidParameter("field filter index"))?;
@@ -1210,5 +1272,23 @@ impl GoalFieldCache {
         }
         self.evict_to(self.max_bytes);
         Ok(progress)
+    }
+}
+
+#[cfg(test)]
+mod counter_tests {
+    use super::*;
+
+    #[test]
+    fn cache_counter_boundaries() {
+        let mut cache = GoalFieldCache::new(usize::MAX);
+        cache.clock = u64::MAX - 1;
+        assert_eq!(cache.tick(), Ok(u64::MAX));
+        assert_eq!(cache.tick(), Err(Error::SizeOverflow));
+        assert_eq!(cache.clock, u64::MAX);
+        cache.next_id = u64::MAX - 1;
+        assert_eq!(cache.allocate_id(), Ok(FieldId(u64::MAX - 1)));
+        assert_eq!(cache.allocate_id(), Err(Error::SizeOverflow));
+        assert_eq!(cache.next_id, u64::MAX);
     }
 }

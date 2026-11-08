@@ -595,10 +595,10 @@ fn cache_shares_counts_refuses_and_evicts_least_recently_used() {
         probe.step(&nav, &filters, &mut Budget::unlimited()),
         Ok(Progress::Done)
     );
-    let ready = probe.get(a).unwrap().bytes();
+    let ready = probe.bytes();
     let estimate = GoalField::peak_bytes(&nav, goals[1].0, goals[1].1, &all).unwrap();
     assert!(ready > 0 && ready < estimate);
-    // Same key (regions compare by resolved columns): same field, two references.
+    // An explicit region retains its own request identity.
     let columns: Vec<TileKey> = probe.get(a).unwrap().columns().to_vec();
     let again = probe
         .request(
@@ -609,7 +609,9 @@ fn cache_shares_counts_refuses_and_evicts_least_recently_used() {
             &FieldRegion::Tiles(columns),
         )
         .unwrap();
-    assert_eq!((again, probe.refs(a)), (a, 2));
+    assert_ne!(again, a);
+    assert_eq!(probe.refs(a), 1);
+    probe.release(again).unwrap();
     // Another filter index: another field.
     let other = probe
         .request(&nav, goals[0].0, goals[0].1, 1, &all)
@@ -867,4 +869,240 @@ fn shared_goal_field_costs_under_ten_percent_of_path_requests() {
         shared as f64 * 100.0 / path_work as f64
     );
     assert!(shared * 10 < path_work);
+}
+
+fn ready_field(nav: &NavMesh, region: &FieldRegion) -> GoalField {
+    let (goal, pos) = nearest(nav, [5.0, 0.0, 5.0]);
+    let mut field = GoalField::new(nav, goal, pos, region, &Limits::UNLIMITED).unwrap();
+    build(&mut field, nav, &slow_filter(), 64);
+    field
+}
+
+#[test]
+fn bridge_added_mid_rebuild_restarts_and_tags_stale_values() {
+    use navmesh_rs::crowd::field::FieldFreshness::{Fresh, Stale};
+    let grid = small_grid();
+    let mut nav = grid.nav(false);
+    let mut field = ready_field(&nav, &FieldRegion::Radius(1000.0));
+    let old_epoch = field.served_epoch();
+    let tile = nav.tile_ref(slot_at(&nav, 1, 0));
+    let bytes = nav.remove_tile(tile).unwrap();
+    field
+        .step(&nav, &slow_filter(), &mut Budget::new(1))
+        .unwrap();
+    assert_eq!(field.freshness(&nav), Some(Stale));
+    assert_eq!(field.served_epoch(), old_epoch);
+    nav.add_tile(bytes).unwrap();
+    field
+        .step(&nav, &slow_filter(), &mut Budget::new(1))
+        .unwrap();
+    assert_eq!(field.status(), FieldStatus::Stale);
+    let q = NavMeshQuery::new(&nav, 16).unwrap();
+    let mut out = FieldSteer::new();
+    assert_eq!(
+        field
+            .steer(
+                &q,
+                field.goal(),
+                &field.goal_pos(),
+                &mut out,
+                &mut Budget::unlimited()
+            )
+            .unwrap(),
+        navmesh_rs::Budgeted::Complete(true)
+    );
+    assert_eq!(out.freshness(), Some(Stale));
+    build(&mut field, &nav, &slow_filter(), 7);
+    assert_eq!(field.freshness(&nav), Some(Fresh));
+    assert_matches_exact(&nav, &field, &slow_filter());
+}
+
+#[test]
+fn old_refs_and_dangling_next_are_refused_before_refresh_and_after_reuse() {
+    let grid = small_grid();
+    let mut nav = grid.nav(false);
+    let field = ready_field(&nav, &FieldRegion::Radius(1000.0));
+    let refs = region_polys(&nav, field.columns());
+    let source = refs
+        .iter()
+        .copied()
+        .find(|&r| field.next(&nav, r).is_some())
+        .unwrap();
+    let target = field.next(&nav, source).unwrap();
+    let (_, slot, _) = nav.decode_poly_id(target);
+    let bytes = nav.remove_tile(nav.tile_ref(slot as usize)).unwrap();
+    assert_eq!(field.cost(&nav, target), None);
+    assert_eq!(field.next(&nav, source), None);
+    nav.add_tile(bytes).unwrap();
+    assert_eq!(field.cost(&nav, target), None);
+    assert_eq!(field.next(&nav, target), None);
+    assert_eq!(field.next(&nav, source), None);
+}
+
+#[test]
+fn zero_budget_refreshes_all_cached_fields_including_unreferenced() {
+    let grid = small_grid();
+    let mut nav = grid.nav(false);
+    let mut cache = GoalFieldCache::new(usize::MAX);
+    let mut ids = Vec::new();
+    for pos in [[5.0, 0.0, 5.0], [35.0, 0.0, 35.0], [15.0, 0.0, 25.0]] {
+        let (goal, pos) = nearest(&nav, pos);
+        ids.push(
+            cache
+                .request(&nav, goal, pos, 0, &FieldRegion::Radius(1000.0))
+                .unwrap(),
+        );
+    }
+    cache
+        .step(&nav, &[slow_filter()], &mut Budget::unlimited())
+        .unwrap();
+    cache.release(ids[2]).unwrap();
+    nav.remove_tile(nav.tile_ref(slot_at(&nav, 1, 0))).unwrap();
+    assert_eq!(
+        cache.step(&nav, &[slow_filter()], &mut Budget::new(0)),
+        Ok(Progress::Exhausted)
+    );
+    for id in ids {
+        assert_eq!(cache.get(id).unwrap().status(), FieldStatus::Stale);
+    }
+}
+
+#[test]
+fn cache_keys_include_mesh_identity() {
+    let grid = small_grid();
+    let a = grid.nav(false);
+    let b = grid.nav(false);
+    let (goal, pos) = nearest(&a, [5.0, 0.0, 5.0]);
+    let mut cache = GoalFieldCache::new(usize::MAX);
+    let region = FieldRegion::Radius(1000.0);
+    let x = cache.request(&a, goal, pos, 0, &region).unwrap();
+    let y = cache.request(&b, goal, pos, 0, &region).unwrap();
+    assert_ne!(x, y);
+    cache
+        .step(&b, &[slow_filter()], &mut Budget::unlimited())
+        .unwrap();
+    assert_eq!(cache.get(y).unwrap().status(), FieldStatus::Ready);
+}
+
+#[test]
+fn radius_recomputes_columns_after_growth() {
+    let grid = small_grid();
+    // Start with narrower occupied bounds; removals intentionally retain bounds.
+    let mut nav = NavMesh::new(&NavMeshParams {
+        orig: [0.0; 3],
+        tile_width: grid.tile,
+        tile_height: grid.tile,
+        max_tiles: 16,
+        max_polys: 1 << 12,
+    })
+    .unwrap();
+    for (x, y) in grid.keys().into_iter().filter(|&(x, _)| x < 3) {
+        nav.add_tile(grid.tile_bytes(x, y).unwrap()).unwrap();
+    }
+    let bytes = grid.tile_bytes(3, 0).unwrap();
+    let mut field = ready_field(&nav, &FieldRegion::Radius(1000.0));
+    assert_eq!(field.columns().len(), 12);
+    nav.add_tile(bytes).unwrap();
+    build(&mut field, &nav, &slow_filter(), 7);
+    let fresh = ready_field(&nav, &FieldRegion::Radius(1000.0));
+    assert_eq!(field.columns(), fresh.columns());
+    assert_eq!(field.columns().len(), 16);
+    assert_matches_exact(&nav, &field, &slow_filter());
+}
+
+#[test]
+fn steering_on_invalidated_goal_is_not_complete() {
+    let grid = small_grid();
+    let mut nav = grid.nav(false);
+    let mut field = ready_field(&nav, &FieldRegion::Radius(1000.0));
+    nav.unload_tile(nav.tile_ref(slot_at(&nav, 0, 0))).unwrap();
+    field.refresh(&nav).unwrap();
+    let tile = detour::prepare_tile(
+        nav.params(),
+        Limits::UNLIMITED,
+        grid.tile_bytes(0, 0).unwrap(),
+    )
+    .unwrap();
+    nav.commit(tile).unwrap();
+    let q = NavMeshQuery::new(&nav, 16).unwrap();
+    let mut out = FieldSteer::new();
+    assert_eq!(
+        field
+            .steer(
+                &q,
+                field.goal(),
+                &field.goal_pos(),
+                &mut out,
+                &mut Budget::unlimited()
+            )
+            .unwrap(),
+        navmesh_rs::Budgeted::Complete(false)
+    );
+    assert!(!out.reaches_goal());
+}
+
+#[test]
+fn columns_heavy_requests_obey_standalone_and_cache_limits() {
+    let grid = small_grid();
+    let nav = grid.nav(false);
+    let (goal, pos) = nearest(&nav, [5.0, 0.0, 5.0]);
+    let region = FieldRegion::Tiles((0..10000).map(|x| TileKey { x, y: 0 }).collect());
+    let estimate = GoalField::peak_bytes(&nav, goal, pos, &region).unwrap();
+    assert!(estimate >= 4 * 10000 * std::mem::size_of::<TileKey>());
+    let mut limits = Limits::UNLIMITED;
+    limits.max_bytes = estimate - 1;
+    assert!(matches!(
+        GoalField::new(&nav, goal, pos, &region, &limits),
+        Err(Error::LimitExceeded)
+    ));
+    let mut cache = GoalFieldCache::new(estimate - 1);
+    assert_eq!(
+        cache.request(&nav, goal, pos, 0, &region),
+        Err(Error::LimitExceeded)
+    );
+}
+
+#[test]
+fn custom_filter_removal_rebuilds_exactly_even_off_the_old_next_chain() {
+    use navmesh_rs::detour::{MeshTile, Poly};
+    struct PortalCost;
+    impl QueryFilter for PortalCost {
+        fn pass_filter(&self, _: PolyRef, _: &MeshTile, _: &Poly) -> bool {
+            true
+        }
+        fn cost(
+            &self,
+            a: &[f32; 3],
+            b: &[f32; 3],
+            _: Option<(PolyRef, &MeshTile, &Poly)>,
+            cur: (PolyRef, &MeshTile, &Poly),
+            next: Option<(PolyRef, &MeshTile, &Poly)>,
+        ) -> f32 {
+            let bend = if next.is_some_and(|n| n.1.header.x < cur.1.header.x) {
+                19.0
+            } else {
+                1.0
+            };
+            dist_xz(*a, *b) * bend + (a[2] - b[2]).abs() * 0.25
+        }
+    }
+    let grid = small_grid();
+    let mut nav = grid.nav(false);
+    let (goal, pos) = nearest(&nav, [5.0, 0.0, 5.0]);
+    let mut field = GoalField::new(
+        &nav,
+        goal,
+        pos,
+        &FieldRegion::Radius(1000.0),
+        &Limits::UNLIMITED,
+    )
+    .unwrap();
+    build(&mut field, &nav, &PortalCost, 17);
+    assert_matches_exact(&nav, &field, &PortalCost);
+    nav.remove_tile(nav.tile_ref(slot_at(&nav, 1, 0))).unwrap();
+    field.step(&nav, &PortalCost, &mut Budget::new(0)).unwrap();
+    assert_eq!(field.status(), FieldStatus::Stale);
+    build(&mut field, &nav, &PortalCost, 1);
+    assert_eq!(field.status(), FieldStatus::Ready);
+    assert_matches_exact(&nav, &field, &PortalCost);
 }

@@ -12,8 +12,12 @@ All notable changes to this project are documented in this file. The format foll
   flood from a goal over a region's polygons (radius or tile set) with Detour's
   portal-midpoint cost model and a `(cost, tile, polygon)` tie rule independent of
   tile slots, stored per tile without a node-pool cap. One-way off-mesh connections
-  are followed through a reverse link index. Removed, unloaded or replaced tiles
-  invalidate the values that route through them and start a budgeted rebuild.
+  are followed through a reverse link index. Every structural change starts a full budgeted rebuild. Previous values may
+  be served as `Stale`; `Fresh` values are exact only at `Ready` with a matching
+  mesh epoch. Lookups validate current residency and salt, and steering reports
+  freshness. Radius regions grow on refresh; cache keys include mesh identity.
+  Zero-budget cache steps refresh all entries for the mesh. Admission includes
+  column storage and key copies; exhausted cache counters return a typed error.
   `GoalField::steer` funnels through the next three polygons. `GoalFieldCache`
   shares fields by goal, filter and region with reference counts, least recently
   used eviction and a byte cap that refuses oversized regions.
