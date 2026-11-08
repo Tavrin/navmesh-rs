@@ -198,6 +198,14 @@ be used independently. Agent handles name reusable slots. The mesh is borrowed o
 during calls, allowing tile changes between ticks. An update error may leave earlier
 phases applied; do not consume that tick as a successful simulation result.
 
+For larger crowds, the opt-in `crowd-world` feature adds `crowd::world::CrowdWorld`:
+up to 2^24 agents behind generational handles, a world-wide sorted-cell neighbour
+grid, steps charged per active agent to a `Budget` before they run, and `'DCRW'`
+snapshots. `CrowdWorld::default_agent_params()` selects ORCA; explicitly supplied
+agent parameters are preserved. With `parallel`, its per-agent phases run on the current rayon pool and
+give the same result for every thread count. Each agent gets the trajectory `Crowd`
+gives with `UpstreamFixes::NEAREST_NEIGHBOURS`, bit for bit.
+
 ## Dynamic obstacles
 
 The default `tilecache` feature adds `tilecache::TileCache`, validated `DTLR`
@@ -276,7 +284,8 @@ resource use; they write into the cache's budgeted output slices.
 | `crowd` | yes | Agent simulation, corridors, avoidance and path queue; implies `detour`. |
 | `std` | yes | floating-point functions from the platform libm |
 | `libm` | no | floating-point functions from the `libm` crate (identical on every target); required without `std` |
-| `parallel` | no | rayon tile workers; serial bake API remains available without it |
+| `crowd-world` | no | `CrowdWorld`: many agents with handles, sorted-cell grid, budgeted steps, snapshots; implies `crowd` |
+| `parallel` | no | rayon tile workers and crowd-world phases; serial paths remain available without it |
 | `polyref64` | yes | 64-bit poly refs; off gives upstream's 32-bit refs |
 
 `no_std`: `default-features = false, features = ["libm", "recast", "detour", "crowd", "tilecache", "polyref64"]`.

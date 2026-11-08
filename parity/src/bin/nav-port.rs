@@ -2214,7 +2214,7 @@ fn parse_fixes(list: &str) -> Result<navmesh_rs::UpstreamFixes, String> {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | bench <case> [--repeat N] | verify-connectivity <case> | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
+    let usage = "usage: nav-port bake <case> --records FILE | digest <case> | budget <case> | crowd-world <case> [--threads N] | bench <case> [--repeat N] | verify-connectivity <case> | verify-parallel <case> | bench-tiles <case> --threads N [--repeat N]";
     let (cmd, case_path) = match (args.first(), args.get(1)) {
         (Some(a), Some(b)) => (a.as_str(), b.as_str()),
         _ => return Err(usage.into()),
@@ -2251,6 +2251,23 @@ fn run() -> Result<(), String> {
             res
         }
         "budget" => budget_check(&case, &g),
+        "crowd-world" => {
+            let baked = bake(&case, &g, &mut Sink { writer: None }).map_err(|e| e.to_string())?;
+            let threads: usize = opt("--threads").and_then(|v| v.parse().ok()).unwrap_or(1);
+            #[cfg(feature = "parallel")]
+            {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .map_err(|e| e.to_string())?;
+                pool.install(|| crowd_world_equivalence(&case, &baked, &base))
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                let _ = threads;
+                crowd_world_equivalence(&case, &baked, &base)
+            }
+        }
         "digest" => {
             // One line per record (`case record length digest`) and one for the whole
             // stream: the cross-platform determinism check compares these lines with
@@ -2333,6 +2350,138 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Drives a `Crowd` (with nearest-neighbour selection) and a `CrowdWorld` through
+/// the eight crowd-record variants in lockstep and compares them bit for bit after
+/// every tick.
+fn crowd_world_equivalence(c: &Case, b: &Baked, name: &str) -> Result<(), String> {
+    use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams, Goal};
+    use navmesh_rs::crowd::{AgentId, AgentParams, Crowd, ObstacleAvoidanceParams};
+    use navmesh_rs::{Budget, UpstreamFixes};
+    let s = |e: Error| e.to_string();
+    if c.crowd_agents == 0 || c.crowd_ticks == 0 {
+        println!("crowd-world {name} no crowd");
+        return Ok(());
+    }
+    let (mut ticks, mut agent_ticks) = (0u64, 0u64);
+    for variant in 0..8 {
+        let mut nav = assemble(b).map_err(s)?;
+        let mut ws = Workspace::new();
+        let mut crowd = Crowd::new(&mut ws, &nav, c.crowd_agents, c.agent_radius).map_err(s)?;
+        crowd.set_fixes(fixes() | UpstreamFixes::NEAREST_NEIGHBOURS);
+        let mut p = CrowdWorldParams::default();
+        p.max_agents = c.crowd_agents as u32;
+        p.max_heavy_agents = c.crowd_agents as u32;
+        p.max_radius = c.agent_radius;
+        p.fixed_dt = 1. / 30.;
+        let mut world = CrowdWorld::new(&nav, &p, Limits::UNLIMITED).map_err(s)?;
+        world.set_fixes(fixes());
+        if (1..=4).contains(&variant) {
+            for k in 0..4 {
+                let q = ObstacleAvoidanceParams::quality(k).map_err(s)?;
+                crowd.set_obstacle_avoidance_params(k, q).map_err(s)?;
+                world.set_obstacle_avoidance_params(k, q).map_err(s)?;
+            }
+        }
+        let seed = c.seed ^ 0x5bd1e995;
+        let mut rng = Rng(if seed != 0 { seed } else { 1 });
+        let mut ap = AgentParams::default();
+        ap.radius = c.agent_radius;
+        ap.height = c.agent_height;
+        ap.collision_query_range = c.agent_radius * 12.;
+        ap.path_optimization_range = c.agent_radius * 30.;
+        ap.obstacle_avoidance_type = if (1..=4).contains(&variant) {
+            variant - 1
+        } else {
+            3
+        };
+        let add = |nav: &NavMesh,
+                   crowd: &mut Crowd,
+                   world: &mut CrowdWorld,
+                   ws: &mut Workspace,
+                   rng: &mut Rng|
+         -> Result<(), Error> {
+            let q = NavMeshQuery::new(nav, 2048)?;
+            let f = DefaultFilter::default();
+            let (_, p0) = q.find_random_point(&f, &mut || rng.frand())?;
+            let (r1, p1) = q.find_random_point(&f, &mut || rng.frand())?;
+            let id = crowd.add_agent(ws, nav, p0, ap)?;
+            crowd.request_move_target(nav, id, r1, p1)?;
+            let h = world.add_agent(nav, p0, ap)?;
+            world.set_goal(nav, h, Goal::Point { poly: r1, pos: p1 })
+        };
+        let at = |world: &CrowdWorld, i: usize| world.handle_at(i as u32).ok_or(Error::Failed);
+        for _ in 0..c.crowd_agents {
+            add(&nav, &mut crowd, &mut world, &mut ws, &mut rng).map_err(s)?;
+        }
+        if variant == 5 {
+            for i in (1..c.crowd_agents).step_by(2) {
+                let a = crowd.agent(AgentId(i)).ok_or("missing agent")?;
+                let d = [a.target_pos[0] - a.npos[0], 0., a.target_pos[2] - a.npos[2]];
+                let len = (d[0] * d[0] + d[2] * d[2]).sqrt();
+                let mut v = [0.; 3];
+                if len > 0.0001 {
+                    let scale = 0.5 * ap.max_speed / len;
+                    v = d.map(|x| x * scale);
+                }
+                crowd.request_move_velocity(AgentId(i), v).map_err(s)?;
+                world
+                    .set_goal(&nav, at(&world, i).map_err(s)?, Goal::Velocity(v))
+                    .map_err(s)?;
+            }
+        }
+        for t in 0..c.crowd_ticks {
+            if variant == 5 && t == c.crowd_ticks / 2 {
+                for i in (0..c.crowd_agents).step_by(3) {
+                    crowd.reset_move_target(AgentId(i)).map_err(s)?;
+                    world
+                        .set_goal(&nav, at(&world, i).map_err(s)?, Goal::None)
+                        .map_err(s)?;
+                }
+            }
+            if variant == 6 && t == c.crowd_ticks / 3 {
+                for i in (1..c.crowd_agents).step_by(4) {
+                    crowd.remove_agent(AgentId(i)).map_err(s)?;
+                    world.remove_agent(at(&world, i).map_err(s)?).map_err(s)?;
+                }
+            }
+            if variant == 6 && t == 2 * c.crowd_ticks / 3 {
+                for _ in (1..c.crowd_agents).step_by(4) {
+                    add(&nav, &mut crowd, &mut world, &mut ws, &mut rng).map_err(s)?;
+                }
+            }
+            if variant == 7
+                && t == c.crowd_ticks / 2
+                && let Some(a) = crowd.agent(AgentId(0))
+                && let Ok((tile, _)) = nav.tile_and_poly_by_ref(a.corridor.first_poly())
+            {
+                let h = &tile.header;
+                let loc = (h.x, h.y, h.layer);
+                if let Some((x, y, l, data)) =
+                    b.tiles.iter().find(|(x, y, l, _)| (*x, *y, *l) == loc)
+                {
+                    let i = nav.tile_index_at(*x, *y, *l).ok_or("missing tile")?;
+                    nav.remove_tile(nav.tile_ref(i)).map_err(s)?;
+                    nav.add_tile(data.clone()).map_err(s)?;
+                }
+            }
+            crowd.update(&mut ws, &nav, 1. / 30.).map_err(s)?;
+            if !world
+                .step(&nav, &mut Budget::unlimited())
+                .map_err(s)?
+                .is_complete()
+            {
+                return Err("crowd-world step refused under an unlimited budget".into());
+            }
+            let n = navmesh_parity::crowd_world::compare(&crowd, &world)
+                .map_err(|e| format!("{name} variant {variant} tick {t}: {e}"))?;
+            ticks += 1;
+            agent_ticks += n as u64;
+        }
+    }
+    println!("crowd-world {name} ticks {ticks} agent_ticks {agent_ticks} mismatches 0");
+    Ok(())
 }
 
 fn record_crowds(c: &Case, b: &Baked, sink: &mut Sink) -> Result<(), Error> {

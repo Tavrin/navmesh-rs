@@ -19,6 +19,6 @@ parallel = ["navmesh-rs/parallel", "dep:rayon"]
 libm = ["navmesh-rs/libm"]
 
 [dependencies]
-navmesh-rs = { path = "..", default-features = false, features = ["std", "recast", "detour", "crowd", "tilecache"] }
+navmesh-rs = { path = "..", default-features = false, features = ["std", "recast", "detour", "crowd", "crowd-world", "tilecache"] }
 
 rayon = { version = "1.11", optional = true }

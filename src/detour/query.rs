@@ -1838,10 +1838,10 @@ pub(crate) fn closest_point_on_boundary(tile: &MeshTile, poly: &Poly, pos: &[f32
 // between crowd updates. Attaching borrows the navmesh only for that update.
 #[cfg(feature = "crowd")]
 pub(crate) struct DetachedQuery {
-    node_pool: NodePool,
+    pub(crate) node_pool: NodePool,
     tiny_node_pool: NodePool,
-    open_list: NodeQueue,
-    query: QueryData,
+    pub(crate) open_list: NodeQueue,
+    pub(crate) query: QueryData,
     fixes: UpstreamFixes,
 }
 #[cfg(feature = "crowd")]

@@ -10,6 +10,7 @@
 
 pub mod container;
 pub mod crowd;
+pub mod crowd_world;
 pub mod decode;
 pub mod diff;
 pub mod encode;
