@@ -86,6 +86,16 @@ impl NodePool {
         })
     }
 
+    #[cfg(feature = "crowd-world")]
+    pub(crate) fn restore_node(&mut self, node: Node) -> bool {
+        let next = self.count;
+        if self.get_node(node.id, node.state) != Some(next) {
+            return false;
+        }
+        self.nodes[next] = node;
+        true
+    }
+
     pub fn clear(&mut self) {
         self.first.fill(NULL_IDX);
         self.count = 0;
@@ -196,6 +206,24 @@ impl NodeQueue {
         heap.try_reserve_exact(n + 1)
             .map_err(|_| Error::AllocationFailed)?;
         Ok(NodeQueue { heap })
+    }
+    #[cfg(feature = "crowd-world")]
+    pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = (usize, f32)> + '_ {
+        self.heap.iter().map(|e| (e.node as usize, e.total))
+    }
+    #[cfg(feature = "crowd-world")]
+    pub(crate) fn valid_heap(&self) -> bool {
+        self.heap
+            .iter()
+            .enumerate()
+            .all(|(i, e)| i == 0 || self.heap[(i - 1) / 2].total <= e.total)
+    }
+    #[cfg(feature = "crowd-world")]
+    pub(crate) fn restore_entry(&mut self, node: usize, total: f32) {
+        self.heap.push(Entry {
+            node: node as u32,
+            total,
+        });
     }
     pub fn clear(&mut self) {
         self.heap.clear();

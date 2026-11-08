@@ -5,7 +5,7 @@ use super::*;
 pub struct LocalBoundary {
     pub(crate) center: V3,
     pub(crate) segments: Vec<(f32, [f32; 6])>,
-    polys: Vec<PolyRef>,
+    pub(crate) polys: Vec<PolyRef>,
 }
 impl LocalBoundary {
     /// Allocates storage for the fixed upstream limits.

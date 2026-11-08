@@ -30,6 +30,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             scenarios::invariants().unwrap();
             return Ok(());
         }
+        #[cfg(feature = "parallel")]
+        Some("world-invariance") => {
+            scenarios::world_invariance()?;
+            return Ok(());
+        }
+        Some("world-equivalence") => {
+            scenarios::world_equivalence()?;
+            return Ok(());
+        }
         _ => {}
     }
     let mut input = String::new();

@@ -40,6 +40,11 @@
 //!   [`detour::QueryFilter`].
 //! - Crowd (feature `crowd`): [`crowd::Crowd`], corridors, local walls, proximity
 //!   grid, sliced path queue, steering, separation and sampled avoidance.
+//! - Crowd world (feature `crowd-world`, not in recastnavigation):
+//!   `crowd::world::CrowdWorld`, up to 2^24 agents with generational handles, a
+//!   sorted-cell neighbour grid, data-parallel phases (with `parallel`) whose result
+//!   does not depend on the thread count, per-active-agent budget charges and
+//!   snapshots; agents simulated in full match [`crowd::Crowd`] bit for bit.
 //! - `no_std` + `alloc`, `wasm32`, no `unsafe` code.
 //!
 //! - Tile cache (feature `tilecache`): validated layers, pluggable compression,
@@ -55,7 +60,9 @@
 //! - `crowd` (default): agent simulation and local avoidance; implies `detour`.
 //! - `tilecache` (default): cached layers and dynamic obstacles; implies Recast and Detour.
 //! - `std` (default): floating-point functions from the platform libm.
-//! - `parallel`: rayon-backed tile baking (opt-in; bake functions remain available without it).
+//! - `crowd-world`: the crowd world (opt-in); implies `crowd`.
+//! - `parallel`: rayon-backed tile baking and crowd-world phases (opt-in; both remain
+//!   available without it).
 //! - `serde`: serialization of diagnostic reports (opt-in, supports alloc without std).
 //! - `libm`: floating-point functions from the `libm` crate; required without `std`.
 //! - `polyref64` (default): 64-bit poly refs (upstream's `DT_POLYREF64`); without it
@@ -155,7 +162,9 @@ mod budget;
 mod common;
 mod fixes;
 pub use budget::{Budget, Budgeted, Progress};
-pub use common::{CancelToken, Error, Limits, TileDataError, TileStateError, Usage, Workspace};
+pub use common::{
+    CancelToken, Error, Limits, SnapshotError, TileDataError, TileStateError, Usage, Workspace,
+};
 pub use fixes::UpstreamFixes;
 
 #[cfg(feature = "recast")]
