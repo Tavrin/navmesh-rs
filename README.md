@@ -206,6 +206,13 @@ agent parameters are preserved. With `parallel`, its per-agent phases run on the
 give the same result for every thread count. Each agent gets the trajectory `Crowd`
 gives with `UpstreamFixes::NEAREST_NEIGHBOURS`, bit for bit.
 
+For many agents with one destination, `crowd::field::GoalField` (not in
+recastnavigation) floods costs from the goal over a region's polygons once, with
+Detour's cost model, and steers each agent through a short funnel along it.
+Builds are budgeted and resumable, a tile change in the region starts a budgeted rebuild
+while earlier values are served as stale, and `GoalFieldCache` shares fields by goal, filter and region under
+a byte cap.
+
 ## Dynamic obstacles
 
 The default `tilecache` feature adds `tilecache::TileCache`, validated `DTLR`
