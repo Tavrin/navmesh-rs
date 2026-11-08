@@ -35,7 +35,7 @@ mod builder;
 mod endian;
 pub(crate) mod math;
 mod navmesh;
-mod node;
+pub(crate) mod node;
 pub(crate) mod query;
 mod query_local;
 mod resumable;

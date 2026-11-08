@@ -193,6 +193,47 @@ entrance, default/preset parameter customization, and finite repeatable adaptive
 sampling for every even division count and ring count at depths 1/3/32. Four
 compile-fail doctests enforce non-exhaustive parameter structs and state enums.
 
+### Crowd world (feature `crowd-world`)
+
+`Crowd::update` and `CrowdWorld::step` call the same per-agent phase functions. Checks,
+release builds, x86-64 Linux, 64-bit refs:
+
+- **`Crowd` unchanged.** `nav-port bake` crowd records of the nine crowd cases at 300
+  ticks per variant (all eight variants) are byte-identical to those of the previous
+  release's code (`cmp`, 9 of 9 files), so the oracle comparison above still holds.
+  `nav-orca digest` equals `reference/orca-determinism.golden` and
+  `reference/determinism.sh` passes.
+- **`CrowdWorld` equals `Crowd` with `NEAREST_NEIGHBOURS`.** `nav-port crowd-world`
+  drives both through the same eight variants (including removal and re-addition, and the
+  tile swap) and compares state, target state, position, the three velocities, corridor,
+  corner count and neighbour list bit for bit after every tick: 21,600 ticks and 323,000
+  active-agent ticks, 0 mismatches, both at 1 and at 4 rayon threads. `nav-orca
+  world-equivalence` does the same for the six ORCA qualification scenes, each with ORCA
+  and with sampled avoidance, for 1,200 ticks: 14,400 ticks and 6,643,200 active-agent
+  ticks, 0 mismatches.
+- **Thread count.** `tests/crowd_world.rs` steps 400 mixed sampled/ORCA agents with point
+  and velocity goals for 120 steps and requires identical digests at 1, 2, 4 and 16
+  threads.
+
+The full-tier scale driver is `nav-orca world-invariance` (feature `parallel`):
+20,000 ORCA agents on a generated 4 km square, 1,200 whole steps, comparing every
+step digest at 1, 2, 4 and 16 threads. The smaller interacting mixed-avoidance test
+above exercises point goals, walls, collisions and sampled avoidance.
+
+Decisions: keep `Crowd` as the parity API and share expression-ordered phase
+functions; replacing it with a tiered manager was rejected (cheap to reverse before
+release). Parallel phases gather from immutable arrays and commit between phases;
+locks and region tasks were rejected (cheap to reverse). A refused full-tier step
+leaves the world and budget untouched; deterministic demotion belongs to the tier
+scheduler. `CrowdWorld::default_agent_params()` recommends ORCA; explicit agent
+parameters, including sampled avoidance, are preserved. Silently overriding them
+was rejected (a default is cheap to change). Snapshots retain sliced-search node pools and heap order on the same navmesh,
+rather than restarting searches; changing the byte layout requires a format version change after release.
+
+Not established here: cost per agent, parallel speedup, mixed-tier scale and frame
+budgets, and cross-target world digests. These require the tier scheduler and scale
+qualification. Snapshot fuzz target compilation is checked; campaigns run separately.
+
 ## Upstream corrections (`UpstreamFixes`)
 
 Each correction is off by default, so every record above is unchanged. With a flag on, the

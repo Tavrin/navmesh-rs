@@ -1,24 +1,24 @@
 //! Budgeted sliced path queue, translated from DetourPathQueue.cpp; see NOTICE.
 use super::*;
 use crate::detour::query::DetachedQuery;
-struct Request {
-    handle: u32,
-    start: PolyRef,
-    end: PolyRef,
-    start_pos: V3,
-    end_pos: V3,
-    filter: usize,
-    status: u32,
-    keep: u8,
-    path: Vec<PolyRef>,
+pub(super) struct Request {
+    pub(super) handle: u32,
+    pub(super) start: PolyRef,
+    pub(super) end: PolyRef,
+    pub(super) start_pos: V3,
+    pub(super) end_pos: V3,
+    pub(super) filter: usize,
+    pub(super) status: u32,
+    pub(super) keep: u8,
+    pub(super) path: Vec<PolyRef>,
 }
 /// An eight-slot FIFO of sliced path searches; results expire after two updates.
 pub struct PathQueue {
-    requests: Vec<Request>,
-    head: usize,
-    next: u32,
-    max_path: usize,
-    query: Option<DetachedQuery>,
+    pub(super) requests: Vec<Request>,
+    pub(super) head: usize,
+    pub(super) next: u32,
+    pub(super) max_path: usize,
+    pub(super) query: Option<DetachedQuery>,
 }
 impl PathQueue {
     /// Allocates queue paths and the sliced-search node pool.
@@ -115,6 +115,11 @@ impl PathQueue {
         q.keep = 0;
         q.path.clear();
         Ok(h)
+    }
+    /// Number of requests holding a slot (pending, in progress or awaiting
+    /// collection).
+    pub fn pending(&self) -> usize {
+        self.requests.iter().filter(|r| r.handle != 0).count()
     }
     /// Upstream status bits of a request; an unknown handle reports failure.
     pub fn status(&self, handle: u32) -> u32 {

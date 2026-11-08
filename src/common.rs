@@ -53,6 +53,25 @@ pub enum Error {
     MeshChanged,
     /// The call was stopped by its [`CancelToken`] (not in recastnavigation).
     Cancelled,
+    /// Snapshot bytes are malformed (not in recastnavigation).
+    InvalidSnapshot(SnapshotError),
+}
+
+/// Why snapshot bytes were rejected.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+pub enum SnapshotError {
+    /// The bytes end before the snapshot does.
+    TooShort,
+    /// The magic number is not the snapshot's.
+    WrongMagic,
+    /// The version is not one this build reads.
+    WrongVersion,
+    /// A stored value is out of its valid range (the message names it).
+    InvalidValue(&'static str),
+    /// Bytes follow the end of the snapshot.
+    TrailingBytes,
 }
 
 /// Why stored tile state was rejected on restore.
@@ -124,6 +143,7 @@ impl fmt::Display for Error {
             Error::TileOutsideGrid => f.write_str("tile outside the keyed grid"),
             Error::MeshChanged => f.write_str("navmesh changed under the search"),
             Error::Cancelled => f.write_str("cancelled"),
+            Error::InvalidSnapshot(r) => write!(f, "invalid snapshot: {r:?}"),
         }
     }
 }

@@ -57,17 +57,25 @@ pub struct Scene {
     pub nav: NavMesh,
     pub goals: Vec<[f32; 3]>,
 }
-pub fn scene(name: &str, count: usize, orca: bool) -> Result<Scene, Error> {
-    let nav = if name == "corridor" {
-        floor(240, 8)?
+/// The six scenes the qualification runs (name, agents).
+pub const SCENES: [(&str, usize); 6] = [
+    ("circle", 64),
+    ("circle", 512),
+    ("crossing", 64),
+    ("corridor", 64),
+    ("doorway", 64),
+    ("dense", 2000),
+];
+fn scene_mesh(name: &str) -> Result<NavMesh, Error> {
+    if name == "corridor" {
+        floor(240, 8)
     } else if name == "doorway" {
-        doorway()?
+        doorway()
     } else {
-        floor(240, 240)?
-    };
-    let mut ws = Workspace::new();
-    let mut crowd = Crowd::new(&mut ws, &nav, count, 0.4)?;
-    crowd.set_obstacle_avoidance_params(3, ObstacleAvoidanceParams::quality(3)?)?;
+        floor(240, 240)
+    }
+}
+pub fn agent_params(orca: bool) -> AgentParams {
     let mut p = AgentParams::default();
     p.radius = 0.4;
     p.height = 2.;
@@ -78,7 +86,40 @@ pub fn scene(name: &str, count: usize, orca: bool) -> Result<Scene, Error> {
     if orca {
         p.avoidance = AvoidanceMode::Orca(OrcaParams::default());
     }
+    p
+}
+pub fn scene(name: &str, count: usize, orca: bool) -> Result<Scene, Error> {
+    let nav = scene_mesh(name)?;
+    let mut ws = Workspace::new();
+    let mut crowd = Crowd::new(&mut ws, &nav, count, 0.4)?;
+    crowd.set_obstacle_avoidance_params(3, ObstacleAvoidanceParams::quality(3)?)?;
+    let p = agent_params(orca);
     let mut goals = Vec::new();
+    for (pos, goal) in spawns(name, count) {
+        let id = crowd.add_agent(&mut ws, &nav, pos, p)?;
+        if name == "doorway" {
+            let (r, g) = doorway_goal(&nav, goal)?;
+            crowd.request_move_target(&nav, id, r, g)?;
+        }
+        goals.push(goal);
+    }
+    Ok(Scene { crowd, nav, goals })
+}
+fn doorway_goal(
+    nav: &NavMesh,
+    goal: [f32; 3],
+) -> Result<(navmesh_rs::detour::PolyRef, [f32; 3]), Error> {
+    let q = navmesh_rs::detour::NavMeshQuery::new(nav, 32)?;
+    let (r, g, _) = q.find_nearest_poly(
+        &goal,
+        &[2.; 3],
+        &navmesh_rs::detour::DefaultFilter::default(),
+    )?;
+    Ok((r, g))
+}
+/// Start and goal of every agent of a scene, in agent order.
+pub fn spawns(name: &str, count: usize) -> Vec<([f32; 3], [f32; 3])> {
+    let mut out = Vec::with_capacity(count);
     // Circle recurrence uses fixed constants and integer quantization, avoiding
     // platform trigonometry in initial state generation.
     let (cos, sin) = if count == 64 {
@@ -128,19 +169,9 @@ pub fn scene(name: &str, count: usize, orca: bool) -> Result<Scene, Error> {
                 ([x, 0., z], [x + 100., 0., z])
             }
         };
-        let id = crowd.add_agent(&mut ws, &nav, pos, p)?;
-        if name == "doorway" {
-            let q = navmesh_rs::detour::NavMeshQuery::new(&nav, 32)?;
-            let (r, g, _) = q.find_nearest_poly(
-                &goal,
-                &[2.; 3],
-                &navmesh_rs::detour::DefaultFilter::default(),
-            )?;
-            crowd.request_move_target(&nav, id, r, g)?;
-        }
-        goals.push(goal);
+        out.push((pos, goal));
     }
-    Ok(Scene { crowd, nav, goals })
+    out
 }
 pub fn tick(s: &mut Scene, ws: &mut Workspace) -> Result<(), Error> {
     for (i, goal) in s.goals.iter().enumerate() {
@@ -148,18 +179,79 @@ pub fn tick(s: &mut Scene, ws: &mut Workspace) -> Result<(), Error> {
         if a.target_state != TargetState::None && a.target_state != TargetState::Velocity {
             continue;
         }
-        let dx = goal[0] - a.npos[0];
-        let dz = goal[2] - a.npos[2];
-        let distance = (dx * dx + dz * dz).sqrt();
-        let speed = (distance / 0.05).min(2.);
-        let v = if distance > 0.001 {
-            [dx / distance * speed, 0., dz / distance * speed]
-        } else {
-            [0.; 3]
-        };
-        s.crowd.request_move_velocity(AgentId(i), v)?;
+        s.crowd
+            .request_move_velocity(AgentId(i), goal_velocity(goal, a.npos))?;
     }
     s.crowd.update(ws, &s.nav, 0.05)
+}
+fn goal_velocity(goal: &[f32; 3], npos: [f32; 3]) -> [f32; 3] {
+    let dx = goal[0] - npos[0];
+    let dz = goal[2] - npos[2];
+    let distance = (dx * dx + dz * dz).sqrt();
+    let speed = (distance / 0.05).min(2.);
+    if distance > 0.001 {
+        [dx / distance * speed, 0., dz / distance * speed]
+    } else {
+        [0.; 3]
+    }
+}
+/// Runs every scene with ORCA and with sampled avoidance through a `Crowd` with
+/// nearest-neighbour selection and a `CrowdWorld` in lockstep for 1,200 ticks and
+/// compares them bit for bit after every tick. Under the `parallel` feature the
+/// world uses the current rayon pool.
+pub fn world_equivalence() -> Result<(), Error> {
+    use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams, Goal};
+    use navmesh_rs::{Budget, Limits, UpstreamFixes};
+    let (mut ticks, mut agent_ticks) = (0u64, 0u64);
+    for (name, n) in SCENES {
+        for orca in [true, false] {
+            let mut s = scene(name, n, orca)?;
+            s.crowd.set_fixes(UpstreamFixes::NEAREST_NEIGHBOURS);
+            let mut p = CrowdWorldParams::default();
+            p.max_agents = n as u32;
+            p.max_heavy_agents = n as u32;
+            p.max_radius = 0.4;
+            p.fixed_dt = 0.05;
+            let mut w = CrowdWorld::new(&s.nav, &p, Limits::UNLIMITED)?;
+            w.set_obstacle_avoidance_params(3, ObstacleAvoidanceParams::quality(3)?)?;
+            for (pos, goal) in spawns(name, n) {
+                let h = w.add_agent(&s.nav, pos, agent_params(orca))?;
+                if name == "doorway" {
+                    let (poly, pos) = doorway_goal(&s.nav, goal)?;
+                    w.set_goal(&s.nav, h, Goal::Point { poly, pos })?;
+                }
+            }
+            let mut ws = Workspace::new();
+            for t in 0..1200 {
+                tick(&mut s, &mut ws)?;
+                for (i, goal) in s.goals.iter().enumerate() {
+                    let h = w.handle_at(i as u32).ok_or(Error::Failed)?;
+                    let a = w.agent(h).ok_or(Error::Failed)?;
+                    if a.target_state() != TargetState::None
+                        && a.target_state() != TargetState::Velocity
+                    {
+                        continue;
+                    }
+                    let v = goal_velocity(goal, a.position());
+                    w.set_goal(&s.nav, h, Goal::Velocity(v))?;
+                }
+                if !w.step(&s.nav, &mut Budget::unlimited())?.is_complete() {
+                    return Err(Error::Failed);
+                }
+                match navmesh_parity::crowd_world::compare(&s.crowd, &w) {
+                    Ok(k) => agent_ticks += k as u64,
+                    Err(e) => {
+                        let mode = if orca { "orca" } else { "sampled" };
+                        eprintln!("world-equivalence {name} {n} {mode} tick {t}: {e}");
+                        return Err(Error::Failed);
+                    }
+                }
+                ticks += 1;
+            }
+        }
+    }
+    println!("world-equivalence ticks {ticks} agent_ticks {agent_ticks} mismatches 0");
+    Ok(())
 }
 pub fn digest() -> Result<(), Error> {
     for (name, n) in [
@@ -310,6 +402,51 @@ pub fn invariants() -> Result<(), Error> {
                 finished_tick as f32 * 0.05
             );
         }
+    }
+    Ok(())
+}
+
+/// Full-tier scale proof; mixed-tier scheduling is qualified separately.
+#[cfg(feature = "parallel")]
+pub fn world_invariance() -> Result<(), Box<dyn std::error::Error>> {
+    use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams, Goal};
+    use navmesh_rs::{Budget, Limits};
+    let nav = floor(4000, 4000)?;
+    let mut expected = None;
+    for threads in [1, 2, 4, 16] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()?;
+        let digests = pool.install(|| -> Result<Vec<u64>, Error> {
+            let mut p = CrowdWorldParams::default();
+            p.max_agents = 20_000;
+            p.max_heavy_agents = 20_000;
+            let mut w = CrowdWorld::new(&nav, &p, Limits::UNLIMITED)?;
+            for i in 0..20_000 {
+                let pos = [
+                    20. + (i % 200) as f32 * 19.,
+                    0.,
+                    20. + (i / 200) as f32 * 39.,
+                ];
+                let h = w.add_agent(&nav, pos, CrowdWorld::default_agent_params())?;
+                w.set_goal(&nav, h, Goal::Velocity([0.5, 0., 0.25]))?;
+            }
+            let mut digests = Vec::new();
+            for _ in 0..1200 {
+                let report = w.step(&nav, &mut Budget::unlimited())?;
+                assert!(report.is_complete());
+                digests.push(w.digest());
+            }
+            Ok(digests)
+        })?;
+        if let Some(ref e) = expected {
+            assert_eq!(&digests, e);
+        }
+        println!(
+            "world-invariance agents 20000 steps 1200 threads {threads} final {:016x}",
+            digests[1199]
+        );
+        expected = Some(digests);
     }
     Ok(())
 }

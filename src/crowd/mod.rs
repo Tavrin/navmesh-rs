@@ -255,6 +255,87 @@ impl CrowdAgent {
         self.waiting_tile
             .filter(|_| self.target_state == TargetState::WaitingForTile)
     }
+    /// An inactive slot with its storage allocated through `ws`.
+    fn new_in(ws: &mut Workspace) -> Result<Self, Error> {
+        Ok(CrowdAgent {
+            active: false,
+            state: AgentState::Invalid,
+            target_state: TargetState::None,
+            npos: [0.; 3],
+            vel: [0.; 3],
+            nvel: [0.; 3],
+            dvel: [0.; 3],
+            desired_speed: 0.,
+            corridor: PathCorridor::new_in(ws, 256)?,
+            boundary: LocalBoundary::new_in(ws)?,
+            corners: ws.vec_with_capacity(4)?,
+            params: AgentParams::default(),
+            target_ref: 0,
+            target_pos: [0.; 3],
+            partial: false,
+            waiting_tile: None,
+            topology_time: 0.,
+            replan_time: 0.,
+            replan: false,
+            pathq: 0,
+            neis: ws.vec(6, (0, 0.))?,
+            nneis: 0,
+            disp: [0.; 3],
+            anim: Animation::default(),
+        })
+    }
+    /// Occupies a reset slot at the polygon `r` (zero: no polygon near, invalid).
+    fn place(&mut self, r: PolyRef, pos: V3, p: AgentParams) -> Result<(), Error> {
+        self.reset_slot();
+        self.params = p;
+        self.corridor.reset(r, pos)?;
+        self.npos = pos;
+        self.state = if r != 0 {
+            AgentState::Walking
+        } else {
+            AgentState::Invalid
+        };
+        self.target_state = TargetState::None;
+        self.active = true;
+        Ok(())
+    }
+    /// Sets a move target; `waiting` names the unloaded column holding `r`.
+    fn request_target(
+        &mut self,
+        r: PolyRef,
+        pos: V3,
+        waiting: Option<TileKey>,
+    ) -> Result<(), Error> {
+        self.target_ref = r;
+        self.target_pos = pos;
+        self.pathq = 0;
+        self.replan = false;
+        self.waiting_tile = waiting;
+        if waiting.is_some() {
+            self.target_state = TargetState::WaitingForTile;
+            if self.state == AgentState::Walking {
+                self.corridor.reset(self.corridor.first_poly(), self.npos)?;
+            }
+        } else {
+            self.target_state = TargetState::Requesting;
+        }
+        Ok(())
+    }
+    fn request_velocity(&mut self, vel: V3) {
+        self.target_ref = 0;
+        self.target_pos = vel;
+        self.pathq = 0;
+        self.replan = false;
+        self.target_state = TargetState::Velocity;
+    }
+    fn reset_target(&mut self) {
+        self.target_ref = 0;
+        self.target_pos = [0.; 3];
+        self.dvel = [0.; 3];
+        self.pathq = 0;
+        self.replan = false;
+        self.target_state = TargetState::None;
+    }
     // Preserve allocated storage, but no state belonging to a previous occupant.
     fn reset_slot(&mut self) {
         self.active = false;
@@ -316,32 +397,7 @@ impl Crowd {
         let pathq = PathQueue::new_in(ws, nav, 256, 4096)?;
         let mut agents = ws.vec_with_capacity(max_agents)?;
         for _ in 0..max_agents {
-            agents.push(CrowdAgent {
-                active: false,
-                state: AgentState::Invalid,
-                target_state: TargetState::None,
-                npos: [0.; 3],
-                vel: [0.; 3],
-                nvel: [0.; 3],
-                dvel: [0.; 3],
-                desired_speed: 0.,
-                corridor: PathCorridor::new_in(ws, 256)?,
-                boundary: LocalBoundary::new_in(ws)?,
-                corners: ws.vec_with_capacity(4)?,
-                params: AgentParams::default(),
-                target_ref: 0,
-                target_pos: [0.; 3],
-                partial: false,
-                waiting_tile: None,
-                topology_time: 0.,
-                replan_time: 0.,
-                replan: false,
-                pathq: 0,
-                neis: ws.vec(6, (0, 0.))?,
-                nneis: 0,
-                disp: [0.; 3],
-                anim: Animation::default(),
-            });
+            agents.push(CrowdAgent::new_in(ws)?);
         }
         Ok(Self {
             agents,
@@ -467,18 +523,7 @@ impl Crowd {
             .find_nearest_poly(&pos, &self.extents, &self.filters[p.query_filter_type])
             .unwrap_or((0, pos, false));
         let nearest = if r == 0 { pos } else { nearest };
-        let a = &mut self.agents[idx];
-        a.reset_slot();
-        a.params = p;
-        a.corridor.reset(r, nearest)?;
-        a.npos = nearest;
-        a.state = if r != 0 {
-            AgentState::Walking
-        } else {
-            AgentState::Invalid
-        };
-        a.target_state = TargetState::None;
-        a.active = true;
+        self.agents[idx].place(r, nearest, p)?;
         Ok(AgentId(idx))
     }
     /// Releases a slot for reuse, clearing its animation, target and cached state.
@@ -502,50 +547,29 @@ impl Crowd {
         pos: V3,
     ) -> Result<(), Error> {
         finite(pos)?;
-        // A polygon of an unloaded tile is accepted: the agent stops where it is
-        // and waits for the tile (`TargetState::WaitingForTile`).
-        let waiting = match nav.ref_state(r) {
-            RefState::Valid => None,
-            RefState::Unloaded(k) => Some(k),
-            _ => return Err(Error::InvalidRef),
-        };
-        let a = self.agent_mut(id)?;
-        a.target_ref = r;
-        a.target_pos = pos;
-        a.pathq = 0;
-        a.replan = false;
-        a.waiting_tile = waiting;
-        if waiting.is_some() {
-            a.target_state = TargetState::WaitingForTile;
-            if a.state == AgentState::Walking {
-                a.corridor.reset(a.corridor.first_poly(), a.npos)?;
-            }
-        } else {
-            a.target_state = TargetState::Requesting;
-        }
-        Ok(())
+        let waiting = target_tile(nav, r)?;
+        self.agent_mut(id)?.request_target(r, pos, waiting)
     }
     /// Switches to direct velocity control.
     pub fn request_move_velocity(&mut self, id: AgentId, vel: V3) -> Result<(), Error> {
         finite(vel)?;
-        let a = self.agent_mut(id)?;
-        a.target_ref = 0;
-        a.target_pos = vel;
-        a.pathq = 0;
-        a.replan = false;
-        a.target_state = TargetState::Velocity;
+        self.agent_mut(id)?.request_velocity(vel);
         Ok(())
     }
     /// Clears a movement request and its desired velocity.
     pub fn reset_move_target(&mut self, id: AgentId) -> Result<(), Error> {
-        let a = self.agent_mut(id)?;
-        a.target_ref = 0;
-        a.target_pos = [0.; 3];
-        a.dvel = [0.; 3];
-        a.pathq = 0;
-        a.replan = false;
-        a.target_state = TargetState::None;
+        self.agent_mut(id)?.reset_target();
         Ok(())
+    }
+}
+/// The unloaded column holding a target polygon, `None` when it is resident.
+/// A polygon of an unloaded tile is accepted: the agent stops where it is and
+/// waits for the tile (`TargetState::WaitingForTile`).
+fn target_tile(nav: &NavMesh, r: PolyRef) -> Result<Option<TileKey>, Error> {
+    match nav.ref_state(r) {
+        RefState::Valid => Ok(None),
+        RefState::Unloaded(k) => Ok(Some(k)),
+        _ => Err(Error::InvalidRef),
     }
 }
 fn finite(v: V3) -> Result<(), Error> {
@@ -589,4 +613,7 @@ fn insert_pos<T>(items: &[T], value: f32, key: impl Fn(&T) -> f32) -> usize {
             .unwrap_or(items.len())
     }
 }
+mod phases;
 mod update;
+#[cfg(feature = "crowd-world")]
+pub mod world;

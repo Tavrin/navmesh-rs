@@ -8,6 +8,19 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
+  agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
+  corridors, walls, corners and neighbours, and a sorted-cell neighbour grid rebuilt
+  each step (radix-sorted, no per-cell or 16-bit id cap). The per-agent phases run
+  data-parallel on the current rayon pool with the `parallel` feature; digests are
+  identical for any thread count. `step` charges `STEP_WORK_PER_AGENT` per active agent
+  plus the path queue's node expansions to a `Budget` before simulating and refuses
+  the step, untouched, when it does not fit. Agents match `Crowd` with
+  `UpstreamFixes::NEAREST_NEIGHBOURS` bit for bit. `'DCRW'` snapshots
+  (`to_bytes`/`from_bytes`) restore a world that steps identically on the same navmesh, including
+  in-progress sliced searches; malformed bytes give
+  `Error::InvalidSnapshot`.
+- `PathQueue::pending`.
 - Shared goal fields (`crowd::field`): `GoalField`, a budgeted, resumable Dijkstra
   flood from a goal over a region's polygons (radius or tile set) with Detour's
   portal-midpoint cost model and a `(cost, tile, polygon)` tie rule independent of
@@ -21,6 +34,11 @@ All notable changes to this project are documented in this file. The format foll
   `GoalField::steer` funnels through the next three polygons. `GoalFieldCache`
   shares fields by goal, filter and region with reference counts, least recently
   used eviction and a byte cap that refuses oversized regions.
+
+### Changed
+
+- `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
+  `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
 
 ## [0.2.2] - 2026-11-06
 
