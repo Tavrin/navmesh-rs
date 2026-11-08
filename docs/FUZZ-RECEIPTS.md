@@ -576,3 +576,9 @@ Crowd target extended to the ORCA mode, seeded from the archived corpus (641 fil
 
 `orca_step`, 2026-11-06: empty starting corpus, `-rss_limit_mb=512`, `-max_len=4096`, AddressSanitizer: two
 600 s chunks, 83480376 executions, coverage 308 → 308 (the second chunk added none). No crash.
+
+## `replace_ops`, 2026-11-08
+
+New target for `NavMesh::replace_tile` (model described in `fuzz/README.md`). Build only:
+`cargo +nightly fuzz build replace_ops` exits 0. No campaign has been run yet; the release rule
+(coverage flat for 10 minutes, 10 to 120 CPU-minutes, no crash) is still to be met.

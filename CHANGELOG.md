@@ -6,6 +6,37 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning
+  `Replaced`: swaps the tile at a prepared tile's column and layer all or nothing. Equal
+  content (same SHA-256) changes nothing: no salt advance, no epoch change, runtime flags
+  and areas kept. Other content takes the same slot with one salt advance. A refusal
+  leaves the resident tile with its salt, refs and runtime state.
+- Opt-in ref layouts for 64-bit refs: `RefLayout`, `NavMesh::with_layout`,
+  `NavMesh::ref_layout` and `prepare_tile_with_layout`. `RefLayout::WIDE_SALT` (22 salt,
+  28 tile, 14 polygon bits) allows 4,194,302 salt advances per slot instead of 65,534, with
+  at most 16,384 polygons per tile. The default layout and its refs are unchanged.
+- `NavMesh::salt_headroom`: salt advances left for a tile's slot.
+- Residency records version 4 and unload-state footers version 3 name an explicit ref
+  layout. Navmeshes with the default layout still write versions 3 and 2, byte for byte as
+  before.
+- `replace_ops` fuzz target.
+
+### Changed
+
+- `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of
+  the resident tile again keeps its refs and runtime flags; a refused tile no longer comes
+  back under a new salt with its flags reset. The layer comes from the tile header instead
+  of assuming layer 0 (removals still remove layer 0), and bytes whose header names
+  another column than the entry's key are refused. Installation now also computes the
+  tile's SHA-256 identity.
+- `TileCache` rebuilds replace the resident tile in place: a refused rebuild keeps the
+  resident tile instead of losing it. Identical bytes still advance the salt by default,
+  as upstream does, so tile-cache parity is unchanged; the new
+  `TileCache::set_keep_identical_tiles(true)` makes them keep the tile's refs, salt and
+  runtime flags.
+
 ## [0.2.2] - 2026-11-06
 
 ### Added

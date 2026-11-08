@@ -1,5 +1,5 @@
 #![cfg(feature = "tilecache")]
-use navmesh_rs::detour::{DefaultFilter, NavMesh, NavMeshParams, NavMeshQuery};
+use navmesh_rs::detour::{DefaultFilter, NavMesh, NavMeshParams, NavMeshQuery, RefState, TileKey};
 use navmesh_rs::tilecache::*;
 use navmesh_rs::{Error, Limits, Workspace};
 fn header(x: i32) -> LayerHeader {
@@ -500,6 +500,45 @@ fn invalid_codec_lengths_are_errors() {
         .is_err()
     );
     assert!(decompress_layer(&mut ws, &BadCodec, &data(0)).is_err());
+}
+#[test]
+fn rebuilds_replace_in_place_and_identical_bytes_can_keep_refs_and_flags() {
+    let key = TileKey { x: 0, y: 0 };
+    for keep in [false, true] {
+        let mut c = TileCache::new(
+            params(2),
+            RawCompressor,
+            DefaultMeshProcess,
+            Limits::default(),
+        )
+        .unwrap();
+        c.set_keep_identical_tiles(keep);
+        let r = c.add_tile(data(0)).unwrap();
+        let mut n = nav(2);
+        c.build_nav_mesh_tile(r, &mut n).unwrap();
+        let first = n.tile_ref(n.tile_index_at(0, 0, 0).unwrap());
+        n.set_poly_flags(first, 5).unwrap();
+        let (epoch, headroom) = (n.epoch(), n.salt_headroom(key, 0).unwrap());
+        c.build_nav_mesh_tile(r, &mut n).unwrap();
+        let again = n.tile_ref(n.tile_index_at(0, 0, 0).unwrap());
+        if keep {
+            assert_eq!(again, first);
+            assert_eq!((n.poly_flags(first), n.epoch()), (Ok(5), epoch));
+        } else {
+            // Upstream's behaviour: identical bytes still advance the salt.
+            assert_eq!(n.ref_state(first), RefState::Stale);
+            assert_eq!(n.salt_headroom(key, 0), Some(headroom - 1));
+            assert_ne!(n.poly_flags(again), Ok(5), "flags come from the bytes");
+        }
+        // One obstacle added and removed: exactly two more salt advances.
+        let headroom = n.salt_headroom(key, 0).unwrap();
+        let o = c.add_obstacle(cylinder(4.0)).unwrap();
+        drain(&mut c, &mut n);
+        c.remove_obstacle(o).unwrap();
+        drain(&mut c, &mut n);
+        assert_eq!(n.salt_headroom(key, 0), Some(headroom - 2));
+        assert_eq!(n.ref_state(again), RefState::Stale);
+    }
 }
 #[test]
 fn complete_carve_removes_tile_and_removal_restores_it() {

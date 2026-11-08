@@ -10,6 +10,8 @@
 //! that tile again with the same hash keeps the salt, so every ref into the
 //! unloaded copy is valid again and names the same polygon; any other content for
 //! that tile increments the salt. [`NavMesh::remove_tile`] increments it as before.
+//! [`NavMesh::replace_tile`] swaps a resident tile in place: equal content changes
+//! nothing, other content increments the salt once.
 //!
 //! Salts only grow (exhaustion is refused, see [`NavMesh`]), and a ref whose salt is
 //! older than its slot's is [`RefState::Stale`] for good: no sequence of commits,
@@ -21,7 +23,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::ops::Range;
 
-use super::{NavMesh, NavMeshParams, Placement, SlotTable, layout_bits};
+use super::{
+    NavMesh, NavMeshParams, Placement, RefLayout, SlotTable, layout_bits, layout_bits_with,
+};
 use crate::detour::math::{ilog2, next_pow2};
 use crate::detour::tile::{MeshTile, peek_header};
 use crate::detour::{EXT_LINK, NAVMESH_STATE_MAGIC, NAVMESH_STATE_VERSION, PolyRef, TileRef};
@@ -154,9 +158,9 @@ pub(crate) struct Parked {
 /// A tile parsed and validated by [`prepare_tile`], ready for [`NavMesh::commit`].
 #[derive(Clone, Debug)]
 pub struct PreparedTile {
-    tile: MeshTile,
-    hash: [u8; 32],
-    poly_bits: u32,
+    pub(super) tile: MeshTile,
+    pub(super) hash: [u8; 32],
+    pub(super) layout: RefLayout,
 }
 
 impl PreparedTile {
@@ -211,7 +215,8 @@ pub struct UnloadedTile {
     /// The bytes the tile was committed from.
     pub bytes: Vec<u8>,
     /// Runtime flags and areas for [`NavMesh::commit_with_state`]: the
-    /// [`NavMesh::store_tile_state`] prefix plus a versioned content-hash footer.
+    /// [`NavMesh::store_tile_state`] prefix plus a versioned content-hash footer
+    /// (which also names the ref layout when the navmesh has an explicit one).
     pub state: Vec<u8>,
     /// [`content_hash`] of `bytes`.
     pub content_hash: [u8; 32],
@@ -235,7 +240,32 @@ pub fn prepare_tile(
     limits: Limits,
     bytes: Vec<u8>,
 ) -> Result<PreparedTile, Error> {
-    let (_, _, poly_bits) = layout_bits(params)?;
+    let (salt, tile, poly) = layout_bits(params)?;
+    prepare_with_layout(
+        RefLayout::new(salt as u8, tile as u8, poly as u8),
+        limits,
+        bytes,
+    )
+}
+
+/// [`prepare_tile`] for a navmesh created by [`NavMesh::with_layout`] with
+/// `layout`; the layout is checked as `with_layout` checks it.
+pub fn prepare_tile_with_layout(
+    params: &NavMeshParams,
+    limits: Limits,
+    layout: RefLayout,
+    bytes: Vec<u8>,
+) -> Result<PreparedTile, Error> {
+    layout_bits_with(params, layout)?;
+    prepare_with_layout(layout, limits, bytes)
+}
+
+fn prepare_with_layout(
+    layout: RefLayout,
+    limits: Limits,
+    bytes: Vec<u8>,
+) -> Result<PreparedTile, Error> {
+    let poly_bits = u32::from(layout.poly_bits);
     let h = peek_header(&bytes)?;
     if PolyRef::BITS == 32
         && (h.poly_count < 0 || poly_bits < ilog2(next_pow2(h.poly_count as u32)))
@@ -249,11 +279,7 @@ pub fn prepare_tile(
     tile.links_free_list = tile.reset_links();
     NavMesh::prepare_internal_links(&mut tile, 0);
     let hash = content_hash(&tile.data);
-    Ok(PreparedTile {
-        tile,
-        hash,
-        poly_bits,
-    })
+    Ok(PreparedTile { tile, hash, layout })
 }
 
 /// Checks a tile state blob against the ref and polygon count it will be applied
@@ -409,6 +435,11 @@ impl StreamState {
     /// Records that `slot` lost its tile (unload, removal, forgotten reservation).
     pub(super) fn log_removal(&mut self, slot: u32) {
         self.bump_epoch();
+        self.record_removal(slot);
+    }
+
+    /// Records a removal at the current structural epoch.
+    pub(super) fn record_removal(&mut self, slot: u32) {
         let e = (self.epoch, slot);
         if self.log.len() < REMOVAL_LOG_CAPACITY {
             self.log.push(e);
@@ -427,7 +458,8 @@ impl NavMesh {
     }
 
     /// Structural change counter: incremented by every commit, add, restore,
-    /// unload, removal and forgotten reservation.
+    /// unload, removal and forgotten reservation, and once by a replacement that
+    /// changes content.
     pub fn epoch(&self) -> u64 {
         self.stream.epoch
     }
@@ -535,8 +567,13 @@ impl NavMesh {
     /// when global off-mesh links
     /// are on (all connection counts times all polygon, link and tile counts).
     pub fn commit_cost(&self, t: &PreparedTile) -> u64 {
-        let (x, y) = (t.tile.header.x, t.tile.header.y);
-        let mut cost = 1 + t.tile.polys.len() as u64;
+        self.link_cost(&t.tile)
+    }
+
+    /// [`NavMesh::commit_cost`] of a parsed tile.
+    pub(super) fn link_cost(&self, t: &MeshTile) -> u64 {
+        let (x, y) = (t.header.x, t.header.y);
+        let mut cost = 1 + t.polys.len() as u64;
         let mut add = |j: usize| cost += self.tile(j).map_or(0, |t| t.polys.len() as u64);
         for j in self.tiles_at(x, y, 32) {
             add(j);
@@ -548,8 +585,8 @@ impl NavMesh {
         }
         if self.global_off_mesh {
             cost = cost.saturating_add(self.resident as u64);
-            let mut connections = t.tile.off_mesh_cons.len() as u64;
-            let mut candidates = 1 + t.tile.polys.len() as u64 + t.tile.links.len() as u64;
+            let mut connections = t.off_mesh_cons.len() as u64;
+            let mut candidates = 1 + t.polys.len() as u64 + t.links.len() as u64;
             for i in self.resident_slots() {
                 if let Some(tile) = self.tile(i) {
                     connections = connections.saturating_add(tile.off_mesh_cons.len() as u64);
@@ -609,8 +646,9 @@ impl NavMesh {
         };
         let would = self.encode_poly_id(salt, target.ti as u32, 0);
         let size = check_state(would, t.tile.polys.len(), state)?;
+        let (version, layout) = self.state_footer_kind();
         let expected = size
-            .checked_add(STREAM_STATE_FOOTER)
+            .checked_add(STREAM_STATE_FOOTER + layout.map_or(0, |l| l.len()))
             .ok_or(Error::SizeOverflow)?;
         if state.len() < expected {
             return Err(Error::InvalidTileState(TileStateError::TooShort));
@@ -622,10 +660,10 @@ impl NavMesh {
         if footer[..4] != STREAM_STATE_MAGIC {
             return Err(Error::InvalidTileState(TileStateError::WrongMagic));
         }
-        if footer[4..8] != 2u32.to_le_bytes() {
+        if footer[4..8] != version.to_le_bytes() {
             return Err(Error::InvalidTileState(TileStateError::WrongVersion));
         }
-        if footer[8..40] != t.hash {
+        if footer[8..40] != t.hash || layout.is_some_and(|l| footer[40..] != l) {
             return Err(Error::InvalidTileState(TileStateError::WrongTile));
         }
         let ti = target.ti;
@@ -636,8 +674,25 @@ impl NavMesh {
         Ok(r)
     }
 
+    /// Footer version of this navmesh's tile state blobs and, for an explicit ref
+    /// layout (version 3), the layout bytes that follow the content hash.
+    fn state_footer_kind(&self) -> (u32, Option<[u8; 4]>) {
+        if self.has_explicit_layout() {
+            let l = self.ref_layout();
+            (3, Some([l.salt_bits, l.tile_bits, l.poly_bits, 0]))
+        } else {
+            (2, None)
+        }
+    }
+
+    /// Parses `bytes` for this navmesh, as [`prepare_tile_with_layout`] with its
+    /// parameters, limits and layout.
+    pub(crate) fn prepare_for(&self, bytes: Vec<u8>) -> Result<PreparedTile, Error> {
+        prepare_with_layout(self.ref_layout(), self.limits, bytes)
+    }
+
     fn commit_target(&self, t: &PreparedTile) -> Result<super::Target, Error> {
-        if t.poly_bits != self.poly_bits {
+        if t.layout != self.ref_layout() {
             return Err(Error::InvalidParameter(
                 "tile prepared for another ref layout",
             ));
@@ -656,25 +711,30 @@ impl NavMesh {
     pub fn unload_tile(&mut self, r: TileRef) -> Result<UnloadedTile, Error> {
         let ti = self.resident_slot(r)?;
         let size = self.tile_state_size(r)?;
+        let (version, layout) = self.state_footer_kind();
         let mut state = Vec::new();
         state
             .try_reserve_exact(
-                size.checked_add(STREAM_STATE_FOOTER)
+                size.checked_add(STREAM_STATE_FOOTER + layout.map_or(0, |l| l.len()))
                     .ok_or(Error::SizeOverflow)?,
             )
             .map_err(|_| Error::AllocationFailed)?;
         state.resize(size, 0);
         self.store_tile_state(r, &mut state)?;
+        let known = self.slots[ti].hash;
         let Some(tile) = self.detach(ti) else {
             return Err(Error::InvalidRef);
         };
         let h = tile.header;
         let key = TileKey { x: h.x, y: h.y };
-        let hash = content_hash(&tile.data);
+        let hash = known.unwrap_or_else(|| content_hash(&tile.data));
         // Capacity was reserved before detaching: appending cannot allocate.
         state.extend_from_slice(&STREAM_STATE_MAGIC);
-        state.extend_from_slice(&2u32.to_le_bytes());
+        state.extend_from_slice(&version.to_le_bytes());
         state.extend_from_slice(&hash);
+        if let Some(l) = layout {
+            state.extend_from_slice(&l);
+        }
         let s = &mut self.slots[ti];
         s.next = -1;
         s.parked = Some(Parked {
@@ -774,7 +834,7 @@ impl NavMesh {
                         y: t.header.y,
                     },
                     layer: t.header.layer,
-                    hash: content_hash(&t.data),
+                    hash: s.hash.unwrap_or_else(|| content_hash(&t.data)),
                     polys: t.polys.len() as u32,
                 }),
                 (None, p) => p,
@@ -788,6 +848,9 @@ impl NavMesh {
         ResidencyRecord {
             ref_bits: PolyRef::BITS,
             poly_bits: self.poly_bits,
+            salt_tile_bits: self
+                .has_explicit_layout()
+                .then_some((self.salt_bits, self.tile_bits)),
             max_tiles: self.params.max_tiles as u32,
             policy: self.stream.policy,
             entries,
@@ -797,22 +860,26 @@ impl NavMesh {
     /// Restores a [`NavMesh::residency`] record into a navmesh that has never held
     /// a tile (epoch 0). Every tile of the record becomes unloaded in its slot;
     /// committing the same bytes makes saved refs valid. The record must come
-    /// from a navmesh with the same ref width, polygon-bit layout, `max_tiles`
-    /// and slot policy. All or nothing.
+    /// from a navmesh with the same ref width, ref layout, `max_tiles` and slot
+    /// policy. All or nothing.
     pub fn restore_residency(&mut self, rec: &ResidencyRecord) -> Result<(), Error> {
         if self.stream.epoch != 0 || self.resident != 0 {
             return Err(Error::InvalidParameter(
                 "residency restored into a navmesh that held tiles",
             ));
         }
+        let layout = self
+            .has_explicit_layout()
+            .then_some((self.salt_bits, self.tile_bits));
         if rec.ref_bits != PolyRef::BITS
             || rec.poly_bits != self.poly_bits
+            || rec.salt_tile_bits != layout
             || rec.max_tiles != self.params.max_tiles as u32
             || rec.policy != self.stream.policy
         {
             return Err(Error::InvalidParameter("residency record layout"));
         }
-        let mask = ((1u64 << self.salt_bits) - 1) as u32;
+        let mask = self.salt_mask();
         let mut keys = BTreeMap::new();
         let mut prev: Option<u32> = None;
         for e in &rec.entries {
@@ -881,13 +948,20 @@ struct ResidencyEntry {
 pub struct ResidencyRecord {
     ref_bits: u32,
     poly_bits: u32,
+    /// Salt and tile bits of an explicit ref layout ([`NavMesh::with_layout`]);
+    /// `None` for the layout the parameters imply.
+    salt_tile_bits: Option<(u32, u32)>,
     max_tiles: u32,
     policy: SlotPolicy,
     entries: Vec<ResidencyEntry>,
 }
 
 const RES_MAGIC: u32 = u32::from_le_bytes(*b"NVRS");
+/// Version of records with the implied ref layout.
 const RES_VERSION: u32 = 3;
+/// Version of records with an explicit ref layout: salt and tile bits follow the
+/// polygon bits in the header.
+const RES_VERSION_LAYOUT: u32 = 4;
 const RES_HEADER: usize = 44;
 const RES_ENTRY: usize = 64;
 
@@ -905,8 +979,16 @@ impl ResidencyRecord {
     /// Little-endian bytes: a 48-byte header (magic `NVRS`, version, ref bits,
     /// max tiles, policy, keyed origin and size, polygon bits, entry count) and 64 bytes per
     /// slot (slot, salt, tile flag, layer, x, y, polygon count, pad, content hash).
+    /// A navmesh with an explicit ref layout ([`NavMesh::with_layout`]) writes
+    /// version 4, whose header has salt bits and tile bits between the polygon
+    /// bits and the entry count (56 bytes); otherwise the version is 3.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(RES_HEADER + self.entries.len() * RES_ENTRY);
+        let mut out = Vec::with_capacity(RES_HEADER + 12 + self.entries.len() * RES_ENTRY);
+        let version = if self.salt_tile_bits.is_some() {
+            RES_VERSION_LAYOUT
+        } else {
+            RES_VERSION
+        };
         let (tag, o, w, h, l) = match self.policy {
             SlotPolicy::Keyed {
                 origin,
@@ -916,7 +998,7 @@ impl ResidencyRecord {
             } => (1u32, origin, width, height, max_layers),
             SlotPolicy::Sequential => (0, [0, 0], 0, 0, 0),
         };
-        for v in [RES_MAGIC, RES_VERSION, self.ref_bits, self.max_tiles, tag] {
+        for v in [RES_MAGIC, version, self.ref_bits, self.max_tiles, tag] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.extend_from_slice(&o[0].to_le_bytes());
@@ -925,6 +1007,10 @@ impl ResidencyRecord {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.extend_from_slice(&self.poly_bits.to_le_bytes());
+        if let Some((salt_bits, tile_bits)) = self.salt_tile_bits {
+            out.extend_from_slice(&salt_bits.to_le_bytes());
+            out.extend_from_slice(&tile_bits.to_le_bytes());
+        }
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         for e in &self.entries {
             out.extend_from_slice(&e.slot.to_le_bytes());
@@ -958,7 +1044,8 @@ impl ResidencyRecord {
             Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         };
         let i = |at: usize| -> Result<i32, Error> { Ok(u(at)? as i32) };
-        if u(0)? != RES_MAGIC || u(4)? != RES_VERSION {
+        let version = u(4)?;
+        if u(0)? != RES_MAGIC || (version != RES_VERSION && version != RES_VERSION_LAYOUT) {
             return Err(bad());
         }
         let ref_bits = u(8)?;
@@ -967,6 +1054,24 @@ impl ResidencyRecord {
         }
         let max_tiles = u(12)?;
         let poly_bits = u(40)?;
+        let (salt_tile_bits, count_at) = if version == RES_VERSION_LAYOUT {
+            let (salt_bits, tile_bits) = (u(44)?, u(48)?);
+            let default = RefLayout::default();
+            // An explicit layout needs 64-bit refs; the default one is version 3.
+            if ref_bits != 64
+                || (salt_bits, tile_bits, poly_bits)
+                    == (
+                        u32::from(default.salt_bits),
+                        u32::from(default.tile_bits),
+                        u32::from(default.poly_bits),
+                    )
+            {
+                return Err(bad());
+            }
+            (Some((salt_bits, tile_bits)), RES_HEADER + 8)
+        } else {
+            (None, RES_HEADER)
+        };
         let policy = match u(16)? {
             0 => {
                 if u(20)? != 0 || u(24)? != 0 || u(28)? != 0 || u(32)? != 0 || u(36)? != 0 {
@@ -982,8 +1087,8 @@ impl ResidencyRecord {
             },
             _ => return Err(bad()),
         };
-        let count = u(RES_HEADER)? as usize;
-        let body = RES_HEADER + 4;
+        let count = u(count_at)? as usize;
+        let body = count_at + 4;
         if data.len() < body
             || (data.len() - body) / RES_ENTRY != count
             || !(data.len() - body).is_multiple_of(RES_ENTRY)
@@ -1037,6 +1142,7 @@ impl ResidencyRecord {
         Ok(ResidencyRecord {
             ref_bits,
             poly_bits,
+            salt_tile_bits,
             max_tiles,
             policy,
             entries,

@@ -137,8 +137,9 @@ manifest to the new grid and `apply` merges the job's `manifest_delta`, refusing
 under another configuration. Rebaking only the dirty tiles gives exactly the tiles and
 manifest of a full bake. `step` works in slices of a `Budget`, `run_parallel` uses the rayon
 pool, and a `CancelToken` stops a job without ever returning a partial tile. A navmesh fed
-by `TileInstaller` replaces a resident tile with its rebake and keeps the newest queued
-version of each tile; after a cancel, every tile is whole, new exactly where
+by `TileInstaller` replaces a resident tile with its rebake in place (`NavMesh::replace_tile`:
+identical bytes keep refs and runtime flags, a refused tile stays as it was) and keeps the
+newest queued version of each tile; after a cancel, every tile is whole, new exactly where
 `manifest_delta` lists it. For a large `Input`, `Input::indexed` builds the spatial index
 once so each fetch costs what the tile holds, not what the mesh holds. Manifest digests are
 not collision resistant: use the manifest as a cache for trusted content.

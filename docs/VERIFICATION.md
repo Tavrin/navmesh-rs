@@ -310,8 +310,14 @@ Independent release repeats are identical on every crowd and tile-cache case.
   a conservative scratch/output charge. Navmesh mutation also uses the navmesh's
   own limits. Custom compressor/process implementations own their internal costs.
 - Failed rebuilds stay queued for retry; previously completed rebuilds remain
-  applied. A navmesh insertion error can leave the old tile removed, as upstream
-  does. There is no transaction/rollback guarantee across the update.
+  applied. A rebuilt layer is prepared and then replaces the resident tile in
+  place, so a navmesh insertion error leaves the old tile, its refs and its
+  runtime flags in place (upstream removes it first). By default identical bytes
+  still advance the salt, as upstream's remove-then-add does: with the equal-bytes
+  no-op on by default, three tile-cache cases (`dungeon_tilecache`,
+  `seams_tilecache`, `multilevel_tilecache`) differed from the oracle only in
+  salts. `TileCache::set_keep_identical_tiles(true)` opts into the no-op. There is
+  no transaction/rollback guarantee across the update.
 - The pinned vertex-removal feasibility test allocates 48 scalar entries but
   indexes triples beyond them. Rust reserves 48 full triples, checks capacities,
   and returns errors for invalid/nonmanifold meshes. No parity claim covers
@@ -611,7 +617,8 @@ Upstream tile bytes and bare runtime tile-state formats remain unchanged.
 
 Salt exhaustion refuses removal, forgotten reservations and changed-content
 commits before mutation with `Error::SaltExhausted`. A slot supports
-`2^salt_bits - 2` advances (65,534 with 64-bit refs); identical unload/reload
+`2^salt_bits - 2` advances (65,534 with the default 64-bit layout, 4,194,302 with
+the opt-in `RefLayout::WIDE_SALT`); identical unload/reload
 works at the limit. The explicitly named `restore_tile_allow_stale` API retains
 its documented upstream-compatible ability to override history.
 
@@ -651,6 +658,10 @@ checked, and how:
 | Residency records are untrusted input | fuzz `residency_record`, every truncation and byte flip in `tests/streaming.rs` |
 | State cannot be applied to different content with a coincidentally equal initial ref | fresh-mesh, truncated-footer, trailing-byte and damaged-footer regressions in `state_and_budgeted_commits_are_all_or_nothing`; damaged-hash operations in fuzz `stream_ops` |
 | Keyed stacked layers break query ties like canonical sequential installation | `keyed_layer_ties_match_canonical_sequential_queries`, before and after eviction/reload |
+| `replace_tile` with equal content changes nothing (ref, salt, epoch, runtime flags); with other content it ends exactly as `remove_tile` then `commit` (tiles, links, residency record; one epoch advance), in the same slot with one salt advance | `replace_tile_is_atomic_and_equal_content_changes_nothing` (both slot policies), fuzz `replace_ops` |
+| A refused replacement (budget, foreign layout, exhausted salt, keyed grid) changes nothing | same test, `salt_exhaustion_never_resurrects_refs_and_is_atomic`, fuzz `replace_ops` (epoch and residency record compared after every refusal) |
+| The installer keeps refs and runtime flags for identical bytes and keeps the resident tile when the new bytes are refused; tile-cache rebuilds do the same for identical bytes when `set_keep_identical_tiles(true)`, and otherwise advance the salt as upstream; an obstacle add/remove cycle costs exactly two salt advances | `installer_replaces_resident_tiles_and_the_newest_queued_version_wins`, `rebuilds_replace_in_place_and_identical_bytes_can_keep_refs_and_flags`, tile-cache parity cases |
+| The wide-salt layout is opt-in: the default layout writes the same residency and state bytes as before; the wide layout reports 4,194,302 advances on a fresh slot, and its records and state blobs restore only into the same layout | `wide_salt_layout_is_opt_in_and_persisted_with_its_refs`, the unchanged residency and state tests above |
 
 `NAV_PORT_STREAMED=1` unloads every tile of a tiled case and commits it again
 from `prepare_tile` with its saved state before all query records. Malformed-tile
@@ -718,6 +729,20 @@ Decisions and reversal costs:
 - Tile-cache `load_tile` restores obstacle associations and always queues a
   rebuild, including obstacle-free layers. `add_tile` retains oracle behaviour;
   merging these entry points would change existing callers' update timing.
+- `replace_tile` decides by SHA-256 identity and advances the salt once for
+  other content; the removal goes into the epoch
+  log, so resumable searches touching the slot report `MeshChanged`. A tile with
+  equal content keeps everything, which is what lets the installer (and a tile
+  cache with `set_keep_identical_tiles(true)`) rebuild a tile without burning its
+  salt. Salts stay monotonic: replacement never
+  moves a salt backwards or reuses one.
+- Explicit ref layouts are 64-bit only and opt-in. A navmesh with the default
+  layout writes residency version 3 and state footer version 2 unchanged; an
+  explicit layout writes residency version 4 (salt and tile bits after the
+  polygon bits in the header) and state footer version 3 (the layout's three
+  field widths and a zero byte after the hash). Records and blobs are accepted
+  only by a navmesh with the same layout. Reversal is cheap until a consumer
+  persists refs or records in a wide layout.
 
 ## Mesh merging, tile state and byte order
 
@@ -1255,6 +1280,9 @@ tile per call.
 
 Measured on the 4 km world (2,809 tiles, 3.2 KiB each), one tile per call: per call mean
 6 us, p99 12 us, max 33 us, no call over 1 ms, 1.8 us per KiB (1 km, one thread: max 12 us).
+These figures predate installation through `prepare_tile` and `NavMesh::replace_tile`,
+which adds a SHA-256 of the tile bytes per installed tile; they have not been measured
+again.
 
 At about 2 us per KiB, a 1 ms call fits roughly 500 KiB of tile data, a few hundred times
 the size of these tiles; a larger tile costs proportionally more and a tile is not split, so
