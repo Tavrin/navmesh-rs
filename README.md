@@ -198,6 +198,13 @@ be used independently. Agent handles name reusable slots. The mesh is borrowed o
 during calls, allowing tile changes between ticks. An update error may leave earlier
 phases applied; do not consume that tick as a successful simulation result.
 
+For many agents with one destination, `crowd::field::GoalField` (not in
+recastnavigation) floods costs from the goal over a region's polygons once, with
+Detour's cost model, and steers each agent through a short funnel along it.
+Builds are budgeted and resumable, tile changes in the region invalidate the
+affected part, and `GoalFieldCache` shares fields by goal, filter and region under
+a byte cap.
+
 ## Dynamic obstacles
 
 The default `tilecache` feature adds `tilecache::TileCache`, validated `DTLR`

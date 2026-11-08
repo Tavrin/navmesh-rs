@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Shared goal fields (`crowd::field`): `GoalField`, a budgeted, resumable Dijkstra
+  flood from a goal over a region's polygons (radius or tile set) with Detour's
+  portal-midpoint cost model and a `(cost, tile, polygon)` tie rule independent of
+  tile slots, stored per tile without a node-pool cap. One-way off-mesh connections
+  are followed through a reverse link index. Removed, unloaded or replaced tiles
+  invalidate the values that route through them and start a budgeted rebuild.
+  `GoalField::steer` funnels through the next three polygons. `GoalFieldCache`
+  shares fields by goal, filter and region with reference counts, least recently
+  used eviction and a byte cap that refuses oversized regions.
+
 ## [0.2.2] - 2026-11-06
 
 ### Added

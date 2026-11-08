@@ -21,6 +21,7 @@ mod orca;
 // Public helper calls reset usage; internal `_in` calls compose within the
 // manager's existing per-call budget.
 mod corridor;
+pub mod field;
 mod grid;
 mod queue;
 pub use avoidance::{ObstacleAvoidanceParams, ObstacleAvoidanceQuery};
