@@ -8,6 +8,21 @@ use navmesh_rs::{Budget, Budgeted, Error, Limits};
 // Grid polygons with explicit adjacency; obstacles delete cells. The independent
 // oracle below works on the closed union of unit squares, without Detour queries.
 fn grid(width: usize, height: usize, blocked: &[usize]) -> Result<NavMesh, Error> {
+    grid_linked(width, height, blocked, &[])
+}
+// The same grid with off-mesh connections `(start, end, bidirectional)`.
+fn grid_linked(
+    width: usize,
+    height: usize,
+    blocked: &[usize],
+    connections: &[([f32; 3], [f32; 3], bool)],
+) -> Result<NavMesh, Error> {
+    let con_verts: Vec<f32> = connections
+        .iter()
+        .flat_map(|(a, b, _)| a.iter().chain(b).copied())
+        .collect();
+    let n = connections.len();
+    let con_dir: Vec<u8> = connections.iter().map(|c| u8::from(c.2)).collect();
     let mut verts = Vec::new();
     for z in 0..=height {
         for x in 0..=width {
@@ -53,6 +68,13 @@ fn grid(width: usize, height: usize, blocked: &[usize]) -> Result<NavMesh, Error
         ch: 1.0,
         walkable_height: 1.0,
         walkable_climb: 0.1,
+        off_mesh_con_verts: &con_verts,
+        off_mesh_con_rad: &vec![0.1; n],
+        off_mesh_con_flags: &vec![2; n],
+        off_mesh_con_areas: &vec![0; n],
+        off_mesh_con_dir: &con_dir,
+        off_mesh_con_user_id: &vec![0; n],
+        off_mesh_con_count: n as i32,
         ..Default::default()
     })?;
     let mut nav = NavMesh::with_limits(
@@ -243,6 +265,63 @@ fn unsupported_and_mesh_identity() -> Result<(), Error> {
         search.resume(&oq, &mut Budget::unlimited()),
         Err(Error::MeshChanged)
     );
+    Ok(())
+}
+
+#[test]
+fn off_mesh_connections_are_traversed_in_their_direction() -> Result<(), Error> {
+    // Column x = 2 is blocked: the halves connect only through the connection.
+    let blocked = [2, 7, 12];
+    let (a, b) = ([1.5, 0.0, 1.5], [3.5, 0.0, 1.5]);
+    for bidirectional in [false, true] {
+        let nav = grid_linked(5, 3, &blocked, &[(a, b, bidirectional)])?;
+        let q = NavMeshQuery::new(&nav, 256)?;
+        let left = endpoint(&q, 0.5, 0.5)?;
+        let right = endpoint(&q, 4.5, 2.5)?;
+        let filter = DefaultFilter::default();
+        let Budgeted::Complete(path) =
+            q.find_any_angle_path(left, right, &filter, &mut Budget::unlimited())?
+        else {
+            panic!("unlimited budget");
+        };
+        let expected = 2.0 * 2f32.sqrt() + 2.0;
+        assert!((path.length - expected).abs() < 1e-5, "{}", path.length);
+        let xz: Vec<[f32; 2]> = path.points.iter().map(|p| [p[0], p[2]]).collect();
+        assert_eq!(xz, [[0.5, 0.5], [1.5, 1.5], [3.5, 1.5], [4.5, 2.5]]);
+        let (_, connection) = nav.tile_and_poly_by_ref(path.polygons[1])?;
+        assert_eq!(connection.poly_type(), detour::POLYTYPE_OFFMESH_CONNECTION);
+        let mut search = AnyAngleSearch::begin(&q, left, right, &filter)?;
+        loop {
+            let mut budget = Budget::new(1);
+            let result = search.resume(&q, &mut budget)?;
+            assert!(budget.used() <= 1);
+            if let Budgeted::Complete(resumed) = result {
+                assert_eq!(resumed, path);
+                break;
+            }
+        }
+        let blocked_filter = DefaultFilter {
+            exclude_flags: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            q.find_any_angle_path(left, right, &blocked_filter, &mut Budget::unlimited()),
+            Err(Error::Failed)
+        );
+        let capped = NavMeshQuery::new(&nav, 2)?;
+        assert_eq!(
+            capped.find_any_angle_path(left, right, &filter, &mut Budget::unlimited()),
+            Err(Error::LimitExceeded)
+        );
+        let back = q.find_any_angle_path(right, left, &filter, &mut Budget::unlimited());
+        if bidirectional {
+            assert!(
+                matches!(back, Ok(Budgeted::Complete(ref p)) if (p.length - expected).abs() < 1e-5)
+            );
+        } else {
+            assert_eq!(back, Err(Error::Failed));
+        }
+    }
     Ok(())
 }
 

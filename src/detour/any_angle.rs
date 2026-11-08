@@ -2,9 +2,9 @@
 //! IJCAI 2017, <https://doi.org/10.24963/ijcai.2017/70>.
 //!
 //! Distances and visibility are in xz. Heights are sampled from detail surfaces.
-//! Non-observable successors conservatively retain both endpoint roots rather
-//! than applying corner/tautness pruning. This trades extra states for simplicity.
-use super::{NULL_LINK, NavMeshQuery, POLYTYPE_GROUND, PolyRef, QueryFilter};
+//! Non-observable successors turn only at interval endpoints that are mesh
+//! boundary vertices (corner pruning); no further tautness pruning is applied.
+use super::{NULL_LINK, NavMeshQuery, OFFMESH_CON_BIDIR, POLYTYPE_GROUND, PolyRef, QueryFilter};
 use crate::common::sqrtf;
 use crate::{Budget, Budgeted, Error};
 use alloc::{collections::BinaryHeap, sync::Arc, vec::Vec};
@@ -25,7 +25,9 @@ pub struct AnyAnglePath {
     pub points: Vec<[f32; 3]>,
     /// Total xz distance, independent of the uniform cost multiplier.
     pub length: f32,
-    /// Containing polygon for each point, for segment validation and height lookup.
+    /// Polygon for each segment's departure point, followed by the goal polygon.
+    /// An off-mesh segment carries its connection polygon; ground segments carry
+    /// a containing ground polygon for validation and height lookup.
     pub polygons: Vec<PolyRef>,
     /// Number of root/interval states expanded.
     pub expanded: u64,
@@ -86,7 +88,6 @@ pub struct AnyAngleSearch<'f, F: QueryFilter + ?Sized> {
     best: Option<(usize, Option<[f32; 3]>, f32)>,
     expanded: u64,
     done: bool,
-    saw_offmesh: bool,
     failure: Option<Error>,
 }
 fn cross(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> f64 {
@@ -159,6 +160,9 @@ fn portal_in_polygon(
         return None;
     }
     let sign = if winding > 0.0 { 1.0 } else { -1.0 };
+    // The shared edge of a neighbour in another tile is collinear with the
+    // portal up to f32 rounding of each tile's vertices; it does not bound it.
+    let mut skip = 0u32;
     let mut lo = 0.0f64;
     let mut hi = 1.0f64;
     for i in 0..count {
@@ -166,6 +170,14 @@ fn portal_in_polygon(
         let b = vertex((i + 1) % count);
         let u = cross(a, b, edge[0]) * sign;
         let v = cross(a, b, edge[1]) * sign;
+        if u >= 0.0 && v >= 0.0 {
+            continue;
+        }
+        let tolerance = rounding(&[a, b, edge[0], edge[1]]) * f64::from(distance(a, b));
+        if u.abs() <= tolerance && v.abs() <= tolerance {
+            skip |= 1 << i;
+            continue;
+        }
         if u < 0.0 && v < 0.0 {
             return None;
         }
@@ -176,7 +188,65 @@ fn portal_in_polygon(
             hi = hi.min(u / (u - v));
         }
     }
-    (lo <= hi).then(|| [lerp(edge[0], edge[1], lo), lerp(edge[0], edge[1], hi)])
+    if lo == 0.0 && hi == 1.0 {
+        return Some(edge);
+    }
+    settle(edge, lo, hi, |p| {
+        (0..count).all(|i| {
+            skip & (1 << i) != 0 || cross(vertex(i), vertex((i + 1) % count), p) * sign >= 0.0
+        })
+    })
+}
+// Distance under which two tiles' copies of a border vertex or edge are the
+// same: eight f32 ulps of the coordinate magnitude.
+fn rounding(points: &[[f32; 3]]) -> f64 {
+    let magnitude = points
+        .iter()
+        .flat_map(|p| [p[0].abs(), p[2].abs()])
+        .fold(1.0f32, f32::max);
+    f64::from(magnitude) * f64::from(f32::EPSILON) * 8.0
+}
+// Round clipped interval endpoints inward: an f32 endpoint must itself satisfy
+// every clipping constraint, so rounding can never widen a visibility cone.
+fn settle(
+    edge: [[f32; 3]; 2],
+    mut lo: f64,
+    mut hi: f64,
+    inside: impl Fn([f32; 3]) -> bool,
+) -> Option<[[f32; 3]; 2]> {
+    if lo > hi {
+        return None;
+    }
+    // An unclipped endpoint satisfied every constraint before clipping.
+    let mut a = if lo == 0.0 {
+        edge[0]
+    } else {
+        lerp(edge[0], edge[1], lo)
+    };
+    let mut step = 1e-7;
+    while lo != 0.0 && !inside(a) {
+        lo += step;
+        step *= 4.0;
+        if lo > hi || step > 1e-3 {
+            return None;
+        }
+        a = lerp(edge[0], edge[1], lo);
+    }
+    let mut b = if hi == 1.0 {
+        edge[1]
+    } else {
+        lerp(edge[0], edge[1], hi)
+    };
+    let mut step = 1e-7;
+    while hi != 1.0 && !inside(b) {
+        hi -= step;
+        step *= 4.0;
+        if lo > hi || step > 1e-3 {
+            return None;
+        }
+        b = lerp(edge[0], edge[1], hi);
+    }
+    Some([a, b])
 }
 // Clip a segment to the visible cone and the far side of the entering edge.
 fn project(root: [f32; 3], mut gate: [[f32; 3]; 2], edge: [[f32; 3]; 2]) -> Option<[[f32; 3]; 2]> {
@@ -218,11 +288,12 @@ fn project(root: [f32; 3], mut gate: [[f32; 3]; 2], edge: [[f32; 3]; 2]) -> Opti
             hi = hi.min(u / (u - v));
         }
     }
-    for (a, b, sign) in [
+    let planes = [
         (root, gate[0], 1.0),
         (root, gate[1], -1.0),
         (gate[0], gate[1], -side),
-    ] {
+    ];
+    for (a, b, sign) in planes {
         let u = cross(a, b, edge[0]) * sign;
         let v = cross(a, b, edge[1]) * sign;
         if u < 0.0 && v < 0.0 {
@@ -235,7 +306,20 @@ fn project(root: [f32; 3], mut gate: [[f32; 3]; 2], edge: [[f32; 3]; 2]) -> Opti
             hi = hi.min(u / (u - v));
         }
     }
-    (lo <= hi).then(|| [lerp(edge[0], edge[1], lo), lerp(edge[0], edge[1], hi)])
+    let near = if distance(root, gate[0]) <= distance(root, gate[1]) {
+        gate[0]
+    } else {
+        gate[1]
+    };
+    settle(edge, lo, hi, |p| {
+        planes
+            .iter()
+            .all(|&(a, b, sign)| cross(a, b, p) * sign >= 0.0)
+            && (side != 0.0
+                || (p[0] as f64 - near[0] as f64) * (near[0] as f64 - root[0] as f64)
+                    + (p[2] as f64 - near[2] as f64) * (near[2] as f64 - root[2] as f64)
+                    >= 0.0)
+    })
 }
 fn estimate(node: &Node, end: [f32; 3]) -> f32 {
     let Some([a, b]) = node.interval else {
@@ -266,6 +350,80 @@ fn estimate(node: &Node, end: [f32; 3]) -> f32 {
     }
     (distance(node.root, a) + distance(a, end)).min(distance(node.root, b) + distance(b, end))
 }
+// A Euclidean shortest path bends only at obstacle vertices. Walk the polygon
+// fan around `vertex` of `start`: it is interior when the walk returns to
+// `start` across full ground portals that pass the filter. Partial portals,
+// unknown topology or long fans conservatively count as corners.
+fn is_corner<F: QueryFilter + ?Sized>(
+    query: &NavMeshQuery<'_>,
+    filter: &F,
+    start: PolyRef,
+    vertex: [f32; 3],
+) -> Result<bool, Error> {
+    let tolerance = rounding(&[vertex]);
+    let mut current = start;
+    for _ in 0..64 {
+        let (_, tile, poly) = query.valid_tp(current)?;
+        let count = poly.vert_count as usize;
+        let position = |i: usize| {
+            let v = poly.verts[i] as usize * 3;
+            [tile.verts[v], tile.verts[v + 2]]
+        };
+        // Tile neighbours repeat a border vertex up to f32 rounding.
+        let Some(i) = (0..count).find(|&i| {
+            let p = position(i);
+            (p[0] as f64 - vertex[0] as f64).abs() <= tolerance
+                && (p[1] as f64 - vertex[2] as f64).abs() <= tolerance
+        }) else {
+            return Ok(true);
+        };
+        // Cross the edge leaving the vertex through the link that touches it:
+        // an internal link, or a tile link whose range starts at the vertex.
+        let mut next = None;
+        let mut link_index = poly.first_link;
+        while link_index != NULL_LINK {
+            let link = tile.links[link_index as usize];
+            link_index = link.next;
+            if link.edge as usize != i || link.r#ref == 0 || (link.side != 0xff && link.bmin != 0) {
+                continue;
+            }
+            if next.is_some() {
+                return Ok(true);
+            }
+            next = Some(link.r#ref);
+        }
+        let Some(next) = next else {
+            return Ok(true);
+        };
+        let (_, nt, np) = query.valid_tp(next)?;
+        if np.poly_type() != POLYTYPE_GROUND || !filter.pass_filter(next, nt, np) {
+            return Ok(true);
+        }
+        if next == start {
+            return Ok(false);
+        }
+        current = next;
+    }
+    Ok(true)
+}
+// Shortest route from a node's root to a point of its polygon: straight when
+// the point is in the visible interval cone, otherwise via the nearer interval
+// endpoint. Both legs lie in polygons already proven visible or convex.
+fn reach(node: &Node, point: [f32; 3]) -> (Option<[f32; 3]>, f32) {
+    let Some(gate) = node.interval else {
+        return (None, node.g + distance(node.root, point));
+    };
+    if project(node.root, gate, [point, point]).is_some() {
+        return (None, node.g + distance(node.root, point));
+    }
+    let a = node.g + distance(node.root, gate[0]) + distance(gate[0], point);
+    let b = node.g + distance(node.root, gate[1]) + distance(gate[1], point);
+    if a <= b {
+        (Some(gate[0]), a)
+    } else {
+        (Some(gate[1]), b)
+    }
+}
 fn bucket(poly: PolyRef, root: [f32; 3], count: usize) -> usize {
     let mut hash = (poly as u64).wrapping_mul(0x100_0000_01b3);
     for coordinate in root {
@@ -283,26 +441,28 @@ fn bucket(poly: PolyRef, root: [f32; 3], count: usize) -> usize {
     hash ^= hash >> 33;
     (hash as usize) & (count - 1)
 }
+#[inline(always)]
 fn same(a: [f32; 3], b: [f32; 3]) -> bool {
     a == b
 }
+#[inline(always)]
 fn contains(outer: [[f32; 3]; 2], inner: [[f32; 3]; 2]) -> bool {
     inner.iter().all(|&p| {
-        cross(outer[0], outer[1], p) == 0.0
-            && p[0] >= outer[0][0].min(outer[1][0])
+        p[0] >= outer[0][0].min(outer[1][0])
             && p[0] <= outer[0][0].max(outer[1][0])
             && p[2] >= outer[0][2].min(outer[1][2])
             && p[2] <= outer[0][2].max(outer[1][2])
+            && cross(outer[0], outer[1], p) == 0.0
     })
 }
 impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
     /// Validate endpoints and begin without expanding a node.
     /// Non-uniform costs and off-mesh endpoints return [`Error::Unsupported`].
-    /// A passable off-mesh neighbour encountered while expanding ground polygons
-    /// also returns `Unsupported`, even if a ground-only route exists. Which
-    /// neighbours are encountered depends on the deterministic search order;
-    /// callers requiring ground-only queries must filter out off-mesh polygons.
-    /// This version does not compare ground paths with off-mesh routes.
+    /// Passable off-mesh connections are traversed in their linked direction at
+    /// their xz length: the path reaches the departure vertex, then continues
+    /// from the landing vertex. The departure point carries the connection
+    /// polygon in [`AnyAnglePath::polygons`]; the segment after it is the
+    /// connection itself, not a ground segment.
     pub fn begin(
         query: &NavMeshQuery<'_>,
         mut start: AnyAnglePoint,
@@ -368,7 +528,6 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
             best: None,
             expanded: 0,
             done: false,
-            saw_offmesh: false,
             failure: None,
         })
     }
@@ -416,6 +575,95 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
         node.hash_next = self.buckets[slot];
         self.buckets[slot] = Some(self.nodes.len());
         self.nodes.push(node);
+        Ok(())
+    }
+    // Retain a path-only state (a corner or an off-mesh departure) that is
+    // never expanded; it still counts against the node cap.
+    fn record(&mut self, node: Node) -> Result<usize, Error> {
+        if self.nodes.len() >= self.cap {
+            return Err(Error::LimitExceeded);
+        }
+        self.nodes
+            .try_reserve(1)
+            .map_err(|_| Error::AllocationFailed)?;
+        self.nodes.push(node);
+        Ok(self.nodes.len() - 1)
+    }
+    // Walk to the connection's departure vertex inside `node.poly`, traverse it
+    // at its xz length, and root a new search at the landing vertex.
+    fn traverse_off_mesh(
+        &mut self,
+        query: &NavMeshQuery<'_>,
+        index: usize,
+        node: &Node,
+        connection: PolyRef,
+    ) -> Result<(), Error> {
+        let (_, tile, poly) = query.valid_tp(connection)?;
+        let bidirectional = query
+            .nav()
+            .off_mesh_connection_by_ref(connection)
+            .is_some_and(|c| c.flags & OFFMESH_CON_BIDIR != 0);
+        let mut landing = [None; 2];
+        let mut link_index = poly.first_link;
+        while link_index != NULL_LINK {
+            let link = tile.links[link_index as usize];
+            link_index = link.next;
+            if link.r#ref != 0 && link.edge < 2 && landing[link.edge as usize].is_none() {
+                landing[link.edge as usize] = Some(link.r#ref);
+            }
+        }
+        let vertex = |i: usize| {
+            let v = poly.verts[i] as usize * 3;
+            [tile.verts[v], tile.verts[v + 1], tile.verts[v + 2]]
+        };
+        for (from, to) in [(0usize, 1usize), (1, 0)] {
+            if (from == 1 && !bidirectional) || landing[from] != Some(node.poly) {
+                continue;
+            }
+            let Some(target) = landing[to] else {
+                continue;
+            };
+            let (_, lt, lp) = query.valid_tp(target)?;
+            if lp.poly_type() != POLYTYPE_GROUND || !self.filter.pass_filter(target, lt, lp) {
+                continue;
+            }
+            let departure = vertex(from);
+            let arrival = vertex(to);
+            let (corner, cost) = reach(node, departure);
+            let mut parent = index;
+            if let Some(corner) = corner {
+                parent = self.record(Node {
+                    root: corner,
+                    root_poly: node.poly,
+                    interval: None,
+                    poly: node.poly,
+                    g: cost - distance(corner, departure),
+                    parent: Some(parent),
+                    turns: [false; 2],
+                    hash_next: None,
+                })?;
+            }
+            parent = self.record(Node {
+                root: departure,
+                root_poly: connection,
+                interval: None,
+                poly: connection,
+                g: cost,
+                parent: Some(parent),
+                turns: [false; 2],
+                hash_next: None,
+            })?;
+            self.push(Node {
+                root: arrival,
+                root_poly: target,
+                interval: None,
+                poly: target,
+                g: cost + distance(departure, arrival),
+                parent: Some(parent),
+                turns: [false; 2],
+                hash_next: None,
+            })?;
+        }
         Ok(())
     }
     fn result(&self) -> Result<AnyAnglePath, Error> {
@@ -513,8 +761,6 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
                 self.done = true;
                 return if self.best.is_some() {
                     Ok(Budgeted::Complete(self.result()?))
-                } else if self.saw_offmesh {
-                    Err(Error::Unsupported)
                 } else {
                     Err(Error::Failed)
                 };
@@ -533,22 +779,7 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
             self.open.pop();
             self.expanded += 1;
             if node.poly == self.end.polygon {
-                let end = self.end.position;
-                let visible = node
-                    .interval
-                    .is_none_or(|gate| project(node.root, gate, [end, end]).is_some());
-                let (corner, cost) = if visible {
-                    (None, node.g + distance(node.root, end))
-                } else {
-                    let gate = node.interval.ok_or(Error::Failed)?;
-                    let a = node.g + distance(node.root, gate[0]) + distance(gate[0], end);
-                    let b = node.g + distance(node.root, gate[1]) + distance(gate[1], end);
-                    if a <= b {
-                        (Some(gate[0]), a)
-                    } else {
-                        (Some(gate[1]), b)
-                    }
-                };
+                let (corner, cost) = reach(&node, self.end.position);
                 if self.best.is_none_or(|(_, _, g)| cost < g) {
                     self.best = Some((index, corner, cost));
                 }
@@ -557,6 +788,25 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
                 continue;
             }
             let (_, tile, poly) = query.valid_tp(node.poly)?;
+            // Turning at a vertex surrounded by walkable polygons is never taut.
+            // Turned roots are shared by every exit edge, so their height is
+            // looked up once. Clipped portal endpoints are rounded to f32;
+            // the closest boundary point avoids requiring exact collinearity.
+            // Caller endpoints still use the strict validation in begin.
+            let mut turns = node.turns;
+            let mut roots = [[0.0f32; 3]; 2];
+            if let Some(gate) = node.interval {
+                for side in 0..2 {
+                    if turns[side] {
+                        turns[side] = is_corner(query, self.filter, node.poly, gate[side])?;
+                    }
+                    if turns[side] {
+                        roots[side] = gate[side];
+                        roots[side][1] = query.closest_point_on_poly(node.poly, &gate[side])?.0[1];
+                        turns[side] = !same(roots[side], node.root);
+                    }
+                }
+            }
             let mut link_index = poly.first_link;
             while link_index != NULL_LINK {
                 let link = tile.links[link_index as usize];
@@ -569,8 +819,8 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
                     continue;
                 }
                 if tp.poly_type() != POLYTYPE_GROUND {
-                    self.saw_offmesh = true;
-                    return Err(Error::Unsupported);
+                    self.traverse_off_mesh(query, index, &node, link.r#ref)?;
+                    continue;
                 }
                 let e = link.edge as usize;
                 if e >= poly.vert_count as usize {
@@ -613,17 +863,9 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
                         hash_next: None,
                     })?;
                 }
-                if let Some(gate) = node.interval {
-                    for (side, mut root) in gate.into_iter().enumerate() {
-                        if !node.turns[side] {
-                            continue;
-                        }
-                        // Clipped portal endpoints are rounded to f32. Height
-                        // lookup at the closest boundary point avoids requiring
-                        // exact collinearity after that rounding. Caller endpoints
-                        // still use the strict validation in begin.
-                        root[1] = query.closest_point_on_poly(node.poly, &root)?.0[1];
-                        if same(root, node.root) {
+                if node.interval.is_some() {
+                    for (side, root) in roots.into_iter().enumerate() {
+                        if !turns[side] {
                             continue;
                         }
                         let g = node.g + distance(node.root, root);
@@ -644,10 +886,9 @@ impl<'f, F: QueryFilter + ?Sized> AnyAngleSearch<'f, F> {
     }
 }
 impl NavMeshQuery<'_> {
-    /// Find an xz shortest path with a uniform-cost filter and no off-mesh edges.
-    /// Passable off-mesh neighbours encountered during expansion return
-    /// [`Error::Unsupported`], even if a ground-only route exists. See
-    /// [`AnyAngleSearch::begin`] for the filter contract.
+    /// Find an xz shortest path with a uniform-cost filter, between ground
+    /// endpoints, through ground polygons and passable off-mesh connections.
+    /// See [`AnyAngleSearch::begin`] for the filter and off-mesh contract.
     /// Use [`AnyAngleSearch`] to retain progress across exhausted budgets.
     pub fn find_any_angle_path<F: QueryFilter + ?Sized>(
         &self,
@@ -663,6 +904,7 @@ impl NavMeshQuery<'_> {
 #[cfg(test)]
 mod tests {
     use super::project;
+
     #[test]
     fn point_interval_keeps_only_the_far_ray() {
         let root = [0.0; 3];
