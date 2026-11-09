@@ -27,6 +27,10 @@ pub enum Error {
     Failed,
     /// A polygon or tile reference is stale, out of range or of the wrong kind.
     InvalidRef,
+    /// Persisted reference layout differs from the receiving navmesh.
+    RefLayoutMismatch,
+    /// A tile-cache processor changed the cached tile location.
+    TileCacheRetargeted,
     /// Navmesh tile bytes are malformed.
     InvalidTileData(TileDataError),
     /// Stored tile state (polygon flags and areas) was rejected.
@@ -126,6 +130,8 @@ impl fmt::Display for Error {
             Error::AllocationFailed => f.write_str("allocation failed"),
             Error::FormatLimit(p) => write!(f, "format limit: {p}"),
             Error::Failed => f.write_str("query failed"),
+            Error::RefLayoutMismatch => f.write_str("reference layout mismatch"),
+            Error::TileCacheRetargeted => f.write_str("tile-cache processor changed tile location"),
             Error::InvalidRef => f.write_str("invalid reference"),
             Error::InvalidTileData(r) => write!(f, "invalid tile data: {r:?}"),
             Error::InvalidTileState(r) => write!(f, "invalid tile state: {r:?}"),

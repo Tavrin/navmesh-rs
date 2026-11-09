@@ -309,3 +309,51 @@ January 2024 commit restoring merge-sort `qsort` (glibc commit `709fbd3e`, discu
 libvirt list); the Khronos glTF-Sample-Assets Sponza metadata (CRYENGINE licence); the ASWF "Links
 to Open Assets" page (Bistro, CC BY 4.0); godot-demo-projects `LICENSE.md` (MIT); Polyanya: Cui,
 Harabor, Grastien, IJCAI 2017.
+
+## Persisted reference layout provenance
+
+A numeric reference has meaning only together with its field widths. Untagged
+legacy artifacts mean the default layout (the parameter-derived layout for
+32-bit references). Default output remains byte-identical. Old files load;
+new readers reject unknown layouts and layout mismatches before mesh mutation.
+
+Nondefault resident tile bytes append a 12-byte trailer at the end of the
+canonical DNAV sections: `NRFL`, little-endian u32 version 1, then u8 salt,
+tile and polygon widths and a zero byte. Geometry produced by the builder is
+layout-neutral; `add_tile` or preparation for a particular mesh tags it before
+residency. Exports through `MeshTile::data`, removal and unload retain the tag.
+When paired with a saved ref, untagged tile bytes mean default: both
+`restore_tile` and `restore_tile_allow_stale` refuse them on a nondefault mesh.
+Do not strip the trailer when saving refs. Default tiles retain DNAV v7 bytes.
+The content hash of a tagged tile includes its trailer.
+Preparation therefore changes the identity of untagged geometry for a nondefault
+layout. `PreparedTile::content_hash` hashes `PreparedTile::tile().data`, and both
+replacement paths, unload and residency retain that identity. Models that track
+installed content must retain the prepared bytes, rather than the original
+untagged builder bytes. Default-layout preparation leaves the bytes and hash
+unchanged.
+
+Bare state keeps DNMS version 1 for default layout. Nondefault layout uses
+version 2 with four layout bytes (salt, tile, polygon, zero) after the polygon
+states. The state size includes these bytes. Restore validates that tag even
+when the numeric tile refs collide. An unload state retains the content-hash
+footer: NVS1 version 2 for default, version 3 with four layout bytes for
+nondefault. Bare restore also validates a supplied unload footer's layout.
+Residency keeps NVRS version 3 for default and version 4 for nondefault, with
+explicit salt and tile widths as well as polygon width. No migration is needed
+for default files. Previously untagged nondefault saved refs cannot be inferred
+safely from their numeric value; regenerate their provenance from the original
+mesh rather than guessing a layout.
+
+The restore/load boundaries are `restore_tile_state`, `restore_tile`,
+`restore_tile_allow_stale`, `add_tile`, `prepare_tile`,
+`prepare_tile_with_layout`, `commit`, `commit_budgeted`, `commit_with_state`,
+`replace_tile`, `replace_tile_budgeted`, and `restore_residency` (including
+records parsed by `ResidencyRecord::from_bytes`). Prepared tiles carry their
+layout in memory; byte exports carry it in the formats above. Layout-neutral
+geometry may be prepared for any valid layout; tagged geometry cannot be
+reinterpreted as another layout. A mismatch is a typed error.
+
+A tile-cache processor may configure geometry and links but must preserve the
+cached layer's tile coordinates and layer. Retargeting returns
+`Error::TileCacheRetargeted` before any resident tile changes.

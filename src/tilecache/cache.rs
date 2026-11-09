@@ -317,6 +317,14 @@ impl Default for Association {
 /// Calls reset the reported usage. Requests and reverse tile/obstacle indices
 /// avoid a scan of the whole obstacle pool for each rebuilt tile. Errors preserve
 /// the front rebuild for retry; earlier completed rebuilds remain applied.
+///
+/// A rebuilt layer replaces the resident tile in place (not in recastnavigation,
+/// which removes the tile before adding the new one): the new bytes are validated
+/// before the resident tile is touched, so a refused rebuild leaves that tile, its
+/// refs and its runtime flags in place. By default the replacement advances the
+/// salt even for identical bytes, as upstream does;
+/// [`TileCache::set_keep_identical_tiles`] makes identical bytes a no-op (see
+/// [`NavMesh::replace_tile`]). A layer rebuilt to no polygons is removed.
 pub struct TileCache<C = RawCompressor, P = DefaultMeshProcess> {
     params: TileCacheParams,
     compressor: C,
@@ -335,6 +343,8 @@ pub struct TileCache<C = RawCompressor, P = DefaultMeshProcess> {
     queue: Vec<usize>,
     queue_pos: usize,
     queued: Vec<bool>,
+    /// See [`TileCache::set_keep_identical_tiles`].
+    keep_identical: bool,
 }
 fn work(ws: &mut Workspace, n: usize) -> Result<(), Error> {
     ws.work(u64::try_from(n).map_err(|_| Error::SizeOverflow)?)
@@ -407,8 +417,17 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             queue: ws.vec_with_capacity(nt)?,
             queue_pos: 0,
             queued: ws.vec(nt, false)?,
+            keep_identical: false,
             ws,
         })
+    }
+    /// Whether a rebuild that produces the bytes already resident leaves that tile
+    /// as it is (not in recastnavigation). Off by default: the tile is replaced and
+    /// its salt advances, as upstream's remove-then-add does, so refs match
+    /// upstream's. On: refs, salt and runtime flags of the tile stay, and an
+    /// obstacle that carves nothing costs no salt advance.
+    pub fn set_keep_identical_tiles(&mut self, on: bool) {
+        self.keep_identical = on;
     }
     /// Configuration.
     pub fn params(&self) -> &TileCacheParams {
@@ -1025,6 +1044,9 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             ..NavMeshCreateParams::default()
         };
         self.process.configure(&mut params);
+        if (params.tile_x, params.tile_y, params.tile_layer) != (h.tx, h.ty, h.tlayer) {
+            return Err(Error::TileCacheRetargeted);
+        }
         // Reserve a conservative bound for builder outputs and temporary arrays before entering Detour.
         let bound = nav_build_bound(&params)?;
         self.ws.charge_bytes::<u8>(bound)?;
@@ -1033,12 +1055,25 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
     }
     fn rebuild(&mut self, i: usize, nav: &mut NavMesh) -> Result<(), Error> {
         let data = self.build(i)?;
-        let h = self.tiles[i].header.as_ref().unwrap();
-        if let Some(k) = nav.tile_index_at(h.tx, h.ty, h.tlayer) {
-            nav.remove_tile(nav.tile_ref(k))?;
-        }
-        if let Some(data) = data {
-            nav.add_tile(data)?;
+        let h = self.tiles[i]
+            .header
+            .as_ref()
+            .ok_or(Error::InvalidInput("missing cached layer header"))?;
+        match data {
+            // Validated before the resident layer is touched.
+            Some(data) => {
+                let t = nav.prepare_for(data)?;
+                if self.keep_identical {
+                    nav.replace_tile(t)?;
+                } else {
+                    nav.replace_tile_advancing(t)?;
+                }
+            }
+            None => {
+                if let Some(k) = nav.tile_index_at(h.tx, h.ty, h.tlayer) {
+                    nav.remove_tile(nav.tile_ref(k))?;
+                }
+            }
         }
         Ok(())
     }

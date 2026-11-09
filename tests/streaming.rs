@@ -11,7 +11,8 @@
 use navmesh_rs::bake::{self, BakeConfig, Input};
 use navmesh_rs::detour::{
     self, Committed, DefaultFilter, EdgeKind, NavMesh, NavMeshCreateParams, NavMeshParams,
-    NavMeshQuery, PolyRef, RefState, ResidencyRecord, SlotPolicy, Status, TileKey, prepare_tile,
+    NavMeshQuery, PolyRef, RefLayout, RefState, Replaced, ResidencyRecord, SlotPolicy, Status,
+    TileKey, prepare_tile,
 };
 use navmesh_rs::{Budget, Error, Limits, TileStateError, Workspace};
 
@@ -564,15 +565,22 @@ fn state_and_budgeted_commits_are_all_or_nothing() {
             assert_eq!(fresh.epoch(), 0);
         }
         for (offset, error) in [
-            (u.state.len() - 40, TileStateError::WrongMagic),
-            (u.state.len() - 36, TileStateError::WrongVersion),
-            (u.state.len() - 1, TileStateError::WrongTile),
+            (
+                u.state.len() - 40,
+                Error::InvalidTileState(TileStateError::WrongMagic),
+            ),
+            // Version 3 denotes explicit layout provenance, absent here.
+            (u.state.len() - 36, Error::RefLayoutMismatch),
+            (
+                u.state.len() - 1,
+                Error::InvalidTileState(TileStateError::WrongTile),
+            ),
         ] {
             let mut corrupted = u.state.clone();
             corrupted[offset] ^= 1;
             assert_eq!(
                 fresh.commit_with_state(same.clone(), &corrupted),
-                Err(Error::InvalidTileState(error))
+                Err(error)
             );
             assert_eq!(fresh.epoch(), 0);
         }
@@ -935,6 +943,14 @@ fn salt_exhaustion_never_resurrects_refs_and_is_atomic() {
     let epoch = nav.epoch();
     let before = nav.residency().to_bytes();
     assert_eq!(nav.remove_tile(last), Err(Error::SaltExhausted));
+    assert_eq!(nav.salt_headroom(TileKey { x: 0, y: 0 }, 0), Some(0));
+    let prep = |b: Vec<u8>| prepare_tile(nav.params(), nav.limits(), b).expect("prepare");
+    let (same, changed) = (prep(bytes.clone()), prep(quad(0, 0, 1)));
+    assert!(matches!(
+        nav.replace_tile(changed),
+        Err(Error::SaltExhausted)
+    ));
+    assert!(matches!(nav.replace_tile(same), Ok(Replaced::Unchanged(r)) if r == last));
     assert_eq!(nav.epoch(), epoch);
     assert_eq!(nav.residency().to_bytes(), before);
     assert_eq!(nav.ref_state(last), RefState::Valid);
@@ -1068,4 +1084,521 @@ fn global_landing_layers_have_canonical_endpoints_and_link_order() {
             .1,
         [105., 0., 5.]
     );
+}
+
+#[test]
+fn replace_tile_is_atomic_and_equal_content_changes_nothing() {
+    let tiles = |nav: &NavMesh| -> Vec<String> {
+        (0..nav.max_tiles() as usize)
+            .map(|i| format!("{:?} {:?}", nav.tile_ref(i), nav.tile(i)))
+            .collect()
+    };
+    for policy in [SlotPolicy::Sequential, keyed(2, 2)] {
+        let mut nav = NavMesh::with_policy(&params(8), Limits::UNLIMITED, policy)
+            .expect("valid streaming fixture");
+        for k in 0..4 {
+            commit(&mut nav, quad(k % 2, k / 2, 0));
+        }
+        let prep = |nav: &NavMesh, x: i32, v: u16| {
+            prepare_tile(nav.params(), nav.limits(), quad(x, 0, v)).expect("valid fixture")
+        };
+        let key = TileKey { x: 0, y: 0 };
+        let r = at(&nav, 0, 0);
+        let (_, slot, _) = nav.decode_poly_id(r);
+        nav.set_poly_flags(r, 7).expect("valid streaming fixture");
+        nav.set_poly_area(r, 5).expect("valid streaming fixture");
+        let (epoch, headroom) = (nav.epoch(), nav.salt_headroom(key, 0));
+
+        // Equal content: no salt advance, no epoch change, runtime flags stay.
+        assert!(matches!(
+            nav.replace_tile(prep(&nav, 0, 0)),
+            Ok(Replaced::Unchanged(x)) if x == r
+        ));
+        assert_eq!((nav.epoch(), nav.salt_headroom(key, 0)), (epoch, headroom));
+        assert_eq!(nav.poly_flags(r), Ok(7));
+        assert_eq!(nav.poly_area(r), Ok(5));
+
+        // Other content: refused below its cost, then swapped in place, ending
+        // exactly as a removal followed by a commit.
+        let mut reference = nav.clone();
+        reference.remove_tile(r).expect("valid streaming fixture");
+        let want = commit(&mut reference, quad(0, 0, 1));
+        let t = prep(&nav, 0, 1);
+        let cost = nav.replace_cost(&t);
+        let Ok(Replaced::Refused(t)) = nav.replace_tile_budgeted(t, &mut Budget::new(cost - 1))
+        else {
+            panic!("a budget below the cost must refuse");
+        };
+        assert_eq!(nav.epoch(), epoch);
+        let mut budget = Budget::new(cost);
+        let Ok(Replaced::Replaced { new, old_salt }) = nav.replace_tile_budgeted(*t, &mut budget)
+        else {
+            panic!("other content replaces the resident tile");
+        };
+        assert_eq!(budget.used(), cost);
+        assert_eq!((new, old_salt), (want, nav.decode_poly_id(r).0));
+        assert_eq!(nav.decode_poly_id(new).1, slot, "same slot");
+        assert_eq!(nav.ref_state(r), RefState::Stale);
+        assert_eq!(nav.poly_flags(new), Ok(2), "flags of the new bytes");
+        assert_eq!(nav.salt_headroom(key, 0), headroom.map(|h| h - 1));
+        assert!(nav.changed_since(epoch, &mut |s| s == slot));
+        assert_eq!(tiles(&nav), tiles(&reference));
+        assert_eq!(nav.epoch(), epoch + 1);
+        assert_eq!(nav.epoch() + 1, reference.epoch());
+        assert_eq!(nav.residency().to_bytes(), reference.residency().to_bytes());
+
+        // A refused replacement changes nothing.
+        let before = (tiles(&nav), nav.epoch());
+        if PolyRef::BITS == 64 {
+            let foreign = detour::prepare_tile_with_layout(
+                nav.params(),
+                nav.limits(),
+                RefLayout::WIDE_SALT,
+                quad(0, 0, 2),
+            )
+            .expect("valid streaming fixture");
+            assert!(matches!(
+                nav.replace_tile(foreign),
+                Err(Error::InvalidParameter(_))
+            ));
+        }
+        let outside = prepare_tile(nav.params(), nav.limits(), quad(5, 5, 0)).expect("fixture");
+        if policy == SlotPolicy::Sequential {
+            assert!(matches!(nav.replace_tile(outside), Ok(Replaced::Added(_))));
+        } else {
+            assert_eq!(
+                nav.replace_tile(outside).map(|x| x.tile_ref()),
+                Err(Error::TileOutsideGrid)
+            );
+            assert_eq!((tiles(&nav), nav.epoch()), before);
+        }
+
+        // No resident tile: an unloaded reservation is honoured.
+        let u = nav.unload_tile(new).expect("valid streaming fixture");
+        let again = prepare_tile(nav.params(), nav.limits(), u.bytes).expect("fixture");
+        assert!(matches!(nav.replace_tile(again), Ok(Replaced::Added(x)) if x == new));
+    }
+}
+
+#[test]
+fn wide_salt_layout_is_opt_in_and_persisted_with_its_refs() {
+    let key = TileKey { x: 0, y: 0 };
+    let default = NavMesh::with_policy(&params(8), Limits::UNLIMITED, keyed(2, 2))
+        .expect("valid streaming fixture");
+    let implied = NavMesh::with_layout(
+        &params(8),
+        Limits::UNLIMITED,
+        keyed(2, 2),
+        default.ref_layout(),
+    )
+    .expect("the implied layout is accepted");
+    assert_eq!(
+        implied.residency().to_bytes(),
+        default.residency().to_bytes()
+    );
+    assert_eq!(default.residency().to_bytes()[4..8], 3u32.to_le_bytes());
+    let layout = RefLayout::WIDE_SALT;
+    let wide = |p: &NavMeshParams, l: RefLayout| {
+        NavMesh::with_layout(p, Limits::UNLIMITED, keyed(2, 2), l)
+    };
+    if PolyRef::BITS != 64 {
+        assert!(wide(&params(8), layout).is_err());
+        return;
+    }
+    assert_eq!(default.salt_headroom(key, 0), Some(65_534));
+    let mut many_polys = params(8);
+    many_polys.max_polys = 1 << 15;
+    assert!(wide(&many_polys, layout).is_err());
+    for bad in [
+        RefLayout::new(9, 28, 14),
+        RefLayout::new(22, 28, 15),
+        RefLayout::new(22, 2, 14),
+    ] {
+        assert!(wide(&params(8), bad).is_err(), "{bad:?}");
+    }
+
+    let mut nav = wide(&params(8), layout).expect("valid streaming fixture");
+    assert_eq!(nav.ref_layout(), layout);
+    assert_eq!(nav.salt_headroom(key, 0), Some(4_194_302));
+    let prep = |x: i32, v: u16| {
+        detour::prepare_tile_with_layout(&params(8), Limits::UNLIMITED, layout, quad(x, 0, v))
+            .expect("valid streaming fixture")
+    };
+    let other = prepare_tile(nav.params(), nav.limits(), quad(0, 0, 0)).expect("fixture");
+    assert!(matches!(nav.commit(other), Err(Error::InvalidParameter(_))));
+    // A different layout with the same polygon width must also be refused.
+    let foreign = detour::prepare_tile_with_layout(
+        nav.params(),
+        nav.limits(),
+        RefLayout::new(23, 27, 14),
+        quad(0, 0, 0),
+    )
+    .expect("valid foreign layout");
+    assert!(matches!(
+        nav.commit(foreign.clone()),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        nav.replace_tile(foreign),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert_eq!(nav.epoch(), 0);
+    let r = nav.commit(prep(0, 0)).expect("valid streaming fixture");
+    nav.commit(prep(1, 0)).expect("valid streaming fixture");
+    assert_eq!(nav.decode_poly_id(r), (1, 0, 0));
+    assert_eq!(
+        (r.count_ones(), r.trailing_zeros()),
+        (1, 42),
+        "salt 1 above 42 bits"
+    );
+    let Ok(Replaced::Replaced { new, .. }) = nav.replace_tile(prep(0, 1)) else {
+        panic!("other content replaces the resident tile");
+    };
+    assert_eq!(nav.decode_poly_id(new), (2, 0, 0));
+    assert_eq!(nav.salt_headroom(key, 0), Some(4_194_301));
+
+    // Residency records carry the layout and restore only into it.
+    let bytes = nav.residency().to_bytes();
+    assert_eq!(bytes[4..8], 4u32.to_le_bytes());
+    let rec = ResidencyRecord::from_bytes(&bytes).expect("valid streaming fixture");
+    assert_eq!(rec.to_bytes(), bytes);
+    for cut in 0..bytes.len() {
+        assert!(ResidencyRecord::from_bytes(&bytes[..cut]).is_err());
+    }
+    let mut plain = NavMesh::with_policy(&params(8), Limits::UNLIMITED, keyed(2, 2))
+        .expect("valid streaming fixture");
+    assert!(plain.restore_residency(&rec).is_err());
+    let mut next = wide(&params(8), layout).expect("valid streaming fixture");
+    next.restore_residency(&rec)
+        .expect("valid streaming fixture");
+    assert_eq!(next.ref_state(new), RefState::Unloaded(key));
+    assert_eq!(next.ref_state(r), RefState::Stale);
+    assert_eq!(next.commit(prep(0, 1)), Ok(new));
+
+    // Tile state blobs name the layout too.
+    nav.set_poly_flags(new, 7).expect("valid streaming fixture");
+    let u = nav.unload_tile(new).expect("valid streaming fixture");
+    let mut foreign = u.state.clone();
+    let n = foreign.len();
+    foreign[n - 4] ^= 1;
+    let before = (nav.epoch(), nav.residency().to_bytes());
+    assert_eq!(
+        nav.commit_with_state(prep(0, 1), &foreign),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!((nav.epoch(), nav.residency().to_bytes()), before);
+    assert_eq!(nav.commit_with_state(prep(0, 1), &u.state), Ok(new));
+    assert_eq!(nav.poly_flags(new), Ok(7));
+}
+
+#[test]
+fn wide_layout_refuses_polygon_overflow_before_mutation() {
+    if PolyRef::BITS != 64 {
+        return;
+    }
+    let p = params(8);
+    let mut nav = NavMesh::with_layout(
+        &p,
+        Limits::UNLIMITED,
+        SlotPolicy::Sequential,
+        RefLayout::WIDE_SALT,
+    )
+    .expect("fixture");
+    let mut bytes = quad(0, 0, 0);
+    bytes[24..28].copy_from_slice(&16_385i32.to_le_bytes());
+    let before = nav.residency().to_bytes();
+    assert!(matches!(
+        detour::prepare_tile_with_layout(
+            &p,
+            Limits::UNLIMITED,
+            RefLayout::WIDE_SALT,
+            bytes.clone()
+        ),
+        Err(Error::InvalidTileData(_))
+    ));
+    assert!(matches!(
+        nav.add_tile(bytes.clone()),
+        Err(Error::InvalidTileData(_))
+    ));
+    let r = nav.encode_poly_id(1, 0, 0);
+    assert!(matches!(
+        nav.restore_tile(bytes, r),
+        Err(Error::InvalidTileData(_))
+    ));
+    assert_eq!(nav.epoch(), 0);
+    assert_eq!(nav.residency().to_bytes(), before);
+}
+
+#[test]
+fn persisted_layout_collision_and_legacy_files() {
+    let tiles = |nav: &NavMesh| {
+        (0..nav.max_tiles() as usize)
+            .filter_map(|i| {
+                nav.tile(i).map(|t| {
+                    (
+                        t.data.clone(),
+                        t.polys
+                            .iter()
+                            .map(|p| (p.flags, p.area()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    if PolyRef::BITS != 64 {
+        return;
+    }
+    let p = params(8);
+    let mesh = |l| NavMesh::with_layout(&p, Limits::UNLIMITED, SlotPolicy::Sequential, l).unwrap();
+    let mut wide = mesh(RefLayout::WIDE_SALT);
+    // Salt 64 under the wide layout collides numerically with default salt 1.
+    let mut r = wide.add_tile(quad(0, 0, 0)).unwrap();
+    for _ in 1..64 {
+        wide.remove_tile(r).unwrap();
+        r = wide.add_tile(quad(0, 0, 0)).unwrap();
+    }
+    let mut plain = mesh(RefLayout::default());
+    let pr = plain.add_tile(quad(0, 0, 0)).unwrap();
+    assert_eq!(pr, r);
+    let mut state = vec![0; wide.tile_state_size(r).unwrap()];
+    wide.store_tile_state(r, &mut state).unwrap();
+    let before = (plain.epoch(), plain.residency().to_bytes(), tiles(&plain));
+    assert_eq!(
+        plain.restore_tile_state(pr, &state),
+        Err(Error::RefLayoutMismatch)
+    );
+    let mut old = vec![0; plain.tile_state_size(pr).unwrap()];
+    plain.store_tile_state(pr, &mut old).unwrap();
+    assert_eq!(&old[4..8], &1i32.to_le_bytes());
+    let mut golden = detour::NAVMESH_STATE_MAGIC.to_le_bytes().to_vec();
+    golden.extend_from_slice(&1i32.to_le_bytes());
+    golden.extend_from_slice(&pr.to_le_bytes());
+    golden.extend_from_slice(&[1, 0, 0, 0]);
+    assert_eq!(old, golden);
+    assert_eq!(
+        wide.restore_tile_state(r, &old),
+        Err(Error::RefLayoutMismatch)
+    );
+    plain.restore_tile_state(pr, &old).unwrap();
+    assert_eq!(
+        (plain.epoch(), plain.residency().to_bytes(), tiles(&plain)),
+        before
+    );
+    wide.restore_tile_state(r, &state).unwrap();
+    let u = wide.unload_tile(r).unwrap();
+    let mut prior_wide = u.state.clone();
+    prior_wide[4..8].copy_from_slice(&1i32.to_le_bytes());
+    prior_wide.drain(state.len() - 4..state.len());
+    assert_eq!(
+        plain.restore_tile_state(pr, &prior_wide),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(
+        plain.restore_tile_state(pr, &u.state),
+        Err(Error::RefLayoutMismatch)
+    );
+    let prep = prepare_tile(&p, Limits::UNLIMITED, quad(1, 0, 0)).unwrap();
+    let empty = || mesh(RefLayout::default());
+    let mut target = empty();
+    assert_eq!(
+        target.commit_with_state(
+            prepare_tile(&p, Limits::UNLIMITED, quad(0, 0, 0)).unwrap(),
+            &u.state
+        ),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(
+        target.restore_tile(u.bytes.clone(), r),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(
+        target.restore_tile_allow_stale(u.bytes.clone(), r),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(
+        target.add_tile(u.bytes.clone()),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert!(matches!(
+        prepare_tile(&p, Limits::UNLIMITED, u.bytes.clone()),
+        Err(Error::RefLayoutMismatch)
+    ));
+    assert_eq!(
+        target.commit_with_state(prep, &u.state),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(target.epoch(), 0);
+    // Mixed loads fail without disturbing a resident default tile.
+    target.add_tile(quad(1, 0, 0)).unwrap();
+    let before = (
+        target.epoch(),
+        target.residency().to_bytes(),
+        tiles(&target),
+    );
+    assert_eq!(
+        target.restore_tile(u.bytes.clone(), r),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(
+        (
+            target.epoch(),
+            target.residency().to_bytes(),
+            tiles(&target)
+        ),
+        before
+    );
+    let mut fresh_wide = mesh(RefLayout::WIDE_SALT);
+    assert_eq!(
+        fresh_wide.restore_tile(quad(0, 0, 0), pr),
+        Err(Error::RefLayoutMismatch)
+    );
+    assert_eq!(fresh_wide.restore_tile(u.bytes.clone(), r), Ok(r));
+    let removed = fresh_wide.remove_tile(r).unwrap();
+    assert_eq!(
+        empty().restore_tile(removed, r),
+        Err(Error::RefLayoutMismatch)
+    );
+    // Old untagged tile files and residency v3 still round-trip unchanged.
+    let raw = quad(0, 0, 0);
+    let mut legacy = empty();
+    assert_eq!(legacy.restore_tile(raw.clone(), pr), Ok(pr));
+    assert_eq!(legacy.remove_tile(pr).unwrap(), raw);
+    let rec = plain.residency().to_bytes();
+    let mut legacy = empty();
+    legacy
+        .restore_residency(&ResidencyRecord::from_bytes(&rec).unwrap())
+        .unwrap();
+    assert_eq!(legacy.residency().to_bytes(), rec);
+    legacy
+        .commit_with_state(
+            prepare_tile(&p, Limits::UNLIMITED, quad(0, 0, 0)).unwrap(),
+            &plain.unload_tile(pr).unwrap().state,
+        )
+        .unwrap();
+    for cut in 1..12 {
+        let short = u.bytes[..u.bytes.len() - cut].to_vec();
+        assert_eq!(
+            empty().restore_tile(short, r),
+            Err(Error::RefLayoutMismatch)
+        );
+    }
+    let mut unknown = u.bytes;
+    let n = unknown.len();
+    unknown[n - 4] = 99;
+    assert_eq!(
+        empty().restore_tile(unknown, r),
+        Err(Error::RefLayoutMismatch)
+    );
+}
+
+#[test]
+fn prepared_layout_checks_cover_all_commit_and_replace_entries() {
+    if PolyRef::BITS != 64 {
+        return;
+    }
+    let p = params(8);
+    let mut mesh = NavMesh::new(&p).unwrap();
+    let foreign = detour::prepare_tile_with_layout(
+        &p,
+        Limits::UNLIMITED,
+        RefLayout::WIDE_SALT,
+        quad(0, 0, 0),
+    )
+    .unwrap();
+    let mut budget = Budget::new(u64::MAX);
+    assert!(matches!(
+        mesh.commit(foreign.clone()),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        mesh.commit_budgeted(foreign.clone(), &mut budget),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        mesh.replace_tile(foreign.clone()),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        mesh.replace_tile_budgeted(foreign.clone(), &mut budget),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert!(matches!(
+        detour::prepare_tile_with_layout(
+            &p,
+            Limits::UNLIMITED,
+            RefLayout::default(),
+            foreign.tile().data.clone()
+        ),
+        Err(Error::RefLayoutMismatch)
+    ));
+    let mut wide = NavMesh::with_layout(
+        &p,
+        Limits::UNLIMITED,
+        SlotPolicy::Sequential,
+        RefLayout::WIDE_SALT,
+    )
+    .unwrap();
+    wide.commit(foreign).unwrap();
+    let record = ResidencyRecord::from_bytes(&wide.residency().to_bytes()).unwrap();
+    assert!(matches!(
+        mesh.restore_residency(&record),
+        Err(Error::InvalidParameter(_))
+    ));
+    assert_eq!(mesh.epoch(), 0);
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn replacement_unload_identity_is_prepared_content_for_both_layouts_and_paths() {
+    for layout in [RefLayout::default(), RefLayout::WIDE_SALT] {
+        if PolyRef::BITS != 64 && layout == RefLayout::WIDE_SALT {
+            continue;
+        }
+        for budgeted in [false, true] {
+            let p = NavMeshParams {
+                max_polys: 16,
+                ..params(64)
+            };
+            let mut nav = if PolyRef::BITS == 64 {
+                NavMesh::with_layout(&p, Limits::UNLIMITED, keyed(4, 4), layout).unwrap()
+            } else {
+                NavMesh::with_policy(&p, Limits::UNLIMITED, keyed(4, 4)).unwrap()
+            };
+            // Same geometry and flags as grid_quad(3, 0, 1).
+            let bytes = quad(3, 0, 1);
+            let t = detour::prepare_tile_with_layout(
+                &p,
+                Limits::UNLIMITED,
+                nav.ref_layout(),
+                bytes.clone(),
+            )
+            .unwrap();
+            let installed = t.tile().data.clone();
+            let hash = t.content_hash();
+            assert_eq!(hash, detour::content_hash(&installed));
+            if PolyRef::BITS == 64 && layout == RefLayout::WIDE_SALT {
+                assert_ne!(hash, detour::content_hash(&bytes));
+            } else {
+                assert_eq!(installed, bytes);
+                assert_eq!(hash, detour::content_hash(&bytes));
+            }
+            let out = if budgeted {
+                nav.replace_tile_budgeted(t, &mut Budget::new(19)).unwrap()
+            } else {
+                nav.replace_tile(t).unwrap()
+            };
+            assert!(matches!(out, Replaced::Added(_)));
+            let r = out.tile_ref().unwrap();
+            let u = nav.unload_tile(r).unwrap();
+            assert_eq!(u.bytes, installed);
+            assert_eq!(u.content_hash, hash);
+            // Exported bytes prepare to the same identity and keep the saved ref.
+            let t =
+                detour::prepare_tile_with_layout(&p, Limits::UNLIMITED, nav.ref_layout(), u.bytes)
+                    .unwrap();
+            assert_eq!(t.content_hash(), hash);
+            assert_eq!(nav.commit_with_state(t, &u.state), Ok(r));
+        }
+    }
 }

@@ -27,10 +27,12 @@ pub fn install_cost(len: usize) -> u64 {
 /// limits; the navmesh's own `max_tiles` (set from [`GridLayout::nav_mesh_params`]) is the
 /// residency cap and is a parameter of the navmesh, not of this type.
 ///
-/// **Rebakes.** A tile whose slot is already resident replaces it: the resident tile is
-/// removed (its refs stop validating, as for [`NavMesh::remove_tile`]) and the new one
-/// added, within one [`install`](Self::install) step. A tile without polygons
-/// removes the resident tile of its key, if any, and is otherwise a no-op. The queue keeps
+/// **Rebakes.** A tile whose column and layer are already resident replaces that tile
+/// with [`NavMesh::replace_tile`], within one [`install`](Self::install) step: the
+/// bytes are validated first, the same bytes change nothing (refs, salt and runtime
+/// flags stay), and other bytes take the slot with the next salt, so refs to the old
+/// tile stop validating. A tile without polygons removes the layer-0 tile of its key
+/// (the layer bakes write), if any, and is otherwise a no-op. The queue keeps
 /// at most one entry per key, the newest push: an older queued version is dropped, not
 /// installed, so a superseded job's tiles can never overwrite a newer job's. Entries
 /// install in the order of their last push.
@@ -93,9 +95,10 @@ impl TileInstaller {
     /// marked fully spent.
     ///
     /// # Errors
-    /// A [`BakeError`] naming the tile whose bytes the navmesh refused (all or nothing: the
-    /// navmesh keeps the tile it held for that key, which stays resident; the entry leaves
-    /// the queue and later entries stay queued).
+    /// A [`BakeError`] naming the tile whose bytes the navmesh refused, including bytes
+    /// whose header names another column than the entry's key (all or nothing: the
+    /// navmesh keeps the tile it held for that key with its salt, refs and runtime flags;
+    /// the entry leaves the queue and later entries stay queued).
     pub fn install(
         &mut self,
         nav: &mut NavMesh,
@@ -131,27 +134,24 @@ impl TileInstaller {
     }
 }
 
-/// Makes `data` the tile of `key` in `nav`, or removes the tile when `data` is `None`.
-/// The resident tile is restored if the new one is refused.
+/// Makes `data` the tile of `key` in `nav` (at the layer its header names), or
+/// removes the layer-0 tile of `key` when `data` is `None`. All or nothing.
 fn apply(nav: &mut NavMesh, key: TileKey, data: Option<Vec<u8>>) -> Result<(), Error> {
-    let resident = nav
-        .tile_index_at(key.x, key.z, 0)
-        .map(|i| nav.tile_ref(i))
-        .filter(|&r| r != 0);
-    let old = match resident {
-        Some(r) => Some(nav.remove_tile(r)?),
-        None => None,
-    };
     let Some(data) = data else {
+        if let Some(r) = nav
+            .tile_index_at(key.x, key.z, 0)
+            .map(|i| nav.tile_ref(i))
+            .filter(|&r| r != 0)
+        {
+            nav.remove_tile(r)?;
+        }
         return Ok(());
     };
-    match nav.add_tile(data) {
-        Ok(_) => Ok(()),
-        Err(error) => {
-            if let Some(old) = old {
-                nav.add_tile(old)?;
-            }
-            Err(error)
-        }
+    let tile = nav.prepare_for(data)?;
+    let column = tile.key();
+    if (column.x, column.y) != (key.x, key.z) {
+        return Err(Error::InvalidParameter("tile bytes name another column"));
     }
+    nav.replace_tile(tile)?;
+    Ok(())
 }

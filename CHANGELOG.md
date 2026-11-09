@@ -39,6 +39,47 @@ All notable changes to this project are documented in this file. The format foll
 
 - `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
   `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
+- `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning
+  `Replaced`: swaps the tile at a prepared tile's column and layer all or nothing. Equal
+  content (same SHA-256) changes nothing: no salt advance, no epoch change, runtime flags
+  and areas kept. Other content takes the same slot with one salt advance. A refusal
+  leaves the resident tile with its salt, refs and runtime state.
+- Opt-in ref layouts for 64-bit refs: `RefLayout`, `NavMesh::with_layout`,
+  `NavMesh::ref_layout` and `prepare_tile_with_layout`. `RefLayout::WIDE_SALT` (22 salt,
+  28 tile, 14 polygon bits) allows 4,194,302 salt advances per slot instead of 65,534, with
+  at most 16,384 polygons per tile. The default layout and its refs are unchanged.
+- `NavMesh::salt_headroom`: salt advances left for a tile's slot.
+- Residency records version 4 and unload-state footers version 3 name an explicit ref
+  layout. Navmeshes with the default layout still write versions 3 and 2, byte for byte as
+  before.
+- `replace_ops` fuzz target.
+
+### Fixed
+
+- Persisted nondefault ref layouts now tag bare tile state (DNMS version 2)
+  and exported tile bytes (NRFL version 1 trailer). All restore paths check
+  provenance before mutation, including colliding numeric refs and bare restore
+  of unload state. Untagged legacy files mean default layout; default output is
+  unchanged. Old default files load; new readers reject unknown layouts.
+- Tile-cache processors cannot retarget a rebuild to another tile or layer.
+- Layer-header decoding and cache rebuild use checked or infallible conversions
+  instead of unwraps.
+- Document prepared content identity, including nondefault layout provenance,
+  and make the replacement property model retain those installed bytes.
+
+### Changed
+
+- `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of
+  the resident tile again keeps its refs and runtime flags; a refused tile no longer comes
+  back under a new salt with its flags reset. The layer comes from the tile header instead
+  of assuming layer 0 (removals still remove layer 0), and bytes whose header names
+  another column than the entry's key are refused. Installation now also computes the
+  tile's SHA-256 identity.
+- `TileCache` rebuilds replace the resident tile in place: a refused rebuild keeps the
+  resident tile instead of losing it. Identical bytes still advance the salt by default,
+  as upstream does, so tile-cache parity is unchanged; the new
+  `TileCache::set_keep_identical_tiles(true)` makes them keep the tile's refs, salt and
+  runtime flags.
 
 ## [0.2.2] - 2026-11-06
 
