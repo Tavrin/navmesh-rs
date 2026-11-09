@@ -107,6 +107,39 @@ All notable changes to this project are documented in this file. The format foll
 - ORCA nearest-neighbour queries use a smaller search only after proving that it
   contains the full nearest set; otherwise they repeat the full-range query.
   The sampled planner and its golden files are unchanged.
+- Experimental additive uniform-cost xz interval queries: `AnyAnglePoint`, `AnyAnglePath`,
+  `AnyAngleSearch::{begin,resume}`, and `NavMeshQuery::find_any_angle_path`.
+  Filters opt in through `QueryFilter::uniform_cost`; weighted costs return
+  `Unsupported`. Passable off-mesh connections are traversed in their linked
+  direction at their xz length. Search progress is budgeted, retained states
+  are capped, and mesh changes require a restart.
+- Experimental opt-in boundary traversal extraction through `BakeConfig::links`, with drop,
+  jump and climb metadata, solid-span clearance checks, generated-link inspection
+  on `Tile`/`TileOutput`, and extraction reach included in incremental halos and
+  configuration hashes. Disabled extraction preserves the existing pipeline.
+
+### Changed
+
+- Any-angle qualification validates the funnel baseline before applying the
+  never-longer rule and accepts raycast hits at `t >= 1 - 1e-6` as endpoint
+  containment. Invalid baselines and tolerance use are counted separately.
+- Traversal extraction checks a continuous swept square enclosing the agent's
+  radius, including the vertical portions of drops, climbs and raised jumps.
+- Internal clipped portal roots use closest detail-surface height lookup after
+  rounding; caller endpoints retain strict validation.
+- Any-angle search no longer returns `Unsupported` on passable off-mesh
+  neighbours; it routes through them.
+- Any-angle search turns only at mesh boundary vertices (corner pruning),
+  reducing expanded states without changing returned lengths.
+- Any-angle dominance comparisons inline their hot predicates and reject
+  disjoint bounds before evaluating geometric tests.
+- Any-angle qualification checks segment containment with an independent
+  closed-coverage test over portal-connected polygons. Detour's raycast stops
+  on segments that run along a shared edge or through a shared vertex; those
+  stops are still counted and reported.
+- Extraction has an independent link-set reference test (exhaustive candidate
+  enumeration with plane-partition clearance), on a synthetic scene and, when
+  `NAV_CORPUS_DIR` is set, on three corpus meshes.
 
 ## [0.2.1] - 2026-11-05
 

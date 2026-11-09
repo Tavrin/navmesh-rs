@@ -33,6 +33,8 @@ use crate::detour::{self, NavMesh, NavMeshCreateParams, NavMeshParams};
 use crate::recast::{self, Config};
 use crate::{Error, Limits, UpstreamFixes, Workspace};
 
+mod links;
+pub use links::{ExtractedLink, LinkExtraction, LinkKind, LinkLimits};
 mod install;
 mod job;
 mod manifest;
@@ -151,6 +153,8 @@ pub struct BakeConfig {
     /// Only [`UpstreamFixes::ZERO_SAMPLE_DIST`] concerns baking. Defaults to
     /// [`UpstreamFixes::NONE`], which reproduces upstream.
     pub fixes: UpstreamFixes,
+    /// Optional boundary traversal extraction; disabled by default.
+    pub links: Option<LinkExtraction>,
 }
 
 impl Default for BakeConfig {
@@ -184,6 +188,7 @@ impl Default for BakeConfig {
             max_total_bytes: usize::MAX,
             strict_triangulation: false,
             fixes: UpstreamFixes::NONE,
+            links: None,
         }
     }
 }
@@ -223,6 +228,8 @@ pub struct Tile {
     pub data: Option<Vec<u8>>,
     /// Partial ear-clipping counts (not in recastnavigation).
     pub triangulation: recast::TriangulationReport,
+    /// Generated traversal connections, in boundary/sample order.
+    pub links: Vec<ExtractedLink>,
 }
 
 /// Ordered tiles and their Detour layout; not in recastnavigation.
@@ -278,6 +285,9 @@ struct Prepared {
 
 /// Checks every setting a tile bake reads, before any geometry is touched.
 fn validate_config(c: &BakeConfig) -> Result<(), Error> {
+    if let Some(links) = c.links {
+        links.validate()?;
+    }
     let base = c.recast;
     if !positive(base.cs)
         || !positive(base.ch)
@@ -367,10 +377,7 @@ fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prep
     work(ws, count)?;
     let mut configs = ws.vec_with_capacity(count)?;
     let mut buckets = ws.vec(count, Vec::new())?;
-    let border = base
-        .walkable_radius
-        .checked_add(3)
-        .ok_or(Error::SizeOverflow)?;
+    let border = links::halo(c)?;
     let dim = ts
         .checked_add(border.checked_mul(2).ok_or(Error::SizeOverflow)?)
         .ok_or(Error::SizeOverflow)?;
@@ -559,7 +566,10 @@ fn build_tile_counted(
     loop {
         match task.advance() {
             Ok(Advance::More) => {}
-            Ok(Advance::Done(data, report)) => return (Ok((data, report)), task.work_used()),
+            Ok(Advance::Done(data, report)) => {
+                let work = task.work_used();
+                return (Ok((data, report, task.links)), work);
+            }
             Err(e) => return (Err(e), task.work_used()),
         }
     }
@@ -613,7 +623,7 @@ fn bake(
     // Slots are allocated fallibly and byte-charged before rayon sees them.
     let mut results = ws.vec(
         p.configs.len(),
-        Ok((None, recast::TriangulationReport::default())),
+        Ok((None, recast::TriangulationReport::default(), Vec::new())),
     )?;
     let columns = p.columns;
     let coord = |i: usize| -> Result<(i32, i32), Error> {
@@ -635,7 +645,7 @@ fn bake(
     fill_results(&mut results, parallel, build);
     for (i, result) in results.into_iter().enumerate() {
         let (x, y) = coord(i)?;
-        let (data, triangulation) = result.map_err(|error| BakeError {
+        let (data, triangulation, links) = result.map_err(|error| BakeError {
             tile: Some([x, y]),
             error,
         })?;
@@ -644,6 +654,7 @@ fn bake(
             y,
             data,
             triangulation,
+            links,
         });
     }
     Ok(BakedTiles {
@@ -684,7 +695,14 @@ fn check_total_bytes(
     Ok(())
 }
 
-type TileResult = Result<(Option<Vec<u8>>, recast::TriangulationReport), Error>;
+type TileResult = Result<
+    (
+        Option<Vec<u8>>,
+        recast::TriangulationReport,
+        Vec<ExtractedLink>,
+    ),
+    Error,
+>;
 
 fn fill_results(
     results: &mut [TileResult],
@@ -925,8 +943,9 @@ mod tests {
             .num_threads(4)
             .build()
             .unwrap();
-        let mut results =
-            core::array::from_fn::<_, 4, _>(|_| Ok((None, recast::TriangulationReport::default())));
+        let mut results = core::array::from_fn::<_, 4, _>(|_| {
+            Ok((None, recast::TriangulationReport::default(), Vec::new()))
+        });
         pool.install(|| {
             fill_results(&mut results, true, |i| {
                 if i == 1 {
@@ -935,7 +954,7 @@ mod tests {
                 } else if i == 3 {
                     Err(Error::Failed)
                 } else {
-                    Ok((None, recast::TriangulationReport::default()))
+                    Ok((None, recast::TriangulationReport::default(), Vec::new()))
                 }
             })
         });

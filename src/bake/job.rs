@@ -40,6 +40,8 @@ pub struct TileOutput {
     pub input_hash: u64,
     /// Digest of `data`; `None` when the tile has no polygons.
     pub output_hash: Option<u64>,
+    /// Generated traversal connections.
+    pub links: Vec<super::ExtractedLink>,
 }
 
 struct Fetched {
@@ -131,7 +133,13 @@ impl<S: GeometrySource> Plan<'_, S> {
                     Ok(Advance::More) => {}
                     Ok(Advance::Done(data, triangulation)) => {
                         report = task.report;
-                        return Ok(output(key, hash, data, triangulation));
+                        return Ok(output(
+                            key,
+                            hash,
+                            data,
+                            triangulation,
+                            core::mem::take(&mut task.links),
+                        ));
                     }
                     Err(error) => {
                         if let Some(stats) = &mut task.report {
@@ -152,6 +160,7 @@ fn output(
     input_hash: u64,
     data: Option<Vec<u8>>,
     triangulation: TriangulationReport,
+    links: Vec<super::ExtractedLink>,
 ) -> TileOutput {
     TileOutput {
         key,
@@ -159,6 +168,7 @@ fn output(
         data,
         triangulation,
         input_hash,
+        links,
     }
 }
 
@@ -445,8 +455,10 @@ impl<'s, S: GeometrySource> BakeJob<'s, S> {
                 if let Some(report) = task.report.take() {
                     self.reports.tiles.push(report);
                 }
+                let links = core::mem::take(&mut task.links);
                 self.current = None;
-                self.ready.push_back(output(key, hash, data, triangulation));
+                self.ready
+                    .push_back(output(key, hash, data, triangulation, links));
                 Ok(cost)
             }
             Err(error) => {

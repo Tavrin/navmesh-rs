@@ -13,7 +13,24 @@ use navmesh_rs::detour::NavMesh;
 use navmesh_rs::{Budget, Progress};
 
 fuzz_target!(|data: &[u8]| {
-    let Some(s) = decode(data) else { return };
+    let Some(mut s) = decode(data) else { return };
+    if s.param & 1 != 0 {
+        use navmesh_rs::bake::{LinkExtraction, LinkLimits};
+        let limit = LinkLimits {
+            distance: 4.0,
+            up: 2.0,
+            down: 3.0,
+            clearance: 1.0,
+        };
+        s.cfg.links = Some(LinkExtraction {
+            drop: Some(limit),
+            jump: Some(limit),
+            climb: Some(limit),
+            spacing_cells: 2,
+            area_ids: [1, 2, 3],
+            flags: [1, 2, 4],
+        });
+    }
     let Some((old_grid, grid)) = s.layout_pair() else {
         return;
     };
