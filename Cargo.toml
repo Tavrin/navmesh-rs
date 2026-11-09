@@ -51,6 +51,7 @@ rayon = { version = "1.11", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
+cpu-time = "1.0"
 
 [workspace]
 members = ["parity"]
