@@ -272,6 +272,12 @@ pub trait MeshProcess {
     fn process(&self, areas: &mut [u8], flags: &mut [u16]);
     /// Supply optional tile-creation settings, such as off-mesh connection slices.
     fn configure<'a>(&'a self, _params: &mut NavMeshCreateParams<'a>) {}
+
+    /// Slots reserved in each ground tile for runtime off-mesh connections.
+    /// Returns zero by default. Keep this value stable across rebuilds.
+    fn spare_links_per_tile(&self) -> u32 {
+        0
+    }
 }
 /// Walkable area 63 becomes ground (0), and all polygons receive flag 1.
 #[derive(Clone, Copy, Debug, Default)]
@@ -1087,10 +1093,11 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             return Err(Error::TileCacheRetargeted);
         }
         // Reserve a conservative bound for builder outputs and temporary arrays before entering Detour.
-        let bound = nav_build_bound(&params)?;
+        let spare = self.process.spare_links_per_tile();
+        let bound = nav_build_bound(&params, spare)?;
         self.ws.charge_bytes::<u8>(bound)?;
         work(&mut self.ws, bound)?;
-        detour::create_nav_mesh_data(&params).map(Some)
+        detour::create_nav_mesh_data_with_spare_links(&params, spare).map(Some)
     }
     fn rebuild(&mut self, i: usize, nav: &mut NavMesh, keep_identical: bool) -> Result<(), Error> {
         let data = self.build(i)?;
@@ -1146,12 +1153,13 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
         Ok(())
     }
 }
-fn nav_build_bound(p: &NavMeshCreateParams<'_>) -> Result<usize, Error> {
+fn nav_build_bound(p: &NavMeshCreateParams<'_>, spare: u32) -> Result<usize, Error> {
     p.verts
         .len()
         .checked_mul(32)
         .and_then(|n| n.checked_add(p.polys.len().checked_mul(256)?))
         .and_then(|n| n.checked_add(p.off_mesh_con_verts.len().checked_mul(512)?))
+        .and_then(|n| n.checked_add((spare as usize).checked_mul(detour::LINK_SIZE)?))
         .and_then(|n| n.checked_add(1024))
         .ok_or(Error::SizeOverflow)
 }

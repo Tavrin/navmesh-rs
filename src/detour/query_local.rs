@@ -1084,7 +1084,7 @@ impl<'a> NavMeshQuery<'a> {
     /// Whether a ref is valid and passes the filter (`isValidPolyRef`).
     pub fn is_valid_poly_ref(&self, r: PolyRef, filter: &dyn QueryFilter) -> bool {
         match self.nav.tile_and_poly_by_ref(r) {
-            Ok((t, p)) => filter.pass_filter(r, t, p),
+            Ok((t, p)) => self.passes_filter((r, t, p), filter),
             Err(_) => false,
         }
     }

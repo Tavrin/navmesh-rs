@@ -147,6 +147,9 @@ pub struct MeshTile {
     /// The bytes the tile was created from.
     pub data: Vec<u8>,
     pub(crate) links_free_list: u32,
+    pub(crate) runtime_links_free_list: u32,
+    pub(crate) spare_links: u32,
+    pub(crate) managed_link_tile: bool,
 }
 
 /// A polygon without vertices or links (stands in for an out-of-range index).
@@ -350,6 +353,10 @@ fn check_limits(h: &MeshHeader, len: usize, limits: &Limits) -> Result<(), Error
     Ok(())
 }
 
+// The serialized link pool is scratch in DNAV. Use its first 12 bytes to
+// declare a reserved tail without changing section offsets or default bytes.
+pub(super) const SPARE_LINK_MAGIC: &[u8; 8] = b"NRSPARE1";
+
 impl MeshTile {
     // The tile reader has already validated the sections and indices. Read
     // only baked bytes, including when linking has snapped off-mesh vertices.
@@ -432,7 +439,15 @@ impl MeshTile {
             p
         })?;
         next += s.polys;
-        // Links are rebuilt when the tile is added; their bytes are not read.
+        if s.links >= 12 && data[next..next + 8] == *SPARE_LINK_MAGIC {
+            r.at = next + 8;
+            t.spare_links = r.u32();
+            if t.spare_links == 0 || t.spare_links > h.max_link_count as u32 || h.off_mesh_base == 0
+            {
+                return Err(bad(TileDataError::BadSize));
+            }
+        }
+        // Link entries are rebuilt when the tile is added.
         t.links = try_vec(h.max_link_count as usize, Link::default)?;
         next += s.links;
         r.at = next;
@@ -581,10 +596,20 @@ impl MeshTile {
     /// Resets the link pool to one free list over every link (as `addTile` does).
     pub(crate) fn reset_links(&mut self) -> u32 {
         let n = self.links.len();
+        let ordinary = n - self.spare_links as usize;
         for (i, l) in self.links.iter_mut().enumerate() {
-            l.next = if i + 1 == n { NULL_LINK } else { i as u32 + 1 };
+            l.next = if i + 1 == n || i + 1 == ordinary {
+                NULL_LINK
+            } else {
+                i as u32 + 1
+            };
         }
-        if n == 0 { NULL_LINK } else { 0 }
+        self.runtime_links_free_list = if ordinary == n {
+            NULL_LINK
+        } else {
+            ordinary as u32
+        };
+        if ordinary == 0 { NULL_LINK } else { 0 }
     }
 }
 

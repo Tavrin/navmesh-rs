@@ -23,6 +23,9 @@ mod orca;
 // Public helper calls reset usage; internal `_in` calls compose within the
 // manager's existing per-call budget.
 mod corridor;
+mod external;
+use external::PendingTraversal;
+pub use external::{OffMeshMode, OffMeshReached};
 pub mod field;
 mod grid;
 mod queue;
@@ -67,7 +70,7 @@ pub enum AgentState {
     Invalid = 0,
     /// Moving on the surface.
     Walking = 1,
-    /// Animating across a connection.
+    /// Animating or waiting for the caller to traverse a connection.
     Offmesh = 2,
 }
 /// Move request state, with upstream numeric values.
@@ -140,6 +143,8 @@ pub struct AgentParams {
     pub obstacle_avoidance_type: usize,
     /// Local velocity planner, gated by [`OBSTACLE_AVOIDANCE`].
     pub avoidance: AvoidanceMode,
+    /// Whether to animate connections or hand traversal to the caller.
+    pub off_mesh: OffMeshMode,
     /// Behavior after reaching a point target; defaults to keeping the target.
     pub arrival_policy: ArrivalPolicy,
     /// Positive planar arrival distance; vertical distance is bounded by height.
@@ -160,6 +165,7 @@ impl Default for AgentParams {
             update_flags: 31,
             obstacle_avoidance_type: 3,
             avoidance: AvoidanceMode::Sampled,
+            off_mesh: OffMeshMode::Animate,
             query_filter_type: 0,
             arrival_policy: ArrivalPolicy::Keep,
             arrival_distance: 0.5,
@@ -251,6 +257,8 @@ pub struct CrowdAgent {
     nneis: usize,
     disp: V3,
     anim: Animation,
+    pending_off_mesh: Option<PendingTraversal>,
+    pending_link_replan: bool,
 }
 impl CrowdAgent {
     fn parked(&self) -> bool {
@@ -300,6 +308,8 @@ impl CrowdAgent {
             nneis: 0,
             disp: [0.; 3],
             anim: Animation::default(),
+            pending_off_mesh: None,
+            pending_link_replan: false,
         })
     }
     /// Occupies a reset slot at the polygon `r` (zero: no polygon near, invalid).
@@ -385,6 +395,8 @@ impl CrowdAgent {
         self.nneis = 0;
         self.disp = [0.; 3];
         self.anim = Animation::default();
+        self.pending_off_mesh = None;
+        self.pending_link_replan = false;
     }
 }
 /// Fixed-capacity single-threaded crowd manager.
@@ -398,6 +410,7 @@ pub struct Crowd {
     filters: [DefaultFilter; 16],
     pathq: PathQueue,
     active: Vec<usize>,
+    link_epoch: u64,
     velocity_samples: usize,
     fixes: UpstreamFixes,
 }
@@ -432,6 +445,7 @@ impl Crowd {
             filters: core::array::from_fn(|_| DefaultFilter::default()),
             active: ws.vec_with_capacity(max_agents)?,
             velocity_samples: 0,
+            link_epoch: nav.runtime_links_changed_at(),
             fixes: UpstreamFixes::NONE,
         })
     }

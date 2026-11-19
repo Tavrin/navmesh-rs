@@ -157,6 +157,8 @@ pub struct BakeConfig {
     pub fixes: UpstreamFixes,
     /// Optional boundary traversal extraction; disabled by default.
     pub links: Option<LinkExtraction>,
+    /// Ground-polygon slots reserved in each nonempty tile for runtime links.
+    pub spare_links_per_tile: u32,
 }
 
 impl Default for BakeConfig {
@@ -191,6 +193,7 @@ impl Default for BakeConfig {
             strict_triangulation: false,
             fixes: UpstreamFixes::NONE,
             links: None,
+            spare_links_per_tile: 0,
         }
     }
 }

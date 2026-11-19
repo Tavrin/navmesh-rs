@@ -570,7 +570,7 @@ impl NavMesh {
             return true;
         }
         match self.stream.known.get(&(x, y)) {
-            Some(&want) => self.tiles_at(x, y, usize::from(want)).len() < want as usize,
+            Some(&want) => self.ground_tiles_at(x, y, usize::from(want)).len() < want as usize,
             None => false,
         }
     }
@@ -623,6 +623,7 @@ impl NavMesh {
     /// one per resident tile plus a full connection/candidate relink allowance
     /// when global off-mesh links
     /// are on (all connection counts times all polygon, link and tile counts).
+    /// A managed runtime layer adds an allowance to resolve both endpoints again.
     pub fn commit_cost(&self, t: &PreparedTile) -> u64 {
         self.link_cost(&t.tile)
     }
@@ -632,7 +633,7 @@ impl NavMesh {
         let (x, y) = (t.header.x, t.header.y);
         let mut cost = 1 + t.polys.len() as u64;
         let mut add = |j: usize| cost += self.tile(j).map_or(0, |t| t.polys.len() as u64);
-        for j in self.tiles_at(x, y, 32) {
+        for j in self.ground_tiles_at(x, y, 32) {
             add(j);
         }
         for side in 0..8 {
@@ -653,7 +654,7 @@ impl NavMesh {
             }
             cost = cost.saturating_add(connections.saturating_mul(candidates));
         }
-        cost
+        cost.saturating_add(self.runtime_link_work(t))
     }
 
     /// Owner-thread half of [`NavMesh::add_tile`] for a tile from [`prepare_tile`]:
@@ -752,6 +753,7 @@ impl NavMesh {
             ));
         }
         let h = &t.tile.header;
+        self.check_ground_layer(h.layer)?;
         if self.tile_index_at(h.x, h.y, h.layer).is_some() {
             return Err(Error::TileSlotOccupied);
         }
@@ -764,6 +766,7 @@ impl NavMesh {
     /// (runtime flags and areas) and the content hash. All or nothing.
     pub fn unload_tile(&mut self, r: TileRef) -> Result<UnloadedTile, Error> {
         let ti = self.resident_slot(r)?;
+        self.check_ground_layer(self.tile_unchecked(ti as u32).header.layer)?;
         let size = self.tile_state_size(r)?;
         let (version, layout) = self.state_footer_kind();
         let mut state = Vec::new();
@@ -799,6 +802,7 @@ impl NavMesh {
         });
         self.stream.park(h.x, h.y, h.layer, ti);
         self.stream.log_removal(ti as u32);
+        self.runtime_ground_changed();
         Ok(UnloadedTile {
             key,
             layer: h.layer,
@@ -812,6 +816,7 @@ impl NavMesh {
     /// [`RefState::Stale`] and the slot is free again (as after `remove_tile`).
     /// [`Error::InvalidParameter`] when no tile is unloaded at `key, layer`.
     pub fn forget_unloaded(&mut self, key: TileKey, layer: i32) -> Result<(), Error> {
+        self.check_ground_layer(layer)?;
         let ti = self
             .stream
             .parked_slot(&self.slots, key.x, key.y, layer)

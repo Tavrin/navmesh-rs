@@ -213,3 +213,34 @@ fn extraction_costs() -> Result<(), Box<dyn std::error::Error>> {
     assert!(counts[1] > 0);
     Ok(())
 }
+
+#[test]
+fn bake_reserve_changes_tile_bytes_and_manifest_identity() -> Result<(), Box<dyn std::error::Error>>
+{
+    use navmesh_rs::detour::MeshTile;
+
+    let (v, t) = scene();
+    let input = Input::new(&v, &t);
+    let mut c = config();
+    let grid = GridLayout::from_input(&input, &c)?;
+    let before = BakeManifest::config_hash(&c, &grid);
+    let plain = bake::tiles(&input, &c, &mut Workspace::new())?;
+    c.spare_links_per_tile = 4;
+    let reserved = bake::tiles(&input, &c, &mut Workspace::new())?;
+    assert_ne!(BakeManifest::config_hash(&c, &grid), before);
+    assert!(plain.tiles.iter().any(|t| t.data.is_some()));
+    assert_eq!(plain.tiles.len(), reserved.tiles.len());
+    for (a, b) in plain.tiles.into_iter().zip(reserved.tiles) {
+        match (a.data, b.data) {
+            (Some(a), Some(b)) => {
+                let a = MeshTile::parse(a)?;
+                let b = MeshTile::parse(b)?;
+                assert_eq!(a.polys, b.polys);
+                assert_eq!(b.links.len(), a.links.len() + 4);
+            }
+            (None, None) => {}
+            _ => panic!("adding spare slots changed ground tile coverage"),
+        }
+    }
+    Ok(())
+}

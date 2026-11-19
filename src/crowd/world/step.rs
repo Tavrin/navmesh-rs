@@ -256,6 +256,7 @@ impl CrowdWorld {
             owner,
             grid,
             active,
+            link_epoch,
             ..
         } = self;
         let (filters, presets) = (&*filters, &*presets);
@@ -270,9 +271,19 @@ impl CrowdWorld {
         }
         // Serial phases, in agent-index order.
         let mut q = NavMeshQuery::new(nav, 512)?;
+        let epoch = nav.runtime_links_changed_at();
+        let links_changed = epoch != *link_epoch;
         for &i in active.iter() {
-            phases::check_path(&mut heavy[heavy_of[i] as usize], &q, filters, extents, dt)?;
+            phases::check_path(
+                &mut heavy[heavy_of[i] as usize],
+                &q,
+                filters,
+                extents,
+                dt,
+                links_changed,
+            )?;
         }
+        *link_epoch = epoch;
         let mut slots = Slots {
             heavy: &mut heavy[..],
             heavy_of,

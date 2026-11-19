@@ -814,7 +814,12 @@ impl<'a> TileTask<'a> {
                 .and_then(|n| n.checked_add(off.off_mesh_con_verts.len()))
                 .and_then(|n| n.checked_add(1))
                 .ok_or(Error::SizeOverflow)?;
-            let bound = n.checked_mul(128).ok_or(Error::SizeOverflow)?;
+            let bound = n
+                .checked_mul(128)
+                .and_then(|n| {
+                    n.checked_add((c.spare_links_per_tile as usize).checked_mul(detour::LINK_SIZE)?)
+                })
+                .ok_or(Error::SizeOverflow)?;
             let polys = usize::try_from(mesh.npolys).map_err(|_| Error::SizeOverflow)?;
             let sort_work = polys
                 .checked_mul(
@@ -825,7 +830,8 @@ impl<'a> TileTask<'a> {
                 .ok_or(Error::SizeOverflow)?;
             work(ws, bound.checked_add(sort_work).ok_or(Error::SizeOverflow)?)?;
             ws.charge_bytes::<u8>(bound)?;
-            let data = detour::create_with_limits(&params, &c.tile_limits)?;
+            let data =
+                detour::create_with_spare_links(&params, &c.tile_limits, c.spare_links_per_tile)?;
             let retained = self
                 .links
                 .capacity()
