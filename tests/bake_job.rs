@@ -1070,3 +1070,54 @@ fn installer_uses_the_prepared_layer() {
     assert_eq!(nav.poly_flags(r), Ok(9));
     assert!(nav.tile_index_at(key.x, key.z, 0).is_none());
 }
+
+#[cfg(feature = "dynamic")]
+#[test]
+fn rebake_installer_reapplies_closed_gate() {
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let cfg = BakeConfig::default();
+    let grid = GridLayout::new([0.0, -1.0, 0.0], 8.0, 2, 2, &cfg).unwrap();
+    let flat = Quads::default().quad(0.0, 0.0, 20.0, 20.0, 0.0);
+    let edited = Quads::default()
+        .quad(0.0, 0.0, 20.0, 20.0, 0.0)
+        .quad(4.0, 4.0, 6.0, 6.0, 0.6);
+    let key = TileKey { x: 0, z: 0 };
+    let old = bake_quads(&flat, &cfg, &grid, &[key]).remove(0);
+    let new = bake_quads(&edited, &cfg, &grid, &[key]).remove(0);
+    assert_ne!(old.data, new.data);
+
+    let mut nav = navmesh_rs::detour::NavMesh::new(&grid.nav_mesh_params(4, 4096)).unwrap();
+    let mut layer = DynamicLayer::new(1, Limits::UNLIMITED).unwrap();
+    let gate = ModifierId(0);
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            Selector::Prism {
+                verts_xz: vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]],
+                ymin: -1.0,
+                ymax: 2.0,
+                area: None,
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    layer.set_enabled(gate, true).unwrap();
+    nav.set_dynamic_layer(Some(layer));
+
+    let mut installer = bake::TileInstaller::new();
+    let mut previous = 0;
+    for output in [old, new] {
+        installer.push(output);
+        installer
+            .install(&mut nav, &mut Budget::unlimited())
+            .unwrap();
+        let r = nav.tile_ref(nav.tile_index_at(0, 0, 0).unwrap());
+        assert_ne!(r, previous);
+        let polys = &nav.tile_by_ref(r).unwrap().polys;
+        assert!(!polys.is_empty());
+        assert_eq!(nav.modifier_polygon_count(gate), Some(polys.len()));
+        assert!(polys.iter().all(|p| p.flags == 0));
+        previous = r;
+    }
+}

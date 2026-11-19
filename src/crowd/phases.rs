@@ -17,6 +17,7 @@ pub(super) trait AgentsView {
     fn dvel(&self, j: usize) -> V3;
     fn radius(&self, j: usize) -> f32;
     fn max_speed(&self, j: usize) -> f32;
+    fn parked(&self, j: usize) -> bool;
     fn orca(&self, j: usize) -> OrcaAgent {
         let (p, v, d) = (self.npos(j), self.vel(j), self.dvel(j));
         OrcaAgent {
@@ -30,6 +31,9 @@ pub(super) trait AgentsView {
 }
 
 impl AgentsView for [CrowdAgent] {
+    fn parked(&self, j: usize) -> bool {
+        self[j].parked()
+    }
     fn npos(&self, j: usize) -> V3 {
         self[j].npos
     }
@@ -677,7 +681,7 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
         for (out, &(_, seg)) in walls.iter_mut().zip(&a.boundary.segments) {
             *out = [seg[0], seg[2], seg[3], seg[5]];
         }
-        let v = orca::velocity_in(
+        let v = orca::velocity_with_responsibility(
             ws,
             &OrcaAgent::crowd(a),
             s.orca_neighbours,
@@ -685,6 +689,14 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
             &p,
             dt,
             s.orca,
+            |k| {
+                let other = others.parked(a.neis[k].0);
+                match (a.parked(), other) {
+                    (true, false) => 0.,
+                    (false, true) => 1.,
+                    _ => 0.5,
+                }
+            },
         )?;
         [v[0], 0., v[1]]
     } else if a.params.update_flags & OBSTACLE_AVOIDANCE != 0

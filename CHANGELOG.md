@@ -13,6 +13,12 @@ All notable changes to this project are documented in this file. The format foll
   snapshots. Tile replacement and streaming re-resolve the registered links.
 - `OffMeshMode::External` in both crowds, with pending arrival reports and
   explicit completion or abort. See [runtime links](docs/RUNTIME-LINKS.md).
+- Opt-in `dynamic` feature for gates and cost zones over baked polygons. The navmesh
+  owns the modifier layer, derives runtime flags and areas on install and reload, and
+  toggles stable IDs without rebuilding tiles or advancing their salts. Save the layer
+  in the versioned `DNDY` format. See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
+- Managed links require both landings to pass the query filter, so closing a
+  gate on either landing blocks paths through the link.
 
 - `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
   agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
@@ -43,6 +49,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
+- CrowdWorld writes `DCRW` version 3 for arrival policies or external traversal.
+  It reads both legacy version 2 layouts and still writes version 1 for default worlds.
 - `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
   `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
 - `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning
@@ -73,6 +81,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
+- Shared point goals can use mesh-checked goal slots and optional park or remove
+  arrival policies in both crowd managers, preventing congestion at one destination.
+  Existing arrival behavior remains the default.
 - Persisted nondefault ref layouts now tag bare tile state (DNMS version 2)
   and exported tile bytes (NRFL version 1 trailer). All restore paths check
   provenance before mutation, including colliding numeric refs and bare restore

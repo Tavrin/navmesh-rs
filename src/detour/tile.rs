@@ -149,6 +149,7 @@ pub struct MeshTile {
     pub(crate) links_free_list: u32,
     pub(crate) runtime_links_free_list: u32,
     pub(crate) spare_links: u32,
+    pub(crate) managed_link_tile: bool,
 }
 
 /// A polygon without vertices or links (stands in for an out-of-range index).
@@ -357,6 +358,33 @@ fn check_limits(h: &MeshHeader, len: usize, limits: &Limits) -> Result<(), Error
 pub(super) const SPARE_LINK_MAGIC: &[u8; 8] = b"NRSPARE1";
 
 impl MeshTile {
+    // The tile reader has already validated the sections and indices. Read
+    // only baked bytes, including when linking has snapped off-mesh vertices.
+    #[cfg(feature = "dynamic")]
+    pub(super) fn baked_state(&self, ip: usize) -> (u16, u8) {
+        let at = HEADER_SIZE + self.header.vert_count as usize * 12 + ip * POLY_SIZE;
+        let p = &self.data[at..at + POLY_SIZE];
+        let flags_at = 4 + VERTS_PER_POLYGON * 4;
+        (
+            u16::from_le_bytes([p[flags_at], p[flags_at + 1]]),
+            p[flags_at + 3] & 63,
+        )
+    }
+
+    #[cfg(feature = "dynamic")]
+    pub(super) fn baked_vertex(&self, vert: usize) -> [f32; 3] {
+        let at = HEADER_SIZE + vert * 12;
+        core::array::from_fn(|i| {
+            let v = at + 4 * i;
+            f32::from_le_bytes([
+                self.data[v],
+                self.data[v + 1],
+                self.data[v + 2],
+                self.data[v + 3],
+            ])
+        })
+    }
+
     /// Decodes and validates tile bytes. Every index upstream follows without a
     /// check is checked here, so a tile that passes cannot make a query read out of
     /// bounds. Same as [`MeshTile::parse_with_limits`] with [`Limits::UNLIMITED`]:

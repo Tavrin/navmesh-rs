@@ -269,6 +269,9 @@ impl Crowd {
         }
         for &i in &self.active {
             phases::check_finite(&self.agents[i])?;
+            if arrival::finish_arrival(&mut self.agents[i]) {
+                self.agents[i].reset_slot();
+            }
         }
         Ok(())
     }

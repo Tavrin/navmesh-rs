@@ -1602,3 +1602,331 @@ fn replacement_unload_identity_is_prepared_content_for_both_layouts_and_paths() 
         }
     }
 }
+
+#[cfg(feature = "dynamic")]
+mod gates {
+    use super::*;
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+    use navmesh_rs::{Budgeted, SnapshotError};
+
+    const GATE: ModifierId = ModifierId(3);
+
+    fn prism(x: f32, area: Option<u8>) -> Selector {
+        Selector::Prism {
+            verts_xz: vec![[x, 0.0], [x + 10.0, 0.0], [x + 10.0, 10.0], [x, 10.0]],
+            ymin: 0.0,
+            ymax: 1.0,
+            area,
+        }
+    }
+
+    fn world(enabled: bool) -> NavMesh {
+        let mut nav = NavMesh::with_policy(&params(4), Limits::UNLIMITED, keyed(4, 1)).unwrap();
+        let mut layer = DynamicLayer::new(8, Limits::UNLIMITED).unwrap();
+        layer
+            .upsert(ModifierSpec::new(
+                GATE,
+                prism(10.0, Some(0)),
+                Effect::ClearFlags(u16::MAX),
+            ))
+            .unwrap();
+        layer.set_enabled(GATE, enabled).unwrap();
+        nav.set_dynamic_layer(Some(layer));
+        nav
+    }
+
+    #[test]
+    fn toggle_changes_queries_without_rebuild_or_salt() {
+        let mut nav = world(false);
+        let start = commit(&mut nav, quad(0, 0, 0));
+        let gate = commit(&mut nav, quad(1, 0, 0));
+        let goal = commit(&mut nav, quad(2, 0, 0));
+        let filter = DefaultFilter::default();
+        let path = |nav: &NavMesh| {
+            let mut q = NavMeshQuery::new(nav, 64).unwrap();
+            let mut out = Vec::new();
+            q.find_path(
+                start,
+                goal,
+                &center(0, 0),
+                &center(2, 0),
+                &filter,
+                &mut out,
+                8,
+            )
+            .unwrap();
+            out
+        };
+        assert_eq!(path(&nav), [start, gate, goal]);
+        let epoch = nav.epoch();
+        let state = nav.state_epoch();
+        let salt = nav.salt_headroom(TileKey { x: 1, y: 0 }, 0);
+        let content = nav.tile_by_ref(gate).unwrap().data.clone();
+
+        assert_eq!(
+            nav.set_modifier_enabled_budgeted(GATE, true, &mut Budget::new(0)),
+            Ok(Budgeted::Exhausted(false))
+        );
+        assert_eq!(nav.state_epoch(), state);
+        assert_eq!(path(&nav), [start, gate, goal]);
+        assert_eq!(
+            nav.set_modifier_enabled_budgeted(GATE, true, &mut Budget::new(1)),
+            Ok(Budgeted::Complete(true))
+        );
+        assert_eq!(nav.set_modifier_enabled(GATE, true), Ok(false));
+        assert_eq!(nav.state_epoch(), state + 1);
+        assert_eq!(nav.state_stamp(gate), Some(state + 1));
+        assert_eq!(nav.state_stamp(start), Some(0));
+        assert_eq!(path(&nav), [start]);
+        assert_eq!(
+            nav.reachable_filtered(start, &filter, &mut Budget::new(0)),
+            Ok(Budgeted::Exhausted(None))
+        );
+        let reached = nav
+            .reachable_filtered(start, &filter, &mut Budget::unlimited())
+            .unwrap()
+            .into_value()
+            .unwrap();
+        assert_eq!(reached.into_iter().collect::<Vec<_>>(), [start]);
+        assert_eq!(nav.epoch(), epoch);
+        assert_eq!(nav.salt_headroom(TileKey { x: 1, y: 0 }, 0), salt);
+        assert_eq!(nav.tile_by_ref(gate).unwrap().data, content);
+        assert_eq!(nav.baked_poly_state(gate), Ok((1, 0)));
+        let report = nav.modifier_selection(GATE).unwrap();
+        assert_eq!(report.selected_polygons, 1);
+        assert_eq!(report.bounds_without_centroid, 2);
+
+        nav.set_modifier_enabled(GATE, false).unwrap();
+        assert_eq!(path(&nav), [start, gate, goal]);
+    }
+
+    #[test]
+    fn overlapping_edits_start_from_baked_state_and_reselect() {
+        let mut nav = world(true);
+        let gate = commit(&mut nav, quad(1, 0, 0));
+        let next = commit(&mut nav, quad(2, 0, 0));
+        let cost = ModifierId(6);
+        let permit = ModifierId(7);
+        for (id, effect) in [(permit, Effect::SetFlags(4)), (cost, Effect::SetArea(9))] {
+            nav.upsert_modifier(ModifierSpec::new(id, prism(10.0, Some(0)), effect))
+                .unwrap();
+            nav.set_modifier_enabled(id, true).unwrap();
+        }
+        assert_eq!(nav.poly_flags(gate), Ok(4));
+        assert_eq!(nav.poly_area(gate), Ok(9));
+        assert!(nav.set_poly_flags(gate, 15).is_err());
+        assert!(nav.set_poly_area(gate, 15).is_err());
+
+        // Moving an enabled spec restores the old selection and applies at the new one.
+        nav.upsert_modifier(ModifierSpec::new(
+            GATE,
+            prism(20.0, Some(0)),
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+        assert_eq!(nav.poly_flags(gate), Ok(5));
+        assert_eq!(nav.poly_flags(next), Ok(0));
+        assert!(nav.remove_modifier(cost));
+        assert_eq!(nav.poly_area(gate), Ok(0));
+        nav.set_dynamic_layer(None);
+        assert_eq!(nav.poly_flags(gate), Ok(1));
+        assert_eq!(nav.poly_flags(next), Ok(1));
+        nav.set_poly_area(gate, 2).unwrap();
+        assert_eq!(nav.state_stamp(gate), Some(nav.state_epoch()));
+    }
+
+    #[test]
+    fn replacement_reapplies_to_new_bytes_with_layout_provenance() {
+        // Explicit layout on 64-bit builds and the derived layout on 32-bit builds.
+        let base = world(true);
+        let mut nav = if PolyRef::BITS == 64 {
+            NavMesh::with_layout(
+                &params(4),
+                Limits::UNLIMITED,
+                keyed(4, 1),
+                RefLayout::WIDE_SALT,
+            )
+            .unwrap()
+        } else {
+            base.clone()
+        };
+        nav.set_dynamic_layer(base.dynamic_layer().cloned());
+        let prepare = |nav: &NavMesh, variant| {
+            detour::prepare_tile_with_layout(
+                nav.params(),
+                nav.limits(),
+                nav.ref_layout(),
+                quad(1, 0, variant),
+            )
+            .unwrap()
+        };
+        let old = nav.commit(prepare(&nav, 0)).unwrap();
+        let changed = prepare(&nav, 1);
+        let budget = nav.replace_cost(&changed);
+        assert!(matches!(
+            nav.replace_tile_budgeted(changed.clone(), &mut Budget::new(budget - 1)),
+            Ok(Replaced::Refused(_))
+        ));
+        assert_eq!(nav.poly_flags(old), Ok(0));
+        let new = nav.replace_tile(changed).unwrap().tile_ref().unwrap();
+        assert_eq!(nav.ref_state(old), RefState::Stale);
+        assert_eq!(nav.poly_flags(new), Ok(0));
+        assert_eq!(nav.baked_poly_state(new), Ok((2, 0)));
+        assert!(
+            matches!(nav.replace_tile(prepare(&nav, 1)), Ok(Replaced::Unchanged(r)) if r == new)
+        );
+        nav.set_modifier_enabled(GATE, false).unwrap();
+        assert_eq!(nav.poly_flags(new), Ok(2));
+    }
+
+    #[test]
+    fn reload_uses_current_bit_even_with_an_old_tile_state_blob() {
+        let mut nav = world(false);
+        let bytes = quad(1, 0, 0);
+        let prepared = prepare_tile(nav.params(), nav.limits(), bytes).unwrap();
+        let r = nav.commit(prepared.clone()).unwrap();
+        let parked = nav.unload_tile(r).unwrap();
+        nav.set_modifier_enabled(GATE, true).unwrap();
+        assert_eq!(
+            nav.commit_with_state(prepared.clone(), &parked.state),
+            Ok(r)
+        );
+        nav.restore_tile_state(r, &parked.state).unwrap();
+        assert_eq!(nav.poly_flags(r), Ok(0));
+        nav.unload_tile(r).unwrap();
+        assert_eq!(nav.commit(prepared), Ok(r));
+        assert_eq!(nav.poly_flags(r), Ok(0));
+
+        // A legacy remove/add sequence also re-derives the state.
+        let bytes = nav.remove_tile(r).unwrap();
+        let r2 = nav.add_tile(bytes).unwrap();
+        assert_ne!(r, r2);
+        assert_eq!(nav.poly_flags(r2), Ok(0));
+    }
+
+    #[test]
+    fn snapshots_restore_modifier_bits_independently_of_residency() {
+        let mut nav = world(true);
+        let r = commit(&mut nav, quad(1, 0, 0));
+        let rec = ResidencyRecord::from_bytes(&nav.residency().to_bytes()).unwrap();
+        let saved = nav.dynamic_layer().unwrap();
+        let bytes = saved.to_bytes();
+        let snapshot = DynamicLayer::from_bytes(&bytes, Limits::UNLIMITED).unwrap();
+        assert_eq!(snapshot.to_bytes(), bytes);
+        assert_eq!(snapshot.digest(), saved.digest());
+
+        let mut restored =
+            NavMesh::with_policy(&params(4), Limits::UNLIMITED, keyed(4, 1)).unwrap();
+        restored.restore_residency(&rec).unwrap();
+        restored.set_dynamic_layer(Some(snapshot));
+        assert_eq!(commit(&mut restored, quad(1, 0, 0)), r);
+        assert_eq!(restored.poly_flags(r), Ok(0));
+
+        let mut unknown = bytes.clone();
+        unknown[4..8].copy_from_slice(&2u32.to_le_bytes());
+        assert!(matches!(
+            DynamicLayer::from_bytes(&unknown, Limits::UNLIMITED),
+            Err(Error::InvalidSnapshot(SnapshotError::WrongVersion))
+        ));
+        for len in 0..bytes.len() {
+            assert!(DynamicLayer::from_bytes(&bytes[..len], Limits::UNLIMITED).is_err());
+        }
+        let mut corrupt = bytes;
+        corrupt[16] ^= 128;
+        assert!(matches!(
+            DynamicLayer::from_bytes(&corrupt, Limits::UNLIMITED),
+            Err(Error::InvalidSnapshot(_))
+        ));
+    }
+
+    #[test]
+    fn baked_link_selector_uses_the_authored_user_id() {
+        let mut nav = world(false);
+        let id = ModifierId(5);
+        nav.upsert_modifier(ModifierSpec::new(
+            id,
+            Selector::Links {
+                user_id_min: 42,
+                user_id_max: 42,
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+        nav.set_modifier_enabled(id, true).unwrap();
+        let bytes = detour::create_nav_mesh_data(&NavMeshCreateParams {
+            verts: &[0, 0, 0, 0, 0, 10, 10, 0, 10, 10, 0, 0],
+            vert_count: 4,
+            polys: &[
+                0, 1, 2, 3, 0xffff, 0xffff, 0x800f, 0x800f, 0x800f, 0x800f, 0xffff, 0xffff,
+            ],
+            poly_flags: &[1],
+            poly_areas: &[0],
+            poly_count: 1,
+            nvp: 6,
+            bmin: [0., 0., 0.],
+            bmax: [10., 1., 10.],
+            walkable_height: 2.,
+            walkable_radius: 0.5,
+            walkable_climb: 0.5,
+            cs: 1.,
+            ch: 1.,
+            off_mesh_con_verts: &[3., 0., 3., 6., 0., 6., 2., 0., 2., 7., 0., 7.],
+            off_mesh_con_rad: &[1., 1.],
+            off_mesh_con_flags: &[1, 1],
+            off_mesh_con_areas: &[0, 0],
+            off_mesh_con_dir: &[1, 1],
+            off_mesh_con_user_id: &[42, 43],
+            off_mesh_con_count: 2,
+            ..Default::default()
+        })
+        .unwrap();
+        let tile = commit(&mut nav, bytes);
+        assert_eq!(nav.poly_flags(tile), Ok(1));
+        assert_eq!(nav.poly_flags(tile + 1), Ok(0));
+        assert_eq!(nav.poly_flags(tile + 2), Ok(1));
+        let saved = nav.dynamic_layer().unwrap().to_bytes();
+        let restored = DynamicLayer::from_bytes(&saved, Limits::UNLIMITED).unwrap();
+        assert_eq!(restored.to_bytes(), saved);
+        nav.set_modifier_enabled(id, false).unwrap();
+        assert_eq!(nav.poly_flags(tile + 1), Ok(1));
+    }
+
+    #[cfg(feature = "crowd")]
+    #[test]
+    fn crowd_observes_closed_polygon_on_next_tick() {
+        use navmesh_rs::crowd::{AgentParams, AgentState, Crowd};
+
+        let mut nav = world(false);
+        commit(&mut nav, quad(1, 0, 0));
+        let mut ws = Workspace::new();
+        let mut crowd = Crowd::new(&mut ws, &nav, 1, 1.0).unwrap();
+        let id = crowd
+            .add_agent(&mut ws, &nav, center(1, 0), AgentParams::default())
+            .unwrap();
+        assert_eq!(crowd.agent(id).unwrap().state, AgentState::Walking);
+        nav.set_modifier_enabled(GATE, true).unwrap();
+        crowd.update(&mut ws, &nav, 0.05).unwrap();
+        assert_eq!(crowd.agent(id).unwrap().state, AgentState::Invalid);
+    }
+
+    #[cfg(feature = "crowd-world")]
+    #[test]
+    fn crowd_world_observes_closed_polygon_on_next_tick() {
+        use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams};
+        use navmesh_rs::crowd::{AgentParams, AgentState};
+
+        let mut nav = world(false);
+        commit(&mut nav, quad(1, 0, 0));
+        let mut params = CrowdWorldParams::default();
+        params.max_agents = 1;
+        params.max_heavy_agents = 1;
+        let mut crowd = CrowdWorld::new(&nav, &params, Limits::UNLIMITED).unwrap();
+        let id = crowd
+            .add_agent(&nav, center(1, 0), AgentParams::default())
+            .unwrap();
+        assert_eq!(crowd.agent(id).unwrap().state(), AgentState::Walking);
+        nav.set_modifier_enabled(GATE, true).unwrap();
+        crowd.step(&nav, &mut Budget::unlimited()).unwrap();
+        assert_eq!(crowd.agent(id).unwrap().state(), AgentState::Invalid);
+    }
+}

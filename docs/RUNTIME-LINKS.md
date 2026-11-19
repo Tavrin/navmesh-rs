@@ -59,6 +59,12 @@ frame, while abort uses the departure frame. The frame owner will need to
 validate and transfer the agent before completing the hand-off. The current API
 runs within one navmesh coordinate frame and validates a landing in that mesh.
 
+Both landing polygons must pass the agent's query filter before a path enters
+a managed link. A gate on a landing can therefore block traversal without
+changing the link's registration or requested availability. With the `dynamic`
+feature, link selectors can also override a managed connection's flags and area.
+The connection must still be enabled and have both landings to be usable.
+
 ## Saved state
 
 Save `runtime_links_to_bytes()` alongside ground content and, if refs are
@@ -66,7 +72,8 @@ persisted, `NavMesh::residency()`. Restore residency first, call
 `restore_runtime_links()`, then recommit any remaining ground tiles. Restore
 the crowd snapshot after the mesh. A residency reservation for a generated
 tile must match the rebuilt tile's content hash. Crowd snapshots with external
-traversal state use `DCRW` version 2 and restore pending arrivals.
+traversal state use `DCRW` version 3 and restore pending arrivals along with
+goal arrival policies. Readers also accept legacy version 2 snapshots.
 
 `DNLK` version 1 is a little-endian record. The 20-byte header contains the four
 magic bytes, a `u32` version, an `i32` layer (`-1` for no layer) and a `u64`
