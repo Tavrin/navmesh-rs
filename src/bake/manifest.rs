@@ -145,11 +145,7 @@ impl GridLayout {
         cfg: &BakeConfig,
     ) -> Result<Self, Error> {
         super::validate_config(cfg)?;
-        let halo_cells = cfg
-            .recast
-            .walkable_radius
-            .checked_add(3)
-            .ok_or(Error::SizeOverflow)?;
+        let halo_cells = super::links::halo(cfg)?;
         let layout = Self {
             origin,
             max_y,
@@ -191,7 +187,7 @@ impl GridLayout {
     pub(super) fn validate(&self, cfg: &BakeConfig) -> Result<(), Error> {
         self.wellformed()?;
         let c = &cfg.recast;
-        let border_ok = self.halo_cells >= c.walkable_radius.saturating_add(3);
+        let border_ok = self.halo_cells >= super::links::halo(cfg)?;
         let extent = c.tile_size as f32 * c.cs;
         if !border_ok
             || self.tile_extent.to_bits() != extent.to_bits()
@@ -788,6 +784,7 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
         max_total_bytes: _,
         strict_triangulation,
         fixes,
+        links,
     } = *cfg;
     let Config {
         width: _,
@@ -839,6 +836,22 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
     h.f32(walkable_climb);
     h.u8(u8::from(strict_triangulation));
     h.u32(fixes.bits());
+    // Preserve the legacy digest when extraction is disabled.
+    if let Some(l) = links {
+        h.u8(0xa6);
+        h.u32(l.spacing_cells as u32);
+        for (i, limit) in [l.drop, l.jump, l.climb].into_iter().enumerate() {
+            h.u8(l.area_ids[i]);
+            h.u32(l.flags[i] as u32);
+            h.u8(u8::from(limit.is_some()));
+            if let Some(v) = limit {
+                h.f32(v.distance);
+                h.f32(v.up);
+                h.f32(v.down);
+                h.f32(v.clearance);
+            }
+        }
+    }
     h.finish()
 }
 

@@ -29,6 +29,8 @@ use navmesh_rs::tilecache::{
     self as tc, MeshProcess, ObstacleShape, RawCompressor, TileCache, TileCacheParams,
 };
 use navmesh_rs::{Error, Limits, Workspace};
+#[path = "../any_angle_check.rs"]
+mod any_angle_check;
 #[path = "../connectivity_check.rs"]
 mod connectivity_check;
 mod tilecache_records {
@@ -42,8 +44,8 @@ fn cost_filter() -> DefaultFilter {
         exclude_flags: 0x10,
         ..DefaultFilter::default()
     };
-    for a in 1..8 {
-        f.area_cost[a] = 1.0 + 1.5 * a as f32;
+    for (a, cost) in f.area_cost.iter_mut().enumerate().take(8).skip(1) {
+        *cost = 1.0 + 1.5 * a as f32;
     }
     f
 }
@@ -2314,6 +2316,7 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        "verify-any-angle" => any_angle_check::verify(&case, &g),
         "verify-connectivity" => {
             let baked = bake(&case, &g, &mut Sink { writer: None }).map_err(|e| e.to_string())?;
             if baked.tiles.is_empty() {

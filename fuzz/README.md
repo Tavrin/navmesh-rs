@@ -139,3 +139,13 @@ exhausted saved history, stacked global landing permutations (varied heights and
 link direction), and refused cache unloads with live obstacles in a colliding
 hash bucket (varied work thresholds). Stream seeds include every boundary mode;
 residency seeds include exhausted reservations.
+
+`replace_ops` takes a mode byte (bit 0: keyed slots, bit 1: global off-mesh links,
+bit 2: the wide-salt ref layout with 64-bit refs) and up to 256 two-byte operations
+on a 4 x 4 grid of quad tiles: `NavMesh::replace_tile` with a content variant, its
+budgeted form, damaged bytes, a tile prepared for another ref layout, unload, remove,
+runtime flags, taking refs, and a residency save and restore. A model checks that equal
+content changes nothing, other content advances the slot's salt once, every refusal
+leaves the epoch and residency record as they were, and every ref taken is exactly as
+stale, valid or unloaded as the model says. It has no seed generator; it starts from an
+empty corpus.

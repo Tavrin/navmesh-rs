@@ -39,6 +39,44 @@ All notable changes to this project are documented in this file. The format foll
 
 - `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
   `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
+- `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning
+  `Replaced`: swaps the tile at a prepared tile's column and layer all or nothing. Equal
+  content (same SHA-256) changes nothing: no salt advance, no epoch change, runtime flags
+  and areas kept. Other content takes the same slot with one salt advance. A refusal
+  leaves the resident tile with its salt, refs and runtime state.
+- Opt-in ref layouts for 64-bit refs: `RefLayout`, `NavMesh::with_layout`,
+  `NavMesh::ref_layout` and `prepare_tile_with_layout`. `RefLayout::WIDE_SALT` (22 salt,
+  28 tile, 14 polygon bits) allows 4,194,302 salt advances per slot instead of 65,534, with
+  at most 16,384 polygons per tile. The default layout and its refs are unchanged.
+- `NavMesh::salt_headroom`: salt advances left for a tile's slot.
+- Residency records version 4 and unload-state footers version 3 name an explicit ref
+  layout. Navmeshes with the default layout still write versions 3 and 2, byte for byte as
+  before.
+- `replace_ops` fuzz target.
+- `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of
+  the resident tile again keeps its refs and runtime flags; a refused tile no longer comes
+  back under a new salt with its flags reset. The layer comes from the tile header instead
+  of assuming layer 0 (removals still remove layer 0), and bytes whose header names
+  another column than the entry's key are refused. Installation now also computes the
+  tile's SHA-256 identity.
+- `TileCache` rebuilds replace the resident tile in place: a refused rebuild keeps the
+  resident tile instead of losing it. Identical bytes still advance the salt by default,
+  as upstream does, so tile-cache parity is unchanged; the new
+  `TileCache::set_keep_identical_tiles(true)` makes them keep the tile's refs, salt and
+  runtime flags.
+
+### Fixed
+
+- Persisted nondefault ref layouts now tag bare tile state (DNMS version 2)
+  and exported tile bytes (NRFL version 1 trailer). All restore paths check
+  provenance before mutation, including colliding numeric refs and bare restore
+  of unload state. Untagged legacy files mean default layout; default output is
+  unchanged. Old default files load; new readers reject unknown layouts.
+- Tile-cache processors cannot retarget a rebuild to another tile or layer.
+- Layer-header decoding and cache rebuild use checked or infallible conversions
+  instead of unwraps.
+- Document prepared content identity, including nondefault layout provenance,
+  and make the replacement property model retain those installed bytes.
 
 ## [0.2.2] - 2026-11-06
 
@@ -66,6 +104,39 @@ All notable changes to this project are documented in this file. The format foll
 - ORCA nearest-neighbour queries use a smaller search only after proving that it
   contains the full nearest set; otherwise they repeat the full-range query.
   The sampled planner and its golden files are unchanged.
+- Experimental additive uniform-cost xz interval queries: `AnyAnglePoint`, `AnyAnglePath`,
+  `AnyAngleSearch::{begin,resume}`, and `NavMeshQuery::find_any_angle_path`.
+  Filters opt in through `QueryFilter::uniform_cost`; weighted costs return
+  `Unsupported`. Passable off-mesh connections are traversed in their linked
+  direction at their xz length. Search progress is budgeted, retained states
+  are capped, and mesh changes require a restart.
+- Experimental opt-in boundary traversal extraction through `BakeConfig::links`, with drop,
+  jump and climb metadata, solid-span clearance checks, generated-link inspection
+  on `Tile`/`TileOutput`, and extraction reach included in incremental halos and
+  configuration hashes. Disabled extraction preserves the existing pipeline.
+
+### Changed
+
+- Any-angle qualification validates the funnel baseline before applying the
+  never-longer rule and accepts raycast hits at `t >= 1 - 1e-6` as endpoint
+  containment. Invalid baselines and tolerance use are counted separately.
+- Traversal extraction checks a continuous swept square enclosing the agent's
+  radius, including the vertical portions of drops, climbs and raised jumps.
+- Internal clipped portal roots use closest detail-surface height lookup after
+  rounding; caller endpoints retain strict validation.
+- Any-angle search no longer returns `Unsupported` on passable off-mesh
+  neighbours; it routes through them.
+- Any-angle search turns only at mesh boundary vertices (corner pruning),
+  reducing expanded states without changing returned lengths.
+- Any-angle dominance comparisons inline their hot predicates and reject
+  disjoint bounds before evaluating geometric tests.
+- Any-angle qualification checks segment containment with an independent
+  closed-coverage test over portal-connected polygons. Detour's raycast stops
+  on segments that run along a shared edge or through a shared vertex; those
+  stops are still counted and reported.
+- Extraction has an independent link-set reference test (exhaustive candidate
+  enumeration with plane-partition clearance), on a synthetic scene and, when
+  `NAV_CORPUS_DIR` is set, on three corpus meshes.
 
 ## [0.2.1] - 2026-11-05
 

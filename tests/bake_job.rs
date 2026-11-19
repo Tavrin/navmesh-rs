@@ -741,12 +741,28 @@ fn installer_replaces_resident_tiles_and_the_newest_queued_version_wins() {
     let (mut nav, mut installer) = (fresh(), bake::TileInstaller::new());
     installer.push(old.clone());
     installer.install(&mut nav, &mut all()).unwrap();
+    let resident = nav.tile_ref(nav.tile_index_at(0, 0, 0).unwrap());
+    nav.set_poly_flags(resident, 9).unwrap();
     let mut corrupt = new.clone();
     corrupt.data = Some(vec![1, 2, 3]);
     installer.push(corrupt);
     let err = installer.install(&mut nav, &mut all()).unwrap_err();
     assert_eq!(err.tile, Some([0, 0]));
     assert_eq!(installer.pending(), 0);
+    // Bytes naming another column are refused too; the same bytes change nothing.
+    let mut misplaced = new.clone();
+    misplaced.key = TileKey { x: 1, z: 1 };
+    installer.push(misplaced);
+    assert!(installer.install(&mut nav, &mut all()).is_err());
+    installer.push(old.clone());
+    installer.install(&mut nav, &mut all()).unwrap();
+    assert_eq!(nav.tile_ref(nav.tile_index_at(0, 0, 0).unwrap()), resident);
+    assert_eq!(
+        nav.poly_flags(resident),
+        Ok(9),
+        "refs and runtime flags stay"
+    );
+    assert!(nav.tile_index_at(1, 1, 0).is_none());
     assert_eq!(take_tile(&mut nav, key), old.data);
 
     // A tile rebaked to nothing removes the resident tile; clear() reports what it drops.
@@ -1027,4 +1043,30 @@ fn fixes_flow_through_jobs_and_invalidate_manifests() {
         manifest.apply(&job.manifest_delta()).unwrap();
         previous = Some(manifest);
     }
+}
+
+#[test]
+fn installer_uses_the_prepared_layer() {
+    let cfg = BakeConfig::default();
+    let grid = GridLayout::new([0.0, -1.0, 0.0], 8.0, 4, 4, &cfg).unwrap();
+    let source = Quads::default().quad(0.0, 0.0, 38.0, 38.0, 0.0);
+    let mut tile = bake_quads(&source, &cfg, &grid, &[TileKey { x: 0, z: 0 }]).remove(0);
+    tile.data.as_mut().unwrap()[16..20].copy_from_slice(&1i32.to_le_bytes());
+    let mut nav = navmesh_rs::detour::NavMesh::new(&grid.nav_mesh_params(16, 1 << 12)).unwrap();
+    let key = tile.key;
+    let mut installer = bake::TileInstaller::new();
+    installer.push(tile.clone());
+    installer
+        .install(&mut nav, &mut Budget::new(u64::MAX))
+        .unwrap();
+    let slot = nav.tile_index_at(key.x, key.z, 1).unwrap();
+    let r = nav.tile_ref(slot);
+    nav.set_poly_flags(r, 9).unwrap();
+    installer.push(tile);
+    installer
+        .install(&mut nav, &mut Budget::new(u64::MAX))
+        .unwrap();
+    assert_eq!(nav.tile_ref(slot), r);
+    assert_eq!(nav.poly_flags(r), Ok(9));
+    assert!(nav.tile_index_at(key.x, key.z, 0).is_none());
 }

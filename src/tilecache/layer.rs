@@ -100,11 +100,18 @@ impl LayerHeader {
         if data.len() < LAYER_HEADER_SIZE {
             return Err(Error::InvalidInput("truncated layer header"));
         }
-        let i32_at = |i| i32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let i32_at = |i| i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
         if i32_at(0) != LAYER_MAGIC || i32_at(4) != 1 {
             return Err(Error::InvalidInput("layer magic/version"));
         }
-        let f = |i| f32::from_bits(u32::from_le_bytes(data[i..i + 4].try_into().unwrap()));
+        let f = |i| {
+            f32::from_bits(u32::from_le_bytes([
+                data[i],
+                data[i + 1],
+                data[i + 2],
+                data[i + 3],
+            ]))
+        };
         let h = Self {
             tx: i32_at(8),
             ty: i32_at(12),

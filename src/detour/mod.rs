@@ -4,7 +4,8 @@
 //!   connections) into tile bytes in upstream's `DNAV` v7 layout.
 //! - [`NavMesh`] owns tiles: it validates tile bytes before adding them (upstream
 //!   trusts them), links polygons inside and across tiles and hands out [`PolyRef`]s
-//!   with upstream's salt/tile/poly bit layout.
+//!   with upstream's salt/tile/poly bit layout (or, opt-in, a wider-salt
+//!   [`RefLayout`]).
 //! - [`NavMeshQuery`] runs every upstream query over a borrowed navmesh, with a
 //!   [`QueryFilter`] and its own node pools.
 //!
@@ -31,6 +32,8 @@
     clippy::unnecessary_cast
 )]
 
+mod any_angle;
+pub use any_angle::{AnyAnglePath, AnyAnglePoint, AnyAngleSearch};
 mod builder;
 mod endian;
 pub(crate) mod math;
@@ -46,8 +49,9 @@ pub use endian::{
     nav_mesh_data_swap_endian, nav_mesh_header_swap_endian, nav_mesh_swap_off_mesh_user_ids,
 };
 pub use navmesh::{
-    Committed, EdgeKind, NavMesh, NavMeshParams, PreparedTile, REMOVAL_LOG_CAPACITY, RefState,
-    ResidencyRecord, SlotPolicy, TileKey, UnloadedTile, content_hash, prepare_tile,
+    Committed, EdgeKind, NavMesh, NavMeshParams, PreparedTile, REMOVAL_LOG_CAPACITY, RefLayout,
+    RefState, Replaced, ResidencyRecord, SlotPolicy, TileKey, UnloadedTile, content_hash,
+    prepare_tile, prepare_tile_with_layout,
 };
 pub use query::{
     DefaultFilter, NavMeshQuery, QueryFilter, RaycastHit, SegmentWall, StraightPathPoint,

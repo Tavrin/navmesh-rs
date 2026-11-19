@@ -143,6 +143,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "replace_ops"
+path = "fuzz_targets/replace_ops.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "prepared_tile"
 path = "fuzz_targets/prepared_tile.rs"
 test = false
@@ -171,8 +178,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "any_angle_query"
+path = "fuzz_targets/any_angle_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "crowd_world_snapshot"
 path = "fuzz_targets/crowd_world_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "link_extract"
+path = "fuzz_targets/link_extract.rs"
 test = false
 doc = false
 bench = false

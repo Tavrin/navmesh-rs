@@ -187,6 +187,12 @@ enum State {
         mesh: PolyMesh,
         report: recast::TriangulationReport,
     },
+    Links {
+        chf: CompactHeightfield,
+        mesh: PolyMesh,
+        detail: PolyMeshDetail,
+        report: recast::TriangulationReport,
+    },
     Dnav {
         mesh: PolyMesh,
         detail: PolyMeshDetail,
@@ -219,6 +225,8 @@ pub(super) struct TileTask<'a> {
     source: Option<TriSource<'a>>,
     state: State,
     pub(super) report: Option<super::TileReport>,
+    pub(super) links: Vec<super::ExtractedLink>,
+    solid: Option<Heightfield>,
 }
 
 impl<'a> TileTask<'a> {
@@ -252,6 +260,8 @@ impl<'a> TileTask<'a> {
             source: Some(source),
             state: State::Finished,
             report: None,
+            links: Vec::new(),
+            solid: None,
         }
     }
 
@@ -366,6 +376,9 @@ impl<'a> TileTask<'a> {
                 let chf = self.tw.stage(|ws| {
                     CompactHeightfield::build(ws, cfg.walkable_height, cfg.walkable_climb, &hf)
                 })?;
+                if self.c.links.is_some() {
+                    self.solid = Some(hf);
+                }
                 self.state = State::Erode { chf };
                 Ok(Advance::More)
             }
@@ -517,6 +530,32 @@ impl<'a> TileTask<'a> {
                     }
                     return Ok(Advance::Done(None, report));
                 }
+                self.state = if self.c.links.is_some() {
+                    State::Links {
+                        chf,
+                        mesh,
+                        detail,
+                        report,
+                    }
+                } else {
+                    State::Dnav {
+                        mesh,
+                        detail,
+                        report,
+                    }
+                };
+                Ok(Advance::More)
+            }
+            State::Links {
+                chf,
+                mesh,
+                detail,
+                report,
+            } => {
+                let solid = self.solid.take().ok_or(Error::Failed)?;
+                self.links = self
+                    .tw
+                    .stage(|ws| super::links::extract(ws, &self.c, &mesh, &chf, &solid))?;
                 self.state = State::Dnav {
                     mesh,
                     detail,
@@ -618,7 +657,55 @@ impl<'a> TileTask<'a> {
     }
 
     fn dnav(&mut self, mesh: &PolyMesh, detail: &PolyMeshDetail) -> Result<Vec<u8>, Error> {
-        let off = self.off_mesh.params()?;
+        let original = self.off_mesh.params()?;
+        let mut combined = super::source::OffMeshSink::new(
+            self.cfg.bmin,
+            self.cfg.bmax,
+            self.c.tile_limits.max_bytes,
+        );
+        let off = if self.c.links.is_some() {
+            self.tw.stage(|ws| {
+                ws.charge_bytes::<u8>(
+                    (original.off_mesh_con_count as usize)
+                        .checked_add(self.links.len())
+                        .ok_or(Error::SizeOverflow)?
+                        .checked_mul(128)
+                        .ok_or(Error::SizeOverflow)?,
+                )?;
+                for i in 0..original.off_mesh_con_count as usize {
+                    ws.work(1)?;
+                    let v = &original.off_mesh_con_verts[i * 6..i * 6 + 6];
+                    combined.push(
+                        i as u64,
+                        [v[0], v[1], v[2]],
+                        [v[3], v[4], v[5]],
+                        original.off_mesh_con_rad[i],
+                        original.off_mesh_con_flags[i],
+                        original.off_mesh_con_areas[i],
+                        original.off_mesh_con_dir[i] != 0,
+                        original.off_mesh_con_user_id.get(i).copied().unwrap_or(0),
+                    )?;
+                }
+                for (i, l) in self.links.iter().enumerate() {
+                    ws.work(1)?;
+                    combined.push(
+                        original.off_mesh_con_count as u64 + i as u64,
+                        l.start,
+                        l.end,
+                        l.radius,
+                        l.flags,
+                        l.area,
+                        false,
+                        0,
+                    )?;
+                }
+                Ok(())
+            })?;
+            OffMesh::Owned(combined)
+        } else {
+            OffMesh::Borrowed(original)
+        };
+        let off = off.params()?;
         let c = self.c;
         let cfg = self.cfg;
         let (x, y) = (self.x, self.y);
@@ -675,7 +762,13 @@ impl<'a> TileTask<'a> {
             work(ws, bound.checked_add(sort_work).ok_or(Error::SizeOverflow)?)?;
             ws.charge_bytes::<u8>(bound)?;
             let data = detour::create_with_limits(&params, &c.tile_limits)?;
-            if data.len() > c.tile_limits.max_tile_bytes {
+            let retained = self
+                .links
+                .capacity()
+                .checked_mul(core::mem::size_of::<super::ExtractedLink>())
+                .and_then(|n| n.checked_add(data.len()))
+                .ok_or(Error::SizeOverflow)?;
+            if retained > c.tile_limits.max_tile_bytes {
                 return Err(Error::LimitExceeded);
             }
             // Validate the produced tile against all caller-specified format limits.
