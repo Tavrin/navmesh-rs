@@ -8,7 +8,7 @@
 //! second commit at the same location is `TileSlotOccupied`.
 use libfuzzer_sys::fuzz_target;
 use navmesh_fuzz::exercise_queries;
-use navmesh_rs::detour::{NavMesh, NavMeshParams, prepare_tile};
+use navmesh_rs::detour::{NavMesh, NavMeshParams, content_hash, prepare_tile};
 use navmesh_rs::{Error, Limits};
 
 const TILE_LIMITS: Limits = Limits::UNLIMITED;
@@ -21,6 +21,23 @@ fuzz_target!(|data: &[u8]| {
         max_tiles: 4,
         max_polys: 1 << 14,
     };
+    // Exercise the checked snapshot path, including records whose checksum
+    // is well-formed but whose definitions or slot requirements are arbitrary.
+    if data.starts_with(b"DNLK") && data.len() <= 8192 {
+        let mut bytes = data.to_vec();
+        bytes.extend_from_slice(&content_hash(data));
+        let mut nav = NavMesh::with_limits(&params, Limits::default()).expect("fixture mesh");
+        let before = nav.residency().to_bytes();
+        if nav.restore_runtime_links(&bytes).is_ok() {
+            let canonical = nav.runtime_links_to_bytes();
+            assert_eq!(canonical, bytes);
+            exercise_queries(&nav);
+        } else {
+            assert_eq!(nav.epoch(), 0);
+            assert_eq!(nav.residency().to_bytes(), before);
+        }
+        return;
+    }
     let (Ok(mut a), Ok(mut b)) = (
         NavMesh::with_limits(&params, TILE_LIMITS),
         NavMesh::with_limits(&params, TILE_LIMITS),

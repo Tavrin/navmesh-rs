@@ -153,6 +153,9 @@ pub(crate) struct QueryData {
 /// Whether a tile that a search's node pool touched was unloaded or removed since
 /// `epoch` (see [`NavMesh::changed_since`]).
 pub(crate) fn pool_changed(nav: &NavMesh, epoch: u64, pool: &NodePool) -> bool {
+    if nav.runtime_links_changed_at() > epoch {
+        return true;
+    }
     if nav.epoch() == epoch {
         return false;
     }

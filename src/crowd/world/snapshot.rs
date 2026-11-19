@@ -6,12 +6,14 @@
 //! each agent's full state in index order, then the path queue's eight request
 //! slots. Every float is stored as its bits, so a restored world steps bit for bit
 //! like the original, including the node pool and heap of a sliced path search in progress.
+//! Version 2 stores the runtime-link epoch and external traversal state.
 use super::*;
 use crate::SnapshotError as E;
 use crate::detour::Status;
 
 const MAGIC: &[u8; 4] = b"DCRW";
-const VERSION: u32 = 1;
+const BASE_VERSION: u32 = 1;
+const LINK_VERSION: u32 = 2;
 
 /// A polygon reference as 64 bits, whatever the reference width.
 // The conversion is the identity with 64-bit references.
@@ -156,7 +158,7 @@ fn read_params(i: &mut In<'_>, max_radius: f32) -> Result<AgentParams, Error> {
     Ok(p)
 }
 
-fn write_agent(o: &mut Out, a: &CrowdAgent) {
+fn write_agent(o: &mut Out, a: &CrowdAgent, links: bool) {
     o.u8(a.state as u8);
     o.u8(a.target_state as u8);
     for v in [a.npos, a.vel, a.nvel, a.dvel] {
@@ -210,6 +212,22 @@ fn write_agent(o: &mut Out, a: &CrowdAgent) {
     }
     o.f32(a.anim.t);
     o.f32(a.anim.tmax);
+    if links {
+        o.u8(u8::from(a.params.off_mesh == OffMeshMode::External));
+        o.u8(u8::from(a.pending_link_replan));
+        o.u8(u8::from(a.pending_off_mesh.is_some()));
+        if let Some(p) = a.pending_off_mesh {
+            let r = p.reached;
+            o.r(r.poly);
+            o.u32(r.user_id);
+            o.u8(u8::from(r.link_id.is_some()));
+            o.v3(r.start);
+            o.v3(r.end);
+            o.r(r.departure);
+            o.r(r.landing);
+            o.f32(p.radius);
+        }
+    }
 }
 
 fn read_agent(
@@ -218,6 +236,7 @@ fn read_agent(
     agents: usize,
     max_radius: f32,
     ws: &mut Workspace,
+    links: bool,
 ) -> Result<(), Error> {
     a.state = match i.u8()? {
         0 => AgentState::Invalid,
@@ -307,6 +326,46 @@ fn read_agent(
     a.anim.end = i.v3("animation")?;
     a.anim.t = i.f32("animation")?;
     a.anim.tmax = i.f32("animation")?;
+    if links {
+        if i.flag("external traversal mode")? {
+            a.params.off_mesh = OffMeshMode::External;
+        }
+        a.pending_link_replan = i.flag("runtime link replan")?;
+        if i.flag("pending external traversal")? {
+            let poly = i.r()?;
+            let user_id = i.u32()?;
+            let link_id = i
+                .flag("runtime traversal")?
+                .then_some(crate::detour::LinkId(user_id));
+            let start = i.v3("external traversal")?;
+            let end = i.v3("external traversal")?;
+            let departure = i.r()?;
+            let landing = i.r()?;
+            let radius = i.f32("external traversal radius")?;
+            if a.state != AgentState::Offmesh
+                || a.anim.active
+                || poly == 0
+                || departure == 0
+                || landing == 0
+                || radius < 0.0
+                || a.npos != start
+            {
+                return Err(bad("pending external traversal"));
+            }
+            a.pending_off_mesh = Some(PendingTraversal {
+                reached: OffMeshReached {
+                    poly,
+                    user_id,
+                    link_id,
+                    start,
+                    end,
+                    departure,
+                    landing,
+                },
+                radius,
+            });
+        }
+    }
     a.active = true;
     Ok(())
 }
@@ -317,7 +376,17 @@ impl CrowdWorld {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut o = Out(Vec::new());
         o.bytes(MAGIC);
-        o.u32(VERSION);
+        let links = self.link_epoch != 0
+            || self.heavy.iter().any(|a| {
+                a.active
+                    && (a.params.off_mesh == OffMeshMode::External
+                        || a.pending_off_mesh.is_some()
+                        || a.pending_link_replan)
+            });
+        o.u32(if links { LINK_VERSION } else { BASE_VERSION });
+        if links {
+            o.u64(self.link_epoch);
+        }
         let p = &self.params;
         o.u32(p.max_agents);
         o.u32(p.max_heavy_agents);
@@ -359,7 +428,7 @@ impl CrowdWorld {
         }
         for &s in &self.heavy_of {
             if s != NONE {
-                write_agent(&mut o, &self.heavy[s as usize]);
+                write_agent(&mut o, &self.heavy[s as usize], links);
             }
         }
         let q = &self.pathq;
@@ -389,9 +458,11 @@ impl CrowdWorld {
         if &i.take::<4>()? != MAGIC {
             return Err(Error::InvalidSnapshot(E::WrongMagic));
         }
-        if i.u32()? != VERSION {
-            return Err(Error::InvalidSnapshot(E::WrongVersion));
-        }
+        let link_epoch = match i.u32()? {
+            BASE_VERSION => None,
+            LINK_VERSION => Some(i.u64()?),
+            _ => return Err(Error::InvalidSnapshot(E::WrongVersion)),
+        };
         let p = CrowdWorldParams {
             max_agents: i.u32()?,
             max_heavy_agents: i.u32()?,
@@ -407,6 +478,7 @@ impl CrowdWorld {
             return Err(bad("parameters hash"));
         }
         let mut w = CrowdWorld::new(nav, &p, limits)?;
+        w.link_epoch = link_epoch.unwrap_or(0);
         w.set_fixes(UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?);
         for k in 0..16 {
             let mut f = DefaultFilter::default();
@@ -472,7 +544,14 @@ impl CrowdWorld {
                 continue;
             }
             let mut a = CrowdAgent::new_in(&mut ws)?;
-            read_agent(&mut i, &mut a, n, p.max_radius, &mut ws)?;
+            read_agent(
+                &mut i,
+                &mut a,
+                n,
+                p.max_radius,
+                &mut ws,
+                link_epoch.is_some(),
+            )?;
             let s = w.heavy.len() as u32;
             w.heavy_of[k] = s;
             w.pos[k] = a.npos;

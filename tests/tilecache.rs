@@ -780,3 +780,41 @@ fn layer_header_short_odd_and_unaligned_inputs() {
     bad[48] = 0;
     assert!(LayerHeader::decode(&bad).is_err());
 }
+
+#[test]
+fn cached_ground_rebuild_keeps_runtime_link_availability_and_reserved_slots() {
+    use navmesh_rs::detour::{LinkId, LinkSpec};
+
+    struct Reserve;
+    impl MeshProcess for Reserve {
+        fn process(&self, areas: &mut [u8], flags: &mut [u16]) {
+            DefaultMeshProcess.process(areas, flags);
+        }
+        fn spare_links_per_tile(&self) -> u32 {
+            1
+        }
+    }
+
+    let mut cache = TileCache::new(params(2), RawCompressor, Reserve, Limits::default()).unwrap();
+    let source = cache.add_tile(data(0)).unwrap();
+    let target = cache.add_tile(data(3)).unwrap();
+    let mut mesh = nav(4);
+    mesh.set_link_layer(Some(1)).unwrap();
+    cache.build_nav_mesh_tile(source, &mut mesh).unwrap();
+    cache.build_nav_mesh_tile(target, &mut mesh).unwrap();
+    let id = LinkId(8);
+    let s = LinkSpec::new(id, [4., 0.2, 4.], [28., 0.2, 4.], 0.75);
+    assert!(mesh.add_runtime_link(s, true).unwrap().is_traversable());
+    mesh.set_runtime_link_enabled(id, false).unwrap();
+
+    let before = mesh.tile_ref(mesh.tile_index_at(0, 0, 0).unwrap());
+    cache.build_nav_mesh_tile(source, &mut mesh).unwrap();
+    assert_eq!(mesh.ref_state(before), RefState::Stale);
+    let r = mesh.runtime_link_report(id).unwrap();
+    assert!(!r.enabled);
+    assert!(
+        mesh.set_runtime_link_enabled(id, true)
+            .unwrap()
+            .is_traversable()
+    );
+}

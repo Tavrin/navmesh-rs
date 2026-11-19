@@ -785,6 +785,7 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
         strict_triangulation,
         fixes,
         links,
+        spare_links_per_tile,
     } = *cfg;
     let Config {
         width: _,
@@ -836,6 +837,10 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
     h.f32(walkable_climb);
     h.u8(u8::from(strict_triangulation));
     h.u32(fixes.bits());
+    if spare_links_per_tile != 0 {
+        h.u8(0xa7);
+        h.u32(spare_links_per_tile);
+    }
     // Preserve the legacy digest when extraction is disabled.
     if let Some(l) = links {
         h.u8(0xa6);

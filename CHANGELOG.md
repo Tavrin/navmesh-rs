@@ -8,6 +8,12 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Managed runtime off-mesh connections with stable ids, optional reserved ground
+  link slots, typed landing reports, game-controlled availability and versioned
+  snapshots. Tile replacement and streaming re-resolve the registered links.
+- `OffMeshMode::External` in both crowds, with pending arrival reports and
+  explicit completion or abort. See [runtime links](docs/RUNTIME-LINKS.md).
+
 - `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
   agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
   corridors, walls, corners and neighbours, and a sorted-cell neighbour grid rebuilt

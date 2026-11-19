@@ -73,9 +73,19 @@ impl Crowd {
                 .enumerate()
                 .filter_map(|(i, a)| a.active.then_some(i)),
         );
+        let link_epoch = nav.runtime_links_changed_at();
+        let links_changed = self.link_epoch != link_epoch;
         for &i in &self.active {
-            phases::check_path(&mut self.agents[i], &q, &self.filters, &self.extents, dt)?;
+            phases::check_path(
+                &mut self.agents[i],
+                &q,
+                &self.filters,
+                &self.extents,
+                dt,
+                links_changed,
+            )?;
         }
+        self.link_epoch = link_epoch;
         phases::move_requests(
             &mut self.agents[..],
             &mut self.pathq,

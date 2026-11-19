@@ -13,7 +13,9 @@ use crate::common::floorf;
 use crate::{Error, Limits, TileDataError};
 use alloc::boxed::Box;
 
+mod links;
 mod replace;
+pub use links::{Landing, LinkId, LinkReport, LinkSpec};
 pub(crate) mod stream;
 pub use replace::Replaced;
 pub use stream::{
@@ -207,6 +209,7 @@ pub struct NavMesh {
     occupied: Option<[i32; 4]>,
     /// Whether off-mesh connections resolve their far endpoint in any tile.
     global_off_mesh: bool,
+    runtime_links: links::RuntimeLinks,
     /// Streaming state: slot policy, unloaded tiles, known columns, epoch.
     stream: stream::StreamState,
 }
@@ -443,9 +446,15 @@ fn alloc_link(tile: &mut MeshTile) -> u32 {
 }
 
 fn free_link(tile: &mut MeshTile, link: u32) {
+    let ordinary = tile.links.len() - tile.spare_links as usize;
     if let Some(l) = tile.links.get_mut(link as usize) {
-        l.next = tile.links_free_list;
-        tile.links_free_list = link;
+        let free = if link as usize >= ordinary {
+            &mut tile.runtime_links_free_list
+        } else {
+            &mut tile.links_free_list
+        };
+        l.next = *free;
+        *free = link;
     }
 }
 
@@ -756,6 +765,7 @@ impl NavMesh {
             resident: 0,
             occupied: None,
             global_off_mesh: false,
+            runtime_links: links::RuntimeLinks::default(),
             stream: stream::StreamState::new(policy)?,
         })
     }
@@ -952,6 +962,17 @@ impl NavMesh {
             .collect()
     }
 
+    fn ground_tiles_at(&self, x: i32, y: i32, max: usize) -> Vec<usize> {
+        self.chain(x, y)
+            .filter(|&i| {
+                self.tile(i).is_some_and(|t| {
+                    t.header.x == x && t.header.y == y && self.link_layer() != Some(t.header.layer)
+                })
+            })
+            .take(max)
+            .collect()
+    }
+
     /// Tile-grid bounds `[min x, min y, max x, max y]` that cover every resident
     /// tile (`None` when the navmesh is empty). The bounds grow as tiles are added
     /// and may stay wider than the resident tiles after removals.
@@ -983,7 +1004,7 @@ impl NavMesh {
         if cells <= self.slots.len() as u64 {
             for y in y0..=y1 {
                 for x in x0..=x1 {
-                    for ti in self.tiles_at(x, y, 32) {
+                    for ti in self.ground_tiles_at(x, y, 32) {
                         if !f(ti) {
                             return;
                         }
@@ -1003,7 +1024,7 @@ impl NavMesh {
         locs.sort_unstable();
         locs.dedup();
         for (y, x) in locs {
-            for ti in self.tiles_at(x, y, 32) {
+            for ti in self.ground_tiles_at(x, y, 32) {
                 if !f(ti) {
                     return;
                 }
@@ -1015,7 +1036,7 @@ impl NavMesh {
         let (dx, dy) = side_offset(side);
         // A neighbour outside the i32 grid does not exist.
         match (x.checked_add(dx), y.checked_add(dy)) {
-            (Some(nx), Some(ny)) => self.tiles_at(nx, ny, 32),
+            (Some(nx), Some(ny)) => self.ground_tiles_at(nx, ny, 32),
             _ => Vec::new(),
         }
     }
@@ -1275,6 +1296,7 @@ impl NavMesh {
 
     fn insert_tile(&mut self, mut data: Vec<u8>, place: Placement) -> Result<TileRef, Error> {
         let h = peek_header(&data)?;
+        self.check_ground_layer(h.layer)?;
         if PolyRef::BITS == 32
             && (h.poly_count < 0 || self.poly_bits < ilog2(next_pow2(h.poly_count as u32)))
         {
@@ -1440,6 +1462,9 @@ impl NavMesh {
             Some([x0, y0, x1, y1]) => [x0.min(hx), y0.min(hy), x1.max(hx), y1.max(hy)],
         });
 
+        if self.link_layer() == Some(hl) {
+            return self.tile_ref(ti);
+        }
         let base = self.base_ref(ti);
         let tile = self.tile_mut(ti);
         if internally_linked {
@@ -1456,7 +1481,7 @@ impl NavMesh {
         }
         self.base_off_mesh_links(ti);
         self.connect_ext_off_mesh_links(ti, ti, -1);
-        for j in self.tiles_at(hx, hy, 32) {
+        for j in self.ground_tiles_at(hx, hy, 32) {
             if j == ti {
                 continue;
             }
@@ -1476,6 +1501,7 @@ impl NavMesh {
         if self.global_off_mesh {
             self.rebuild_global_links();
         }
+        self.runtime_ground_changed();
         self.tile_ref(ti)
     }
 
@@ -1486,9 +1512,11 @@ impl NavMesh {
     /// trailer, which must be retained alongside saved refs.
     pub fn remove_tile(&mut self, r: TileRef) -> Result<Vec<u8>, Error> {
         let ti = self.resident_slot(r)?;
+        self.check_ground_layer(self.tile_unchecked(ti as u32).header.layer)?;
         let next = self.next_salt(self.slots[ti].salt)?;
         let tile = self.detach(ti);
         self.release_slot(ti, next);
+        self.runtime_ground_changed();
         Ok(tile.map(|t| t.data).unwrap_or_default())
     }
 
@@ -1540,11 +1568,17 @@ impl NavMesh {
     /// global pairs. The slot's salt, free-list state and reservation are left to
     /// the caller.
     fn detach(&mut self, ti: usize) -> Option<Box<MeshTile>> {
-        let (x, y) = self.tile(ti).map(|t| (t.header.x, t.header.y))?;
+        let (x, y, layer) = self
+            .tile(ti)
+            .map(|t| (t.header.x, t.header.y, t.header.layer))?;
+        let ground = self.link_layer() != Some(layer);
+        if ground {
+            self.clear_runtime_edges();
+        }
         if !self.stream.is_keyed() {
             self.unlink_lookup(ti, x, y);
         }
-        for j in self.tiles_at(x, y, 32) {
+        for j in self.ground_tiles_at(x, y, 32) {
             if j != ti {
                 self.unconnect_links(j, ti);
             }
@@ -1554,13 +1588,13 @@ impl NavMesh {
                 self.unconnect_links(j, ti);
             }
         }
-        if self.global_off_mesh {
+        if self.global_off_mesh && ground {
             self.disconnect_global_pairs(ti);
         }
         let tile = self.slots[ti].tile.take();
         self.slots[ti].hash = None;
         self.resident = self.resident.saturating_sub(1);
-        if self.global_off_mesh {
+        if self.global_off_mesh && ground {
             self.rebuild_global_links();
         }
         if self.resident == 0 {
@@ -1868,7 +1902,7 @@ impl NavMesh {
     /// Rebuild global pairs in lexicographic tile-key order. Prepending links
     /// makes the greatest landing key the snapped endpoint and first link.
     fn rebuild_global_links(&mut self) {
-        let mut resident = self.resident_slots();
+        let mut resident = self.ground_slots();
         resident.sort_unstable_by_key(|&i| {
             let h = &self.tile_unchecked(i as u32).header;
             (h.x, h.y, h.layer)
@@ -1929,7 +1963,7 @@ impl NavMesh {
 
     /// Removes the global links between `ti` and every other tile, in both roles.
     fn disconnect_global_pairs(&mut self, ti: usize) {
-        for j in self.resident_slots() {
+        for j in self.ground_slots() {
             if j != ti {
                 self.disconnect_global_pair(j, ti);
                 self.disconnect_global_pair(ti, j);
@@ -2010,7 +2044,7 @@ impl NavMesh {
         if enabled == self.global_off_mesh {
             return;
         }
-        let resident = self.resident_slots();
+        let resident = self.ground_slots();
         if enabled {
             self.global_off_mesh = true;
             self.rebuild_global_links();
@@ -2095,4 +2129,6 @@ static EMPTY_TILE: MeshTile = MeshTile {
     off_mesh_cons: Vec::new(),
     data: Vec::new(),
     links_free_list: NULL_LINK,
+    runtime_links_free_list: NULL_LINK,
+    spare_links: 0,
 };
