@@ -43,6 +43,9 @@ parallel = ["dep:rayon"]
 # Serialization of diagnostic report structs (also available with alloc only).
 serde = ["dep:serde"]
 
+# Opt-in sector summaries and resumable long-route queries.
+route = ["detour"]
+
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }
 sha2 = { version = "0.10.9", default-features = false, features = ["force-soft"], optional = true }

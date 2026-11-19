@@ -55,3 +55,34 @@ Reuse matching saved timing cohorts when only these correctness metrics change.
 Sector compression, streaming, hierarchy memory and edit fan-out require a sector
 planner and are outside this flat baseline. Existing corpus parity and determinism
 checks remain independent compatibility gates.
+
+## Experimental query components
+
+The default-off `route` feature provides the sector summary records and two query
+components. `RouteIndex::build` compiles one profile's super-region graph into
+arrays outside the frame loop. `RouteIndex::request` starts a `CoarseSearch`;
+`resume` charges heap pops, individual edge relaxations and path reconstruction
+to a shared `Budget`. The completed corridor is exposed in reverse order, so
+completion does not hide an unbounded reversal. Stable region keys break ties.
+Dijkstra is used because geometric distance is not admissible for the region
+crossing lower bounds. A graph mutation invalidates existing searches.
+
+`CorridorWindow` runs sliced search over the live mesh with a sector-set filter.
+Its detached state allows tile streaming between updates. A changed mesh epoch
+returns `MeshChanged`; this conservative policy also invalidates windows for
+unrelated edits. Admission allocates the node pool, and explicit `finish` copies
+the polygon corridor; these operations are not expansion-budgeted. Callers must
+inspect partial-result and node-exhaustion status bits. Window endpoints must be
+resident, and callers supply the sector margin and resolve portal positions.
+
+These are building blocks, not a qualified end-to-end long-route service. There
+is no automatic level-2 portal search, window advancement, first-move scheduling,
+or waiting/resumption service yet. No latency, fairness, cost, streaming, or
+full-world connectivity acceptance result is claimed for these components.
+
+The current summary representation joins one-way off-mesh connections into
+undirected regions, and locates some far endpoints using bounding boxes. Therefore
+coarse connectivity is only an optimistic hint. A unit regression documents two
+regions connected in one direction collapsing to one super-region. Fixing exact
+reachability requires directed region transitions and unambiguous endpoint
+membership; callers must not use the current graph to certify reachability.
