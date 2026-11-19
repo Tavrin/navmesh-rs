@@ -780,3 +780,107 @@ fn layer_header_short_odd_and_unaligned_inputs() {
     bad[48] = 0;
     assert!(LayerHeader::decode(&bad).is_err());
 }
+
+#[test]
+fn cached_ground_rebuild_keeps_runtime_link_availability_and_reserved_slots() {
+    use navmesh_rs::detour::{LinkId, LinkSpec};
+
+    struct Reserve;
+    impl MeshProcess for Reserve {
+        fn process(&self, areas: &mut [u8], flags: &mut [u16]) {
+            DefaultMeshProcess.process(areas, flags);
+        }
+        fn spare_links_per_tile(&self) -> u32 {
+            1
+        }
+    }
+
+    let mut cache = TileCache::new(params(2), RawCompressor, Reserve, Limits::default()).unwrap();
+    let source = cache.add_tile(data(0)).unwrap();
+    let target = cache.add_tile(data(3)).unwrap();
+    let mut mesh = nav(4);
+    mesh.set_link_layer(Some(1)).unwrap();
+    cache.build_nav_mesh_tile(source, &mut mesh).unwrap();
+    cache.build_nav_mesh_tile(target, &mut mesh).unwrap();
+    let id = LinkId(8);
+    let s = LinkSpec::new(id, [4., 0.2, 4.], [28., 0.2, 4.], 0.75);
+    assert!(mesh.add_runtime_link(s, true).unwrap().is_traversable());
+    mesh.set_runtime_link_enabled(id, false).unwrap();
+
+    let before = mesh.tile_ref(mesh.tile_index_at(0, 0, 0).unwrap());
+    cache.build_nav_mesh_tile(source, &mut mesh).unwrap();
+    assert_eq!(mesh.ref_state(before), RefState::Stale);
+    let r = mesh.runtime_link_report(id).unwrap();
+    assert!(!r.enabled);
+    assert!(
+        mesh.set_runtime_link_enabled(id, true)
+            .unwrap()
+            .is_traversable()
+    );
+}
+
+#[cfg(feature = "dynamic")]
+#[test]
+fn obstacle_rebuilds_and_layer_reload_preserve_gate_state() {
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let mut cache = TileCache::new(
+        params(2),
+        RawCompressor,
+        DefaultMeshProcess,
+        Limits::UNLIMITED,
+    )
+    .unwrap();
+    let tile = cache.add_tile(data(0)).unwrap();
+    let mut nav = nav(2);
+    let mut layer = DynamicLayer::new(1, Limits::UNLIMITED).unwrap();
+    let gate = ModifierId(0);
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            Selector::Prism {
+                verts_xz: vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]],
+                ymin: -1.0,
+                ymax: 3.0,
+                area: Some(0),
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    layer.set_enabled(gate, true).unwrap();
+    nav.set_dynamic_layer(Some(layer));
+
+    let assert_closed = |nav: &NavMesh| {
+        let r = nav.tile_ref(nav.tile_index_at(0, 0, 0).unwrap());
+        let polys = &nav.tile_by_ref(r).unwrap().polys;
+        assert!(!polys.is_empty());
+        assert_eq!(nav.modifier_polygon_count(gate), Some(polys.len()));
+        assert!(polys.iter().all(|p| p.flags == 0));
+        r
+    };
+
+    cache.build_nav_mesh_tile(tile, &mut nav).unwrap();
+    let original = assert_closed(&nav);
+    let obstacle = cache.add_obstacle(cylinder(4.0)).unwrap();
+    drain(&mut cache, &mut nav);
+    let carved = assert_closed(&nav);
+    assert_ne!(carved, original);
+    cache.remove_obstacle(obstacle).unwrap();
+    drain(&mut cache, &mut nav);
+    let rebuilt = assert_closed(&nav);
+    assert_ne!(rebuilt, carved);
+
+    let compressed = cache.unload_tile(tile).unwrap();
+    nav.unload_tile(rebuilt).unwrap();
+    let loaded = cache.load_tile(compressed).unwrap();
+    cache.build_nav_mesh_tile(loaded, &mut nav).unwrap();
+    assert_eq!(assert_closed(&nav), rebuilt);
+    nav.set_modifier_enabled(gate, false).unwrap();
+    assert!(
+        nav.tile_by_ref(rebuilt)
+            .unwrap()
+            .polys
+            .iter()
+            .all(|p| p.flags == 1)
+    );
+}

@@ -76,13 +76,20 @@ impl NavMesh {
     /// [`NavMesh::commit`]. Unlike a removal followed by a commit, a refusal
     /// leaves the resident tile with its salt, refs and runtime state.
     pub fn replace_tile(&mut self, t: PreparedTile) -> Result<Replaced, Error> {
+        self.check_ground_layer(t.tile.header.layer)?;
+        self.replace_managed_tile(t)
+    }
+
+    pub(super) fn replace_managed_tile(&mut self, t: PreparedTile) -> Result<Replaced, Error> {
         let plan = self.plan_replace(&t, true)?;
         self.apply_replace(t, plan)
     }
 
     /// [`NavMesh::replace_tile`], except that equal content is replaced too (one
     /// salt advance, flags from the bytes), as upstream's remove-then-add does.
+    #[cfg(feature = "tilecache")]
     pub(crate) fn replace_tile_advancing(&mut self, t: PreparedTile) -> Result<Replaced, Error> {
+        self.check_ground_layer(t.tile.header.layer)?;
         let plan = self.plan_replace(&t, false)?;
         self.apply_replace(t, plan)
     }
@@ -96,6 +103,7 @@ impl NavMesh {
         t: PreparedTile,
         budget: &mut Budget,
     ) -> Result<Replaced, Error> {
+        self.check_ground_layer(t.tile.header.layer)?;
         let plan = self.plan_replace(&t, true)?;
         if !budget.spend(self.plan_cost(&t, &plan)) {
             return Ok(Replaced::Refused(Box::new(t)));

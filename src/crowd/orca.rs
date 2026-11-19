@@ -163,7 +163,7 @@ pub(super) fn clip(v: V2, speed: f32) -> V2 {
 
 // Eq. (5): nearest point on a disc's truncated velocity cone. In overlap,
 // use the next integration step rather than the prediction horizon.
-fn agent_plane(a: &OrcaAgent, b: &OrcaAgent, horizon: f32, dt: f32) -> Plane {
+fn agent_plane(a: &OrcaAgent, b: &OrcaAgent, horizon: f32, dt: f32, responsibility: f32) -> Plane {
     let p = sub(b.position, a.position);
     let v = sub(a.velocity, b.velocity);
     let r = a.radius + b.radius;
@@ -191,7 +191,7 @@ fn agent_plane(a: &OrcaAgent, b: &OrcaAgent, horizon: f32, dt: f32) -> Plane {
         let n = unit(w, unit(mul(p, -1.), [1., 0.]));
         (n, mul(n, r / dt - norm(w)))
     };
-    plane(n, add(a.velocity, mul(u, 0.5)))
+    plane(n, add(a.velocity, mul(u, responsibility)))
 }
 
 // Project the current velocity onto the boundary of the finite segment's
@@ -408,6 +408,19 @@ pub(super) fn velocity_in(
     dt: f32,
     s: &mut OrcaScratch,
 ) -> Result<V2, Error> {
+    velocity_with_responsibility(ws, a, neighbours, walls, params, dt, s, |_| 0.5)
+}
+/// Internal asymmetric split used only for opted-in parked agents.
+pub(super) fn velocity_with_responsibility(
+    ws: &mut Workspace,
+    a: &OrcaAgent,
+    neighbours: &[OrcaAgent],
+    walls: &[[f32; 4]],
+    params: &OrcaParams,
+    dt: f32,
+    s: &mut OrcaScratch,
+    responsibility: impl Fn(usize) -> f32,
+) -> Result<V2, Error> {
     a.validate()?;
     params.validate()?;
     for t in [dt, params.time_horizon, params.time_horizon_obstacles] {
@@ -448,8 +461,13 @@ pub(super) fn velocity_in(
     let static_count = s.planes.len();
     for &(i, _) in &s.order {
         ws.work(1)?;
-        s.planes
-            .push(agent_plane(a, &neighbours[i], params.time_horizon, dt));
+        s.planes.push(agent_plane(
+            a,
+            &neighbours[i],
+            params.time_horizon,
+            dt,
+            responsibility(i),
+        ));
     }
     let (mut v, failed) = solve(
         ws,

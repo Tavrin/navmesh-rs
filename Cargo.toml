@@ -26,6 +26,8 @@ libm = ["dep:libm"]
 recast = []
 # Navmesh runtime, tile data and queries (Detour).
 detour = ["dep:sha2"]
+# Declarative gates and cost zones over baked polygons.
+dynamic = ["detour"]
 # Agent simulation and local avoidance (DetourCrowd).
 crowd = ["detour"]
 # Crowd store for many agents with handles, a sorted-cell grid and data-parallel

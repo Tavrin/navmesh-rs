@@ -185,6 +185,10 @@ impl<'a> AgentView<'a> {
     pub fn tier(&self) -> Tier {
         self.tier
     }
+    /// Whether this agent has triggered its current point arrival policy.
+    pub fn arrived(&self) -> bool {
+        self.agent.arrived()
+    }
     /// Current position.
     pub fn position(&self) -> V3 {
         self.agent.npos
@@ -240,6 +244,7 @@ pub struct CrowdWorld {
     // Per-step scratch.
     grid: CellGrid,
     active: Vec<usize>,
+    link_epoch: u64,
 }
 
 impl CrowdWorld {
@@ -281,6 +286,7 @@ impl CrowdWorld {
             free_heavy: BinaryHeap::new(),
             grid: CellGrid::new(r * 3.),
             active: Vec::new(),
+            link_epoch: nav.runtime_links_changed_at(),
         })
     }
     /// The configuration the world was created with.
@@ -494,6 +500,37 @@ impl CrowdWorld {
         }
         Ok(())
     }
+    /// External traversal requests awaiting a response, in agent index order.
+    pub fn off_mesh_arrivals(&self) -> impl Iterator<Item = (AgentHandle, OffMeshReached)> + '_ {
+        self.agents()
+            .filter_map(|a| a.agent.off_mesh_reached().map(|p| (a.handle, p)))
+    }
+
+    /// Lands a waiting agent, with the same validation as [`Crowd::complete_off_mesh`].
+    pub fn complete_off_mesh(
+        &mut self,
+        nav: &NavMesh,
+        h: AgentHandle,
+        landing: V3,
+    ) -> Result<(), Error> {
+        let s = self
+            .slot_of(h)
+            .ok_or(Error::InvalidParameter("stale agent handle"))?;
+        let a = &mut self.heavy[s];
+        a.complete_external(nav, &self.filters[a.params.query_filter_type], landing)?;
+        self.pos[h.index as usize] = a.npos;
+        Ok(())
+    }
+
+    /// Cancels the hand-off and replans from the departure point on the next step.
+    pub fn abort_off_mesh(&mut self, h: AgentHandle) -> Result<(), Error> {
+        let a = self.heavy_mut(h)?;
+        a.abort_external()?;
+        let pos = a.npos;
+        self.pos[h.index as usize] = pos;
+        Ok(())
+    }
+
     /// Reads an agent; `None` for a stale handle.
     pub fn agent(&self, h: AgentHandle) -> Option<AgentView<'_>> {
         let s = self.slot_of(h)?;
@@ -550,6 +587,21 @@ impl CrowdWorld {
             put(&v.handle.index.to_le_bytes());
             put(&v.handle.generation.to_le_bytes());
             put(&[a.state as u8, a.target_state as u8]);
+            if a.params.arrival_policy != ArrivalPolicy::Keep
+                || a.params.arrival_distance != 0.5
+                || a.arrived
+            {
+                put(b"arrival");
+                put(&[
+                    match a.params.arrival_policy {
+                        ArrivalPolicy::Keep => 0,
+                        ArrivalPolicy::Park => 1,
+                        ArrivalPolicy::Remove => 2,
+                    },
+                    u8::from(a.arrived),
+                ]);
+                put(&a.params.arrival_distance.to_bits().to_le_bytes());
+            }
             for x in a.npos.iter().chain(&a.vel).chain(&a.nvel).chain(&a.dvel) {
                 put(&x.to_bits().to_le_bytes());
             }

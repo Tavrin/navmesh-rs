@@ -15,12 +15,17 @@ use crate::detour::{
 };
 use crate::{Budget, Budgeted, Error, Limits, UpstreamFixes, Workspace};
 use alloc::vec::Vec;
+mod arrival;
+pub use arrival::{ArrivalPolicy, GoalSlots};
 mod avoidance;
 mod boundary;
 mod orca;
 // Public helper calls reset usage; internal `_in` calls compose within the
 // manager's existing per-call budget.
 mod corridor;
+mod external;
+use external::PendingTraversal;
+pub use external::{OffMeshMode, OffMeshReached};
 pub mod field;
 mod grid;
 mod queue;
@@ -65,7 +70,7 @@ pub enum AgentState {
     Invalid = 0,
     /// Moving on the surface.
     Walking = 1,
-    /// Animating across a connection.
+    /// Animating or waiting for the caller to traverse a connection.
     Offmesh = 2,
 }
 /// Move request state, with upstream numeric values.
@@ -138,6 +143,12 @@ pub struct AgentParams {
     pub obstacle_avoidance_type: usize,
     /// Local velocity planner, gated by [`OBSTACLE_AVOIDANCE`].
     pub avoidance: AvoidanceMode,
+    /// Whether to animate connections or hand traversal to the caller.
+    pub off_mesh: OffMeshMode,
+    /// Behavior after reaching a point target; defaults to keeping the target.
+    pub arrival_policy: ArrivalPolicy,
+    /// Positive planar arrival distance; vertical distance is bounded by height.
+    pub arrival_distance: f32,
     /// Filter slot (0..16).
     pub query_filter_type: usize,
 }
@@ -154,13 +165,17 @@ impl Default for AgentParams {
             update_flags: 31,
             obstacle_avoidance_type: 3,
             avoidance: AvoidanceMode::Sampled,
+            off_mesh: OffMeshMode::Animate,
             query_filter_type: 0,
+            arrival_policy: ArrivalPolicy::Keep,
+            arrival_distance: 0.5,
         }
     }
 }
 impl AgentParams {
     fn validate(&self, max_radius: f32) -> Result<(), Error> {
         for v in [
+            self.arrival_distance,
             self.radius,
             self.height,
             self.max_speed,
@@ -232,6 +247,7 @@ pub struct CrowdAgent {
     pub target_pos: V3,
     /// Whether the full search returned a partial path.
     pub partial: bool,
+    arrived: bool,
     waiting_tile: Option<TileKey>,
     topology_time: f32,
     replan_time: f32,
@@ -241,8 +257,17 @@ pub struct CrowdAgent {
     nneis: usize,
     disp: V3,
     anim: Animation,
+    pending_off_mesh: Option<PendingTraversal>,
+    pending_link_replan: bool,
 }
 impl CrowdAgent {
+    fn parked(&self) -> bool {
+        self.arrived && self.params.arrival_policy == ArrivalPolicy::Park
+    }
+    /// Whether the current point request has triggered its arrival policy.
+    pub fn arrived(&self) -> bool {
+        self.arrived
+    }
     /// The neighbours kept by the last update (six for sampled mode, the configured
     /// cap for ORCA), nearest first, as
     /// the neighbour's agent slot and its squared planar distance.
@@ -273,6 +298,7 @@ impl CrowdAgent {
             target_ref: 0,
             target_pos: [0.; 3],
             partial: false,
+            arrived: false,
             waiting_tile: None,
             topology_time: 0.,
             replan_time: 0.,
@@ -282,6 +308,8 @@ impl CrowdAgent {
             nneis: 0,
             disp: [0.; 3],
             anim: Animation::default(),
+            pending_off_mesh: None,
+            pending_link_replan: false,
         })
     }
     /// Occupies a reset slot at the polygon `r` (zero: no polygon near, invalid).
@@ -306,6 +334,7 @@ impl CrowdAgent {
         pos: V3,
         waiting: Option<TileKey>,
     ) -> Result<(), Error> {
+        self.arrived = false;
         self.target_ref = r;
         self.target_pos = pos;
         self.pathq = 0;
@@ -322,6 +351,7 @@ impl CrowdAgent {
         Ok(())
     }
     fn request_velocity(&mut self, vel: V3) {
+        self.arrived = false;
         self.target_ref = 0;
         self.target_pos = vel;
         self.pathq = 0;
@@ -329,6 +359,7 @@ impl CrowdAgent {
         self.target_state = TargetState::Velocity;
     }
     fn reset_target(&mut self) {
+        self.arrived = false;
         self.target_ref = 0;
         self.target_pos = [0.; 3];
         self.dvel = [0.; 3];
@@ -338,6 +369,7 @@ impl CrowdAgent {
     }
     // Preserve allocated storage, but no state belonging to a previous occupant.
     fn reset_slot(&mut self) {
+        self.arrived = false;
         self.active = false;
         self.state = AgentState::Invalid;
         self.target_state = TargetState::None;
@@ -363,6 +395,8 @@ impl CrowdAgent {
         self.nneis = 0;
         self.disp = [0.; 3];
         self.anim = Animation::default();
+        self.pending_off_mesh = None;
+        self.pending_link_replan = false;
     }
 }
 /// Fixed-capacity single-threaded crowd manager.
@@ -376,6 +410,7 @@ pub struct Crowd {
     filters: [DefaultFilter; 16],
     pathq: PathQueue,
     active: Vec<usize>,
+    link_epoch: u64,
     velocity_samples: usize,
     fixes: UpstreamFixes,
 }
@@ -410,6 +445,7 @@ impl Crowd {
             filters: core::array::from_fn(|_| DefaultFilter::default()),
             active: ws.vec_with_capacity(max_agents)?,
             velocity_samples: 0,
+            link_epoch: nav.runtime_links_changed_at(),
             fixes: UpstreamFixes::NONE,
         })
     }

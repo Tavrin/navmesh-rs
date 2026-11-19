@@ -11,6 +11,7 @@ struct View<'a> {
     radius: &'a [f32],
     height: &'a [f32],
     max_speed: &'a [f32],
+    parked: &'a [bool],
 }
 impl<'a> View<'a> {
     fn of(
@@ -20,6 +21,7 @@ impl<'a> View<'a> {
         radius: &'a [f32],
         height: &'a [f32],
         max_speed: &'a [f32],
+        parked: &'a [bool],
     ) -> Self {
         Self {
             pos,
@@ -28,10 +30,14 @@ impl<'a> View<'a> {
             radius,
             height,
             max_speed,
+            parked,
         }
     }
 }
 impl AgentsView for View<'_> {
+    fn parked(&self, j: usize) -> bool {
+        self.parked.get(j).copied().unwrap_or(false)
+    }
     fn npos(&self, j: usize) -> V3 {
         self.pos[j]
     }
@@ -250,16 +256,34 @@ impl CrowdWorld {
             owner,
             grid,
             active,
+            link_epoch,
             ..
         } = self;
         let (filters, presets) = (&*filters, &*presets);
         let (owner, heavy_of) = (&owner[..], &heavy_of[..]);
 
+        let any_parked = heavy.iter().any(CrowdAgent::parked);
+        let mut parked = ws.vec(if any_parked { pos.len() } else { 0 }, false)?;
+        for (a, &i) in heavy.iter().zip(owner.iter()) {
+            if i != NONE && any_parked {
+                parked[i as usize] = a.parked();
+            }
+        }
         // Serial phases, in agent-index order.
         let mut q = NavMeshQuery::new(nav, 512)?;
+        let epoch = nav.runtime_links_changed_at();
+        let links_changed = epoch != *link_epoch;
         for &i in active.iter() {
-            phases::check_path(&mut heavy[heavy_of[i] as usize], &q, filters, extents, dt)?;
+            phases::check_path(
+                &mut heavy[heavy_of[i] as usize],
+                &q,
+                filters,
+                extents,
+                dt,
+                links_changed,
+            )?;
         }
+        *link_epoch = epoch;
         let mut slots = Slots {
             heavy: &mut heavy[..],
             heavy_of,
@@ -283,7 +307,7 @@ impl CrowdWorld {
 
         // Walls and neighbours, corners and visibility, off-mesh triggers: each
         // writes only its own agent and reads positions no phase here changes.
-        let view = View::of(pos, vel, dvel, radius, height, max_speed);
+        let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
         let grid = &*grid;
         tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
             if a.state == AgentState::Walking {
@@ -323,7 +347,7 @@ impl CrowdWorld {
         // Avoidance reads neighbours' positions, velocities and desired velocities
         // from the arrays, so integrating each agent right after it is the same as
         // integrating after all of them.
-        let view = View::of(pos, vel, dvel, radius, height, max_speed);
+        let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
         tally = tally.add(ctx.run(heavy, owner, |w, _, a| {
             let mut s = AvoidScratch {
                 query: &mut w.avoid,
@@ -343,7 +367,7 @@ impl CrowdWorld {
         // Four Jacobi collision iterations; the last one's application is fused
         // with the agent-local tail of the step.
         for iteration in 0..4 {
-            let view = View::of(pos, vel, dvel, radius, height, max_speed);
+            let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
             tally = tally.add(ctx.run(heavy, owner, |_, i, a| {
                 if let Some(d) = phases::collision_displacement(i, a, &view) {
                     a.disp = d;
@@ -374,6 +398,18 @@ impl CrowdWorld {
         report.measured_work = tally.work;
         report.velocity_samples = tally.samples;
         report.path_queue_depth = pathq.pending() as u32;
+        for k in 0..self.active.len() {
+            let i = self.active[k];
+            let s = self.heavy_of[i] as usize;
+            if arrival::finish_arrival(&mut self.heavy[s]) {
+                if let Some(h) = self.handle_at(i as u32) {
+                    self.remove_agent(h)?;
+                }
+            } else {
+                self.vel[i] = self.heavy[s].vel;
+                self.dvel[i] = self.heavy[s].dvel;
+            }
+        }
         Ok(Budgeted::Complete(report))
     }
 }
