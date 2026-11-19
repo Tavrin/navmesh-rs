@@ -57,6 +57,7 @@
 //!
 //! - `recast` (default): navmesh generation.
 //! - `detour` (default): tile data, navmesh and queries.
+//! - `dynamic`: declarative gates and cost zones, implies `detour`.
 //! - `crowd` (default): agent simulation and local avoidance; implies `detour`.
 //! - `tilecache` (default): cached layers and dynamic obstacles; implies Recast and Detour.
 //! - `std` (default): floating-point functions from the platform libm.
@@ -172,6 +173,8 @@ pub mod recast;
 
 #[cfg(feature = "detour")]
 pub mod detour;
+#[cfg(feature = "dynamic")]
+pub mod dynamic;
 
 // Compiles the README's code blocks as doctests.
 #[cfg(all(

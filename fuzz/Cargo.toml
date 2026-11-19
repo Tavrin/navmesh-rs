@@ -55,6 +55,7 @@ bench = false
 
 [features]
 parallel = ["navmesh-rs/parallel", "dep:rayon"]
+dynamic = ["navmesh-rs/dynamic"]
 
 [[bin]]
 name = "parallel_bake"
@@ -197,3 +198,11 @@ path = "fuzz_targets/link_extract.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dndy_record"
+path = "fuzz_targets/dndy_record.rs"
+test = false
+doc = false
+bench = false
+required-features = ["dynamic"]
