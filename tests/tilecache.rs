@@ -780,3 +780,69 @@ fn layer_header_short_odd_and_unaligned_inputs() {
     bad[48] = 0;
     assert!(LayerHeader::decode(&bad).is_err());
 }
+
+#[cfg(feature = "dynamic")]
+#[test]
+fn obstacle_rebuilds_and_layer_reload_preserve_gate_state() {
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let mut cache = TileCache::new(
+        params(2),
+        RawCompressor,
+        DefaultMeshProcess,
+        Limits::UNLIMITED,
+    )
+    .unwrap();
+    let tile = cache.add_tile(data(0)).unwrap();
+    let mut nav = nav(2);
+    let mut layer = DynamicLayer::new(1, Limits::UNLIMITED).unwrap();
+    let gate = ModifierId(0);
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            Selector::Prism {
+                verts_xz: vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]],
+                ymin: -1.0,
+                ymax: 3.0,
+                area: Some(0),
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    layer.set_enabled(gate, true).unwrap();
+    nav.set_dynamic_layer(Some(layer));
+
+    let assert_closed = |nav: &NavMesh| {
+        let r = nav.tile_ref(nav.tile_index_at(0, 0, 0).unwrap());
+        let polys = &nav.tile_by_ref(r).unwrap().polys;
+        assert!(!polys.is_empty());
+        assert_eq!(nav.modifier_polygon_count(gate), Some(polys.len()));
+        assert!(polys.iter().all(|p| p.flags == 0));
+        r
+    };
+
+    cache.build_nav_mesh_tile(tile, &mut nav).unwrap();
+    let original = assert_closed(&nav);
+    let obstacle = cache.add_obstacle(cylinder(4.0)).unwrap();
+    drain(&mut cache, &mut nav);
+    let carved = assert_closed(&nav);
+    assert_ne!(carved, original);
+    cache.remove_obstacle(obstacle).unwrap();
+    drain(&mut cache, &mut nav);
+    let rebuilt = assert_closed(&nav);
+    assert_ne!(rebuilt, carved);
+
+    let compressed = cache.unload_tile(tile).unwrap();
+    nav.unload_tile(rebuilt).unwrap();
+    let loaded = cache.load_tile(compressed).unwrap();
+    cache.build_nav_mesh_tile(loaded, &mut nav).unwrap();
+    assert_eq!(assert_closed(&nav), rebuilt);
+    nav.set_modifier_enabled(gate, false).unwrap();
+    assert!(
+        nav.tile_by_ref(rebuilt)
+            .unwrap()
+            .polys
+            .iter()
+            .all(|p| p.flags == 1)
+    );
+}

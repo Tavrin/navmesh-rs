@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Opt-in `dynamic` feature for gates and cost zones over baked polygons. The navmesh
+  owns the modifier layer, derives runtime flags and areas on install and reload, and
+  toggles stable IDs without rebuilding tiles or advancing their salts. Save the layer
+  in the versioned `DNDY` format. See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
+
 - `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
   agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
   corridors, walls, corners and neighbours, and a sorted-cell neighbour grid rebuilt
