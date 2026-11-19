@@ -702,3 +702,97 @@ fn corrected_and_orca_neighbours_equal_brute_force_across_search_radii() {
         }
     }
 }
+
+#[test]
+fn point_arrival_policies_and_retargeting() {
+    for policy in [
+        ArrivalPolicy::Keep,
+        ArrivalPolicy::Park,
+        ArrivalPolicy::Remove,
+    ] {
+        let nav = floor();
+        let mut ws = Workspace::new();
+        let mut c = Crowd::new(&mut ws, &nav, 1, 0.6).unwrap();
+        let mut p = AgentParams::default();
+        p.arrival_policy = policy;
+        let id = c.add_agent(&mut ws, &nav, [2., 0., 2.], p).unwrap();
+        let r = c.agent(id).unwrap().corridor.first_poly();
+        c.request_move_target(&nav, id, r, [3., 0., 2.]).unwrap();
+        for _ in 0..120 {
+            c.update(&mut ws, &nav, 0.05).unwrap();
+        }
+        match policy {
+            ArrivalPolicy::Remove => {
+                assert!(c.agent(id).is_none());
+                let new = c
+                    .add_agent(&mut ws, &nav, [2., 0., 2.], AgentParams::default())
+                    .unwrap();
+                assert!(!c.agent(new).unwrap().arrived());
+            }
+            ArrivalPolicy::Park => {
+                let a = c.agent(id).unwrap();
+                assert!(a.arrived());
+                assert_eq!(a.target_state, TargetState::None);
+                assert_eq!(a.vel, [0.; 3]);
+                c.request_move_velocity(id, [1., 0., 0.]).unwrap();
+                assert!(!c.agent(id).unwrap().arrived());
+                c.update(&mut ws, &nav, 0.05).unwrap();
+                assert!(c.agent(id).unwrap().vel[0] > 0.);
+            }
+            _ => {
+                assert!(!c.agent(id).unwrap().arrived());
+                assert_eq!(c.agent(id).unwrap().target_state, TargetState::Valid);
+            }
+        }
+    }
+}
+
+#[test]
+fn goal_slots_spacing_projection_release_and_exhaustion() {
+    let nav = floor();
+    assert!(GoalSlots::new([0.; 3], 1.59).is_err());
+    assert!(GoalSlots::new([f32::NAN; 3], 2.).is_err());
+    let mut slots = GoalSlots::new([5., 0., 5.], 1.6).unwrap();
+    let mut points: Vec<[f32; 3]> = Vec::new();
+    let mut first = None;
+    for _ in 0..16 {
+        let s = slots
+            .allocate(&nav, &DefaultFilter::default(), 256)
+            .unwrap();
+        for p in &points {
+            assert!(((p[0] - s.2[0]).powi(2) + (p[2] - s.2[2]).powi(2)).sqrt() >= 1.6);
+        }
+        points.push(s.2);
+        first.get_or_insert(s);
+    }
+    assert!(slots.allocate(&nav, &DefaultFilter::default(), 0).is_err());
+    let s = first.unwrap();
+    slots.release(s.0).unwrap();
+    assert!(slots.release(s.0).is_err());
+    assert_eq!(
+        slots
+            .allocate(&nav, &DefaultFilter::default(), 256)
+            .unwrap(),
+        s
+    );
+}
+
+#[test]
+fn removal_does_not_trigger_for_velocity_or_another_floor() {
+    let nav = floor();
+    let mut ws = Workspace::new();
+    let mut c = Crowd::new(&mut ws, &nav, 1, 0.6).unwrap();
+    let mut p = AgentParams::default();
+    p.arrival_policy = ArrivalPolicy::Remove;
+    p.arrival_distance = f32::NAN;
+    assert!(c.add_agent(&mut ws, &nav, [2., 0., 2.], p).is_err());
+    p.arrival_distance = 0.5;
+    let id = c.add_agent(&mut ws, &nav, [2., 0., 2.], p).unwrap();
+    c.request_move_velocity(id, [0.; 3]).unwrap();
+    c.update(&mut ws, &nav, 0.05).unwrap();
+    assert!(c.agent(id).is_some());
+    let r = c.agent(id).unwrap().corridor.first_poly();
+    c.request_move_target(&nav, id, r, [2., 10., 2.]).unwrap();
+    c.update(&mut ws, &nav, 0.05).unwrap();
+    assert!(c.agent(id).is_some());
+}

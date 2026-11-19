@@ -338,3 +338,46 @@ fn snapshot_rejects_overflowing_queue_retention() {
         Err(Error::InvalidSnapshot(_))
     ));
 }
+
+#[test]
+fn arrival_policies_survive_snapshot_and_remove_handles() {
+    let nav = rooms();
+    for policy in [
+        ArrivalPolicy::Keep,
+        ArrivalPolicy::Park,
+        ArrivalPolicy::Remove,
+    ] {
+        let mut config = CrowdWorldParams::default();
+        config.max_agents = 1;
+        config.max_heavy_agents = 1;
+        let mut w = CrowdWorld::new(&nav, &config, Limits::UNLIMITED).unwrap();
+        let mut p = CrowdWorld::default_agent_params();
+        p.arrival_policy = policy;
+        let h = w.add_agent(&nav, [3., 0., 3.], p).unwrap();
+        w.set_goal(
+            &nav,
+            h,
+            Goal::Point {
+                poly: nearest(&nav, [4., 0., 3.]),
+                pos: [4., 0., 3.],
+            },
+        )
+        .unwrap();
+        let mut restored = CrowdWorld::from_bytes(&nav, &w.to_bytes(), Limits::UNLIMITED).unwrap();
+        for _ in 0..120 {
+            step(&nav, &mut w);
+            step(&nav, &mut restored);
+            assert_eq!(w.to_bytes(), restored.to_bytes());
+        }
+        if policy == ArrivalPolicy::Remove {
+            assert!(w.agent(h).is_none());
+            let new = w.add_agent(&nav, [3., 0., 3.], p).unwrap();
+            assert_ne!(h, new);
+        } else {
+            assert_eq!(
+                w.agent(h).unwrap().detail().unwrap().arrived(),
+                policy == ArrivalPolicy::Park
+            );
+        }
+    }
+}
