@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Independent agent-size bake profiles with checked tile halos, versioned
+  catalogs, and profile-bound streaming, queries, connectivity and crowds.
+  See [Agent-size bake profiles](docs/BAKE-PROFILES.md).
+
 - `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
   agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
   corridors, walls, corners and neighbours, and a sorted-cell neighbour grid rebuilt

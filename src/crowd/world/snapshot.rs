@@ -315,6 +315,10 @@ impl CrowdWorld {
     /// The world as `'DCRW'` snapshot bytes (see the format in the module source).
     /// In-progress searches retain their node pool and heap for exact continuation.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.snapshot_bytes(None)
+    }
+
+    fn snapshot_bytes(&self, epoch: Option<u64>) -> Vec<u8> {
         let mut o = Out(Vec::new());
         o.bytes(MAGIC);
         o.u32(VERSION);
@@ -377,8 +381,59 @@ impl CrowdWorld {
             o.len(r.path.len());
             r.path.iter().for_each(|&x| o.r(x));
         }
-        write_search(&mut o, q);
+        write_search(&mut o, q, epoch);
         o.0
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn profile_snapshot(&self, nav: &NavMesh) -> Result<Vec<u8>, Error> {
+        // The profile wrapper binds the exact slot history. Its local mesh epoch
+        // is reconstructed when that history is installed in a new instance.
+        if let Some(query) = self.profile_search(nav)?
+            && crate::detour::query::pool_changed(nav, query.query.epoch, &query.node_pool)
+        {
+            return Err(Error::MeshChanged);
+        }
+        Ok(self.snapshot_bytes(Some(0)))
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn restore_profile_snapshot(
+        nav: &NavMesh,
+        bytes: &[u8],
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let mut world = Self::from_bytes(nav, bytes, limits)?;
+        if let Some(query) = world.profile_search(nav)? {
+            if query.query.epoch != 0 {
+                return Err(bad("profile search epoch"));
+            }
+            let query = world.pathq.query.as_mut().ok_or(bad("queue query"))?;
+            query.query.epoch = nav.epoch();
+        }
+        Ok(world)
+    }
+
+    #[cfg(feature = "recast")]
+    fn profile_search(
+        &self,
+        nav: &NavMesh,
+    ) -> Result<Option<&crate::detour::query::DetachedQuery>, Error> {
+        if !has_running_search(&self.pathq) {
+            return Ok(None);
+        }
+        let query = self.pathq.query.as_ref().ok_or(bad("queue query"))?;
+        if !nav.is_valid_poly_ref(query.query.start_ref)
+            || !nav.is_valid_poly_ref(query.query.end_ref)
+            || query
+                .node_pool
+                .used()
+                .iter()
+                .any(|node| !nav.is_valid_poly_ref(node.id))
+        {
+            return Err(Error::MeshChanged);
+        }
+        Ok(Some(query))
     }
 
     /// Restores a world from untrusted `'DCRW'` bytes for agents on `nav`. Rejects
@@ -547,11 +602,15 @@ impl CrowdWorld {
     }
 }
 
-fn write_search(o: &mut Out, queue: &PathQueue) {
-    let running = queue
+fn has_running_search(queue: &PathQueue) -> bool {
+    queue
         .requests
         .iter()
-        .any(|r| r.handle != 0 && r.status & Status::IN_PROGRESS != 0);
+        .any(|r| r.handle != 0 && r.status & Status::IN_PROGRESS != 0)
+}
+
+fn write_search(o: &mut Out, queue: &PathQueue, epoch: Option<u64>) {
+    let running = has_running_search(queue);
     o.u8(u8::from(running));
     if !running {
         return;
@@ -584,7 +643,7 @@ fn write_search(o: &mut Out, queue: &PathQueue) {
     o.v3(d.end_pos);
     o.u32(d.options);
     o.f32(d.raycast_limit_sqr);
-    o.u64(d.epoch);
+    o.u64(epoch.unwrap_or(d.epoch));
 }
 
 fn read_search(
