@@ -155,6 +155,64 @@ impl<S: GeometrySource> Plan<'_, S> {
     }
 }
 
+/// Bakes one caller-selected column into encoded tile-cache layers.
+///
+/// Use the same [`GridLayout`] and voxel settings as the adjacent polygon bake.
+/// The raster grid, including both borders, must fit in 255 cells per side.
+/// The encoded layers store the interior grid and its seam portals. An empty
+/// column returns no layers.
+///
+/// Give only the remaining columns to [`BakeJob`]. Store the set of cache
+/// columns and the codec alongside the bake manifest. Layer data carries area
+/// volumes. Author any off-mesh connections for these columns through the
+/// cache's [`MeshProcess`](crate::tilecache::MeshProcess) hook.
+///
+/// # Errors
+/// Returns an error for an invalid grid/key, a raster grid or layer count
+/// beyond the zone limits, a resource limit, or a source or compressor failure.
+#[cfg(feature = "tilecache")]
+pub fn tile_cache_layers(
+    src: &impl GeometrySource,
+    cfg: &BakeConfig,
+    grid: &GridLayout,
+    key: TileKey,
+    compressor: &impl crate::tilecache::LayerCompressor,
+) -> Result<Vec<Vec<u8>>, BakeError> {
+    let at = |error| BakeError {
+        tile: Some([key.x, key.z]),
+        error,
+    };
+    super::validate_config(cfg)?;
+    grid.validate(cfg)?;
+    if !grid.contains(key) {
+        return Err(at(Error::InvalidParameter("tile outside the grid")));
+    }
+    let tile_cfg = grid.tile_config(cfg, key).map_err(at)?;
+    if tile_cfg.width > i32::from(u8::MAX) || tile_cfg.height > i32::from(u8::MAX) {
+        return Err(at(Error::FormatLimit("bordered tile-cache grid")));
+    }
+    super::check_total_bytes(cfg, 0, 1, 1)?;
+    let (bmin, bmax) = (tile_cfg.bmin, tile_cfg.bmax);
+    let cap = cfg.tile_limits.max_bytes;
+    let mut triangles = TriangleSink::new(bmin, bmax, cap);
+    let mut volumes = VolumeSink::new(bmin, bmax, cap);
+    src.triangles(bmin, bmax, &mut triangles).map_err(at)?;
+    src.volumes(bmin, bmax, &mut volumes).map_err(at)?;
+    let (verts, areas, mode) = triangles.into_parts();
+    let mut task = TileTask::new(
+        cfg,
+        &tile_cfg,
+        key.x,
+        key.z,
+        Cow::Owned(verts),
+        TriSource::Fetched { areas, mode },
+        VolumeRef::from_sink(volumes),
+        OffMesh::Owned(OffMeshSink::new(bmin, bmax, cap)),
+        None,
+    );
+    task.cache_layers(compressor).map_err(at)
+}
+
 fn output(
     key: TileKey,
     input_hash: u64,
