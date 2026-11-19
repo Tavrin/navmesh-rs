@@ -534,16 +534,25 @@ impl NavMesh {
                 next
             });
             let owner = self.base_ref(ti) | ip as PolyRef;
+            #[cfg(feature = "dynamic")]
+            let modified = self.modifiers.governs(ti, ip).then(|| {
+                self.modifiers
+                    .effective_state(self.tile_unchecked(ti as u32), ti, ip)
+            });
             let t = self.tile_mut(ti);
             for (j, p) in points.iter().enumerate() {
                 let v = t.polys[ip].verts[j] as usize * 3;
                 t.verts[v..v + 3].copy_from_slice(p);
             }
-            t.polys[ip].flags = if report.is_traversable() {
-                e.spec.flags
+            let flags = e.spec.flags;
+            #[cfg(feature = "dynamic")]
+            let flags = if let Some((flags, area)) = modified {
+                t.polys[ip].set_area(area);
+                flags
             } else {
-                0
+                flags
             };
+            t.polys[ip].flags = if report.is_traversable() { flags } else { 0 };
             if report.is_traversable()
                 && let (Landing::Connected(a), Landing::Connected(b)) = (report.start, report.end)
             {

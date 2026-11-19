@@ -288,6 +288,7 @@ resource use; they write into the cache's budgeted output slices.
 |---|---|---|
 | `recast` | yes | navmesh generation |
 | `detour` | yes | tile data, navmesh, queries |
+| `dynamic` | no | [Gates and cost zones](docs/DYNAMIC-MODIFIERS.md) over baked polygons. Implies `detour`. |
 | `tilecache` | yes | Cached layers, dynamic obstacles and incremental rebuilds; implies `recast` and `detour`. |
 | `crowd` | yes | Agent simulation, corridors, avoidance and path queue; implies `detour`. |
 | `std` | yes | floating-point functions from the platform libm |

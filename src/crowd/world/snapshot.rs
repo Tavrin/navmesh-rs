@@ -6,14 +6,24 @@
 //! each agent's full state in index order, then the path queue's eight request
 //! slots. Every float is stored as its bits, so a restored world steps bit for bit
 //! like the original, including the node pool and heap of a sliced path search in progress.
-//! Version 2 stores the runtime-link epoch and external traversal state.
+//! Version 3 adds the runtime-link epoch after the version number. Each agent
+//! starts with the arrival policy, distance and arrived flag, and ends with the
+//! external traversal mode, replan flag and optional pending traversal. The two
+//! legacy version 2 layouts each contain just one of these extensions.
 use super::*;
 use crate::SnapshotError as E;
 use crate::detour::Status;
 
 const MAGIC: &[u8; 4] = b"DCRW";
 const BASE_VERSION: u32 = 1;
-const LINK_VERSION: u32 = 2;
+const LEGACY_VERSION: u32 = 2;
+const EXTENDED_VERSION: u32 = 3;
+
+#[derive(Clone, Copy)]
+struct AgentLayout {
+    arrival: bool,
+    links: bool,
+}
 
 /// A polygon reference as 64 bits, whatever the reference width.
 // The conversion is the identity with 64-bit references.
@@ -158,7 +168,16 @@ fn read_params(i: &mut In<'_>, max_radius: f32) -> Result<AgentParams, Error> {
     Ok(p)
 }
 
-fn write_agent(o: &mut Out, a: &CrowdAgent, links: bool) {
+fn write_agent(o: &mut Out, a: &CrowdAgent, layout: AgentLayout) {
+    if layout.arrival {
+        o.u8(match a.params.arrival_policy {
+            ArrivalPolicy::Keep => 0,
+            ArrivalPolicy::Park => 1,
+            ArrivalPolicy::Remove => 2,
+        });
+        o.f32(a.params.arrival_distance);
+        o.u8(u8::from(a.arrived));
+    }
     o.u8(a.state as u8);
     o.u8(a.target_state as u8);
     for v in [a.npos, a.vel, a.nvel, a.dvel] {
@@ -212,7 +231,7 @@ fn write_agent(o: &mut Out, a: &CrowdAgent, links: bool) {
     }
     o.f32(a.anim.t);
     o.f32(a.anim.tmax);
-    if links {
+    if layout.links {
         o.u8(u8::from(a.params.off_mesh == OffMeshMode::External));
         o.u8(u8::from(a.pending_link_replan));
         o.u8(u8::from(a.pending_off_mesh.is_some()));
@@ -236,8 +255,23 @@ fn read_agent(
     agents: usize,
     max_radius: f32,
     ws: &mut Workspace,
-    links: bool,
+    layout: AgentLayout,
 ) -> Result<(), Error> {
+    let (policy, distance, arrived) = if layout.arrival {
+        let policy = match i.u8()? {
+            0 => ArrivalPolicy::Keep,
+            1 => ArrivalPolicy::Park,
+            2 => ArrivalPolicy::Remove,
+            _ => return Err(bad("arrival policy")),
+        };
+        let distance = i.f32("arrival distance")?;
+        if distance <= 0. {
+            return Err(bad("arrival distance"));
+        }
+        (policy, distance, i.flag("arrived")?)
+    } else {
+        (ArrivalPolicy::Keep, 0.5, false)
+    };
     a.state = match i.u8()? {
         0 => AgentState::Invalid,
         1 => AgentState::Walking,
@@ -292,6 +326,9 @@ fn read_agent(
         a.corners.push(StraightPathPoint { pos, flags, r#ref });
     }
     a.params = read_params(i, max_radius)?;
+    a.params.arrival_policy = policy;
+    a.params.arrival_distance = distance;
+    a.arrived = arrived;
     a.target_ref = i.r()?;
     a.target_pos = i.v3("target")?;
     a.partial = i.flag("partial flag")?;
@@ -326,7 +363,7 @@ fn read_agent(
     a.anim.end = i.v3("animation")?;
     a.anim.t = i.f32("animation")?;
     a.anim.tmax = i.f32("animation")?;
-    if links {
+    if layout.links {
         if i.flag("external traversal mode")? {
             a.params.off_mesh = OffMeshMode::External;
         }
@@ -374,17 +411,33 @@ impl CrowdWorld {
     /// The world as `'DCRW'` snapshot bytes (see the format in the module source).
     /// In-progress searches retain their node pool and heap for exact continuation.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut o = Out(Vec::new());
-        o.bytes(MAGIC);
-        let links = self.link_epoch != 0
+        let extended = self.link_epoch != 0
             || self.heavy.iter().any(|a| {
                 a.active
                     && (a.params.off_mesh == OffMeshMode::External
                         || a.pending_off_mesh.is_some()
-                        || a.pending_link_replan)
+                        || a.pending_link_replan
+                        || a.params.arrival_policy != ArrivalPolicy::Keep
+                        || a.params.arrival_distance != 0.5
+                        || a.arrived)
             });
-        o.u32(if links { LINK_VERSION } else { BASE_VERSION });
-        if links {
+        let layout = AgentLayout {
+            arrival: extended,
+            links: extended,
+        };
+        let version = if extended {
+            EXTENDED_VERSION
+        } else {
+            BASE_VERSION
+        };
+        self.write_snapshot(version, layout)
+    }
+
+    fn write_snapshot(&self, version: u32, layout: AgentLayout) -> Vec<u8> {
+        let mut o = Out(Vec::new());
+        o.bytes(MAGIC);
+        o.u32(version);
+        if layout.links {
             o.u64(self.link_epoch);
         }
         let p = &self.params;
@@ -428,7 +481,7 @@ impl CrowdWorld {
         }
         for &s in &self.heavy_of {
             if s != NONE {
-                write_agent(&mut o, &self.heavy[s as usize], links);
+                write_agent(&mut o, &self.heavy[s as usize], layout);
             }
         }
         let q = &self.pathq;
@@ -458,27 +511,22 @@ impl CrowdWorld {
         if &i.take::<4>()? != MAGIC {
             return Err(Error::InvalidSnapshot(E::WrongMagic));
         }
-        let link_epoch = match i.u32()? {
-            BASE_VERSION => None,
-            LINK_VERSION => Some(i.u64()?),
+        let layout = match i.u32()? {
+            BASE_VERSION => AgentLayout {
+                arrival: false,
+                links: false,
+            },
+            LEGACY_VERSION => legacy_layout(i.0)?,
+            EXTENDED_VERSION => AgentLayout {
+                arrival: true,
+                links: true,
+            },
             _ => return Err(Error::InvalidSnapshot(E::WrongVersion)),
         };
-        let p = CrowdWorldParams {
-            max_agents: i.u32()?,
-            max_heavy_agents: i.u32()?,
-            max_radius: i.f32("world parameters")?,
-            path_queue: PathQueueParams {
-                max_nodes: i.u32()? as usize,
-                iterations: i.u32()? as usize,
-            },
-            fixed_dt: i.f32("world parameters")?,
-        };
-        p.validate().map_err(|_| bad("world parameters"))?;
-        if i.u64()? != params_hash(&p) {
-            return Err(bad("parameters hash"));
-        }
+        let link_epoch = if layout.links { i.u64()? } else { 0 };
+        let p = read_world_params(&mut i)?;
         let mut w = CrowdWorld::new(nav, &p, limits)?;
-        w.link_epoch = link_epoch.unwrap_or(0);
+        w.link_epoch = link_epoch;
         w.set_fixes(UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?);
         for k in 0..16 {
             let mut f = DefaultFilter::default();
@@ -544,14 +592,7 @@ impl CrowdWorld {
                 continue;
             }
             let mut a = CrowdAgent::new_in(&mut ws)?;
-            read_agent(
-                &mut i,
-                &mut a,
-                n,
-                p.max_radius,
-                &mut ws,
-                link_epoch.is_some(),
-            )?;
+            read_agent(&mut i, &mut a, n, p.max_radius, &mut ws, layout)?;
             let s = w.heavy.len() as u32;
             w.heavy_of[k] = s;
             w.pos[k] = a.npos;
@@ -791,6 +832,45 @@ fn read_search(
     Ok(())
 }
 
+fn read_world_params(i: &mut In<'_>) -> Result<CrowdWorldParams, Error> {
+    let p = CrowdWorldParams {
+        max_agents: i.u32()?,
+        max_heavy_agents: i.u32()?,
+        max_radius: i.f32("world parameters")?,
+        path_queue: PathQueueParams {
+            max_nodes: i.u32()? as usize,
+            iterations: i.u32()? as usize,
+        },
+        fixed_dt: i.f32("world parameters")?,
+    };
+    p.validate().map_err(|_| bad("world parameters"))?;
+    if i.u64()? != params_hash(&p) {
+        return Err(bad("parameters hash"));
+    }
+    Ok(p)
+}
+
+fn legacy_layout(bytes: &[u8]) -> Result<AgentLayout, Error> {
+    // The link layout has an extra u64 before the checksummed parameters.
+    // Identify the layout before allocating the world or reading any agents.
+    let arrival = read_world_params(&mut In(bytes));
+    let links = bytes
+        .get(8..)
+        .is_some_and(|tail| read_world_params(&mut In(tail)).is_ok());
+    match (arrival, links) {
+        (Ok(_), false) => Ok(AgentLayout {
+            arrival: true,
+            links: false,
+        }),
+        (Err(_), true) => Ok(AgentLayout {
+            arrival: false,
+            links: true,
+        }),
+        (Ok(_), true) => Err(bad("ambiguous legacy snapshot layout")),
+        (Err(err), false) => Err(err),
+    }
+}
+
 fn params_hash(p: &CrowdWorldParams) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for word in [
@@ -806,4 +886,59 @@ fn params_hash(p: &CrowdWorldParams) -> u64 {
         }
     }
     hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::detour::NavMeshParams;
+
+    #[test]
+    fn reads_both_legacy_layouts_and_rejects_unknown_versions() {
+        let nav = NavMesh::new(&NavMeshParams {
+            orig: [0.; 3],
+            tile_width: 10.,
+            tile_height: 10.,
+            max_tiles: 4,
+            max_polys: 32,
+        })
+        .unwrap();
+        let mut w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+        let params = AgentParams {
+            arrival_policy: ArrivalPolicy::Park,
+            arrival_distance: 0.75,
+            off_mesh: OffMeshMode::External,
+            ..AgentParams::default()
+        };
+        let h = w.add_agent(&nav, [0.; 3], params).unwrap();
+        w.link_epoch = 17;
+
+        for arrival in [true, false] {
+            let mut bytes = w.write_snapshot(
+                LEGACY_VERSION,
+                AgentLayout {
+                    arrival,
+                    links: !arrival,
+                },
+            );
+            let mut restored = CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED).unwrap();
+            let agent = restored.heavy_mut(h).unwrap();
+            if arrival {
+                assert_eq!(agent.params.arrival_policy, ArrivalPolicy::Park);
+                assert_eq!(agent.params.arrival_distance, 0.75);
+                assert_eq!(agent.params.off_mesh, OffMeshMode::Animate);
+                assert_eq!(restored.link_epoch, 0);
+            } else {
+                assert_eq!(agent.params.arrival_policy, ArrivalPolicy::Keep);
+                assert_eq!(agent.params.off_mesh, OffMeshMode::External);
+                assert_eq!(restored.link_epoch, 17);
+            }
+            assert_eq!(restored.to_bytes()[4..8], EXTENDED_VERSION.to_le_bytes());
+            bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert!(matches!(
+                CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED),
+                Err(Error::InvalidSnapshot(E::WrongVersion))
+            ));
+        }
+    }
 }

@@ -14,6 +14,8 @@ use crate::{Error, Limits, TileDataError};
 use alloc::boxed::Box;
 
 mod links;
+#[cfg(feature = "dynamic")]
+mod modifiers;
 mod replace;
 pub use links::{Landing, LinkId, LinkReport, LinkSpec};
 pub(crate) mod stream;
@@ -67,6 +69,8 @@ struct Slot {
     /// Content hash of the resident tile when it is known without hashing again
     /// (tiles committed from a [`PreparedTile`]).
     hash: Option<[u8; 32]>,
+    #[cfg(feature = "dynamic")]
+    state_stamp: u64,
 }
 
 /// A never-allocated slot (read through [`SlotTable`] for pages not allocated yet).
@@ -77,6 +81,8 @@ static EMPTY_SLOT: Slot = Slot {
     used: false,
     parked: None,
     hash: None,
+    #[cfg(feature = "dynamic")]
+    state_stamp: 0,
 };
 
 /// Slots per page of a keyed navmesh (pages are allocated on first use, so a large
@@ -212,6 +218,8 @@ pub struct NavMesh {
     runtime_links: links::RuntimeLinks,
     /// Streaming state: slot policy, unloaded tiles, known columns, epoch.
     stream: stream::StreamState,
+    #[cfg(feature = "dynamic")]
+    modifiers: modifiers::Modifiers,
 }
 
 /// A slot chosen for a tile, before anything changed.
@@ -788,6 +796,8 @@ impl NavMesh {
             global_off_mesh: false,
             runtime_links: links::RuntimeLinks::default(),
             stream: stream::StreamState::new(policy)?,
+            #[cfg(feature = "dynamic")]
+            modifiers: modifiers::Modifiers::default(),
         })
     }
 
@@ -1144,6 +1154,8 @@ impl NavMesh {
     fn poly_mut(&mut self, r: PolyRef) -> Result<&mut Poly, Error> {
         self.tile_and_poly_by_ref(r)?;
         let (_, it, ip) = self.decode_poly_id(r);
+        #[cfg(feature = "dynamic")]
+        self.check_unmanaged(it as usize, ip as usize)?;
         self.slots
             .get_mut(it as usize)
             .and_then(|s| s.tile.as_deref_mut())
@@ -1151,9 +1163,17 @@ impl NavMesh {
             .ok_or(Error::InvalidRef)
     }
 
-    /// Sets a polygon's flags.
+    /// Sets a polygon's flags. A polygon governed by a modifier returns
+    /// [`Error::InvalidParameter`].
     pub fn set_poly_flags(&mut self, r: PolyRef, flags: u16) -> Result<(), Error> {
-        self.poly_mut(r)?.flags = flags;
+        let poly = self.poly_mut(r)?;
+        #[cfg(feature = "dynamic")]
+        let changed = poly.flags != flags;
+        poly.flags = flags;
+        #[cfg(feature = "dynamic")]
+        if changed {
+            self.stamp_state(self.decode_poly_id(r).1 as usize);
+        }
         Ok(())
     }
 
@@ -1162,9 +1182,17 @@ impl NavMesh {
         Ok(self.tile_and_poly_by_ref(r)?.1.flags)
     }
 
-    /// Sets a polygon's area.
+    /// Sets a polygon's area. A polygon governed by a modifier returns
+    /// [`Error::InvalidParameter`].
     pub fn set_poly_area(&mut self, r: PolyRef, area: u8) -> Result<(), Error> {
-        self.poly_mut(r)?.set_area(area);
+        let poly = self.poly_mut(r)?;
+        #[cfg(feature = "dynamic")]
+        let before = poly.area();
+        poly.set_area(area);
+        #[cfg(feature = "dynamic")]
+        if before != poly.area() {
+            self.stamp_state(self.decode_poly_id(r).1 as usize);
+        }
         Ok(())
     }
 
@@ -1237,7 +1265,7 @@ impl NavMesh {
 
     /// Restores polygon flags and areas stored by [`NavMesh::store_tile_state`]
     /// (`dtNavMesh::restoreTileState`). The tile's ref and polygon refs do not
-    /// change.
+    /// change. Governed polygons keep their derived flags and areas.
     ///
     /// The blob is untrusted: it is checked completely before the tile is touched.
     /// Errors, in upstream's order: [`Error::InvalidRef`] for a ref that is not a
@@ -1252,12 +1280,23 @@ impl NavMesh {
         let polys = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?.polys.len();
         let size = stream::check_state(tile, polys, data, self.ref_layout())?;
         let (_, it, _) = self.decode_poly_id(tile);
-        let t = self
+        self.restore_checked_state(it as usize, data, size)
+    }
+
+    fn restore_checked_state(&mut self, ti: usize, data: &[u8], size: usize) -> Result<(), Error> {
+        let tile = self
             .slots
-            .get_mut(it as usize)
+            .get_mut(ti)
             .and_then(|s| s.tile.as_deref_mut())
             .ok_or(Error::InvalidRef)?;
-        stream::apply_state(t, data, size);
+        #[cfg(feature = "dynamic")]
+        {
+            if stream::apply_state(tile, data, size, |ip| self.modifiers.governs(ti, ip)) {
+                self.stamp_state(ti);
+            }
+        }
+        #[cfg(not(feature = "dynamic"))]
+        stream::apply_state(tile, data, size, |_| false);
         Ok(())
     }
 
@@ -1451,6 +1490,10 @@ impl NavMesh {
         internally_linked: bool,
     ) -> TileRef {
         let ti = target.ti;
+        let mut tile = tile;
+        tile.managed_link_tile = self.link_layer() == Some(tile.header.layer);
+        #[cfg(feature = "dynamic")]
+        let stamp = self.modifiers.attach_tile(&mut tile, ti);
         let h = &tile.header;
         let (hx, hy, hl) = (h.x, h.y, h.layer);
 
@@ -1474,6 +1517,10 @@ impl NavMesh {
         s.salt = salt;
         s.parked = None;
         s.tile = Some(Box::new(tile));
+        #[cfg(feature = "dynamic")]
+        {
+            s.state_stamp = stamp;
+        }
         s.hash = hash;
         s.used = true;
         self.stream.bump_epoch();
@@ -1613,6 +1660,10 @@ impl NavMesh {
             self.disconnect_global_pairs(ti);
         }
         let tile = self.slots[ti].tile.take();
+        #[cfg(feature = "dynamic")]
+        if let Some(tile) = tile.as_deref() {
+            self.modifiers.detach_tile(tile, ti);
+        }
         self.slots[ti].hash = None;
         self.resident = self.resident.saturating_sub(1);
         if self.global_off_mesh && ground {
@@ -2152,4 +2203,5 @@ static EMPTY_TILE: MeshTile = MeshTile {
     links_free_list: NULL_LINK,
     runtime_links_free_list: NULL_LINK,
     spare_links: 0,
+    managed_link_tile: false,
 };

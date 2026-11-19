@@ -107,6 +107,83 @@ fn runtime_link_changes_keep_ground_refs_and_have_no_dangling_edges() {
     assert_eq!(path(&nav, [a, b], [START, END]), before);
 }
 
+#[cfg(feature = "dynamic")]
+#[test]
+fn closing_a_gate_on_a_runtime_landing_keeps_the_link_out_of_paths() {
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let (mut nav, a, b) = scene(1, 0);
+    let gate = ModifierId(0);
+    let mut layer = DynamicLayer::new(1, Limits::UNLIMITED).unwrap();
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            Selector::Prism {
+                verts_xz: vec![[30., 0.], [40., 0.], [40., 10.], [30., 10.]],
+                ymin: -1.,
+                ymax: 1.,
+                area: None,
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    nav.set_dynamic_layer(Some(layer));
+    assert!(nav.add_runtime_link(spec(), true).unwrap().is_traversable());
+    // Starting behind the connection makes its departure point a better
+    // heuristic candidate than the start if the link is wrongly searched.
+    let points = [[1., 0., 5.], END];
+    let open = path(&nav, [a, b], points);
+    assert_eq!(open.len(), 3);
+    assert_eq!(nav.runtime_link_id(open[1]), Some(ID));
+    assert_eq!(open[2], b);
+
+    nav.set_modifier_enabled(gate, true).unwrap();
+    assert_eq!(path(&nav, [a, b], points), [a]);
+    assert!(nav.runtime_link_report(ID).unwrap().enabled);
+    nav.set_modifier_enabled(gate, false).unwrap();
+    assert_eq!(path(&nav, [a, b], points), open);
+}
+
+#[cfg(feature = "dynamic")]
+#[test]
+fn runtime_refresh_preserves_link_modifiers_and_explicit_disable_wins() {
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let (mut nav, a, b) = scene(1, 0);
+    let selector = Selector::Links {
+        user_id_min: ID.0,
+        user_id_max: ID.0,
+    };
+    let mut layer = DynamicLayer::new(2, Limits::UNLIMITED).unwrap();
+    let gate = ModifierId(0);
+    let cost = ModifierId(1);
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            selector.clone(),
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    layer
+        .upsert(ModifierSpec::new(cost, selector, Effect::SetArea(7)))
+        .unwrap();
+    layer.set_enabled(gate, true).unwrap();
+    layer.set_enabled(cost, true).unwrap();
+    nav.set_dynamic_layer(Some(layer));
+
+    nav.add_runtime_link(spec(), true).unwrap();
+    let points = [START, END];
+    assert_eq!(path(&nav, [a, b], points), [a]);
+    nav.set_runtime_link_enabled(ID, false).unwrap();
+    nav.set_modifier_enabled(gate, false).unwrap();
+    assert_eq!(path(&nav, [a, b], points), [a]);
+    nav.set_runtime_link_enabled(ID, true).unwrap();
+    let open = path(&nav, [a, b], points);
+    assert_eq!(open.len(), 3);
+    let (_, poly) = nav.tile_and_poly_by_ref(open[1]).unwrap();
+    assert_eq!((poly.flags, poly.area()), (1, 7));
+}
+
 #[test]
 fn capacity_failure_is_atomic_and_disabled_links_keep_their_reservations() {
     let (mut nav, a, b) = scene(1, 0);
@@ -263,13 +340,14 @@ fn crowd_replans_on_toggle_and_round_trips_external_traversal() {
 fn world_replans_and_can_abort_or_restore_a_pending_external_traversal() {
     use navmesh_rs::Budget;
     use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams, Goal};
-    use navmesh_rs::crowd::{AgentParams, AgentState, OffMeshMode};
+    use navmesh_rs::crowd::{AgentParams, AgentState, ArrivalPolicy, OffMeshMode};
 
     let (mut nav, _, b) = scene(1, 0);
     nav.add_runtime_link(spec(), true).unwrap();
     let mut w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
     let mut p = AgentParams::default();
     p.off_mesh = OffMeshMode::External;
+    p.arrival_policy = ArrivalPolicy::Park;
     let a = w.add_agent(&nav, START, p).unwrap();
     w.set_goal(&nav, a, Goal::Point { poly: b, pos: END })
         .unwrap();
@@ -292,6 +370,10 @@ fn world_replans_and_can_abort_or_restore_a_pending_external_traversal() {
     assert_eq!(restored.off_mesh_arrivals().next(), Some((a, reached)));
     restored.complete_off_mesh(&restored_nav, a, END).unwrap();
     assert_eq!(restored.agent(a).unwrap().position(), END);
+    restored
+        .step(&restored_nav, &mut Budget::unlimited())
+        .unwrap();
+    assert!(restored.agent(a).unwrap().detail().unwrap().arrived());
     nav.set_runtime_link_enabled(ID, false).unwrap();
     w.abort_off_mesh(a).unwrap();
     assert_eq!(w.agent(a).unwrap().position(), START);

@@ -95,23 +95,49 @@ impl<C: FrameCrowd> FramedCrowd<C> {
         Ok(Budgeted::Complete(intents))
     }
 
-    fn openings(
+    fn local_targets(
         frames: &FrameSet,
         intents: &[Intent<C::Handle>],
         index: impl Fn(C::Handle) -> usize,
-    ) -> Result<BTreeMap<FrameId, BTreeMap<usize, V3>>, Error> {
-        let mut openings: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
+    ) -> Result<BTreeMap<FrameId, BTreeMap<usize, LocalTarget>>, Error> {
+        let mut targets: BTreeMap<_, BTreeMap<_, _>> = BTreeMap::new();
         for intent in intents {
-            if let Some(dock) = &intent.dock
-                && frames.dock_open(dock.id, dock.departure, dock.landing.1)?
-            {
-                openings
-                    .entry(intent.rider.frame)
-                    .or_default()
-                    .insert(index(intent.rider.handle), dock.departure.position);
+            let Some((_, point)) = intent.target else {
+                continue;
+            };
+            let target = if let Some(dock) = &intent.dock {
+                LocalTarget::Dock(
+                    frames
+                        .dock_open(dock.id, dock.departure, dock.landing.1)?
+                        .then_some(dock.departure.position),
+                )
+            } else {
+                LocalTarget::Goal(point)
+            };
+            targets
+                .entry(intent.rider.frame)
+                .or_default()
+                .insert(index(intent.rider.handle), target);
+        }
+        Ok(targets)
+    }
+
+    fn finish_arrivals(&mut self, intents: &[Intent<C::Handle>]) {
+        for intent in intents {
+            if intent.dock.is_none() && intent.target.is_some() {
+                match self.agent(intent.id) {
+                    None => {
+                        self.riders.remove(&intent.id);
+                    }
+                    Some((_, _, agent)) if agent.arrived() => {
+                        if let Some(rider) = self.riders.get_mut(&intent.id) {
+                            rider.goal = None;
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
-        Ok(openings)
     }
 
     fn apply_targets(
@@ -217,7 +243,7 @@ impl FramedCrowd<Crowd> {
         let Budgeted::Complete(intents) = self.intents(frames, &mut budget)? else {
             return Err(Error::LimitExceeded);
         };
-        let openings = Self::openings(frames, &intents, |h| h.0)?;
+        let targets = Self::local_targets(frames, &intents, |h| h.0)?;
         let empty = BTreeMap::new();
         self.apply_targets(frames, &intents)?;
         for (&id, crowd) in &mut self.crowds {
@@ -226,10 +252,11 @@ impl FramedCrowd<Crowd> {
                     ws,
                     frames.require_mesh(id)?,
                     dt,
-                    openings.get(&id).unwrap_or(&empty),
+                    targets.get(&id).unwrap_or(&empty),
                 )?;
             }
         }
+        self.finish_arrivals(&intents);
         self.apply_transfers(frames, &intents)
     }
 }
@@ -263,19 +290,20 @@ impl FramedCrowd<CrowdWorld> {
         let Budgeted::Complete(obstacles) = self.dock_obstacles(frames, budget)? else {
             return Ok(Budgeted::Exhausted(()));
         };
-        let openings = Self::openings(frames, &intents, |h| h.index() as usize)?;
-        let (empty_open, empty_obstacles) = (BTreeMap::new(), BTreeMap::new());
+        let targets = Self::local_targets(frames, &intents, |h| h.index() as usize)?;
+        let (empty, empty_obstacles) = (BTreeMap::new(), BTreeMap::new());
         self.apply_targets(frames, &intents)?;
         for (&id, crowd) in &mut self.crowds {
             if !crowd.is_empty() {
                 crowd.step_with_docks(
                     frames.require_mesh(id)?,
                     &mut Budget::unlimited(),
-                    openings.get(&id).unwrap_or(&empty_open),
+                    targets.get(&id).unwrap_or(&empty),
                     obstacles.get(&id).unwrap_or(&empty_obstacles),
                 )?;
             }
         }
+        self.finish_arrivals(&intents);
         self.apply_transfers(frames, &intents)?;
         Ok(Budgeted::Complete(()))
     }

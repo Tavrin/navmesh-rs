@@ -55,6 +55,10 @@ across the hand-over. Native slot ids, velocities and corridor state are
 frame-local. Ordinary external off-mesh requests can still be completed or
 aborted in the current frame.
 
+Arrival policies apply to the final goal. A rider keeps approaching or
+waiting at intermediate docks. At the final goal, a parked rider retains
+its stable id and a removed rider releases it for reuse.
+
 `CrowdWorld` models agents across the two sides of an aligned, enabled dock as
 moving discs for avoidance only. Both agents must be within the authored
 dock radius, and the recipient's collision range and height overlap still
@@ -69,8 +73,10 @@ Local surface movement still constrains its position until hand-over.
 ## Snapshot and restore
 
 Save each mesh's tile data, residency, and ordinary runtime links using the
-normal APIs. Save the frame snapshot with `FrameSet::to_bytes`. Restore the
-meshes with the same frame ids, then apply the frame snapshot. Its binding
+normal APIs. Save and restore any registered gate and cost-zone state with
+the [modifier layer](DYNAMIC-MODIFIERS.md). Save the frame snapshot with
+`FrameSet::to_bytes`. Restore the meshes with the same frame ids, then
+apply the frame snapshot. Its binding
 checks the mesh's grid, residency and runtime link records. A framed
 `CrowdWorld` snapshot restores the native simulations and stable rider
 handles, goals and wait costs. Restore it after the matching frame snapshot.

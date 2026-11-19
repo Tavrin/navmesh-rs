@@ -408,10 +408,10 @@ pub(super) fn velocity_in(
     dt: f32,
     s: &mut OrcaScratch,
 ) -> Result<V2, Error> {
-    velocity_with_obstacles_in(ws, a, neighbours, walls, &[], params, dt, s)
+    velocity_with_responsibility(ws, a, neighbours, walls, &[], params, dt, s, |_| 0.5)
 }
-
-pub(super) fn velocity_with_obstacles_in(
+/// Solves with nonreciprocal obstacles and a caller-supplied split for neighbours.
+pub(super) fn velocity_with_responsibility(
     ws: &mut Workspace,
     a: &OrcaAgent,
     neighbours: &[OrcaAgent],
@@ -420,6 +420,7 @@ pub(super) fn velocity_with_obstacles_in(
     params: &OrcaParams,
     dt: f32,
     s: &mut OrcaScratch,
+    responsibility: impl Fn(usize) -> f32,
 ) -> Result<V2, Error> {
     a.validate()?;
     params.validate()?;
@@ -471,8 +472,13 @@ pub(super) fn velocity_with_obstacles_in(
     let static_count = s.planes.len();
     for &(i, _) in &s.order {
         ws.work(1)?;
-        s.planes
-            .push(agent_plane(a, &neighbours[i], params.time_horizon, dt, 0.5));
+        s.planes.push(agent_plane(
+            a,
+            &neighbours[i],
+            params.time_horizon,
+            dt,
+            responsibility(i),
+        ));
     }
     let (mut v, failed) = solve(
         ws,

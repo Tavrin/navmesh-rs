@@ -17,6 +17,7 @@ pub(super) trait AgentsView {
     fn dvel(&self, j: usize) -> V3;
     fn radius(&self, j: usize) -> f32;
     fn max_speed(&self, j: usize) -> f32;
+    fn parked(&self, j: usize) -> bool;
     fn orca(&self, j: usize) -> OrcaAgent {
         let (p, v, d) = (self.npos(j), self.vel(j), self.dvel(j));
         OrcaAgent {
@@ -30,6 +31,9 @@ pub(super) trait AgentsView {
 }
 
 impl AgentsView for [CrowdAgent] {
+    fn parked(&self, j: usize) -> bool {
+        self[j].parked()
+    }
     fn npos(&self, j: usize) -> V3 {
         self[j].npos
     }
@@ -528,12 +532,14 @@ pub(super) fn find_corners(
     a: &mut CrowdAgent,
     q: &mut NavMeshQuery<'_>,
     filters: &[DefaultFilter; 16],
+    precise_target: Option<V3>,
 ) -> Result<(), Error> {
     if a.state != S::Walking || matches!(a.target_state, T::None | T::Velocity) {
         return Ok(());
     }
     let f = &filters[a.params.query_filter_type];
-    a.corridor.find_corners(q, &mut a.corners, 4)?;
+    a.corridor
+        .find_corners_for_target(q, &mut a.corners, 4, precise_target)?;
     if a.params.update_flags & OPTIMIZE_VIS != 0 && !a.corners.is_empty() {
         let next = a.corners[1.min(a.corners.len() - 1)].pos;
         a.corridor
@@ -695,7 +701,7 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
         let dock_obstacles = s.dock_obstacles;
         #[cfg(not(feature = "crowd-world"))]
         let dock_obstacles = &[];
-        let v = orca::velocity_with_obstacles_in(
+        let v = orca::velocity_with_responsibility(
             ws,
             &OrcaAgent::crowd(a),
             s.orca_neighbours,
@@ -704,6 +710,14 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
             &p,
             dt,
             s.orca,
+            |k| {
+                let other = others.parked(a.neis[k].0);
+                match (a.parked(), other) {
+                    (true, false) => 0.,
+                    (false, true) => 1.,
+                    _ => 0.5,
+                }
+            },
         )?;
         [v[0], 0., v[1]]
     } else if a.params.update_flags & OBSTACLE_AVOIDANCE != 0

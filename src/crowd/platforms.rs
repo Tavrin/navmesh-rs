@@ -26,6 +26,27 @@ struct Rider<H> {
     goal: Option<FramePoint>,
 }
 
+pub(super) enum LocalTarget {
+    Goal(V3),
+    Dock(Option<V3>),
+}
+
+impl LocalTarget {
+    pub(super) fn precise_point(&self) -> Option<V3> {
+        match *self {
+            Self::Goal(point) => Some(point),
+            Self::Dock(opening) => opening,
+        }
+    }
+
+    pub(super) fn opening(&self) -> Option<V3> {
+        match *self {
+            Self::Dock(opening) => opening,
+            Self::Goal(_) => None,
+        }
+    }
+}
+
 /// A collection of frame-local crowds with stable agent ids and dock routes.
 ///
 /// Use `FramedCrowd<Crowd>` or `FramedCrowd<CrowdWorld>`. Attach a configured,

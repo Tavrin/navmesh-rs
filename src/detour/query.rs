@@ -17,6 +17,9 @@ use super::{
 use crate::budget::spend_one;
 use crate::{Budget, Budgeted, Error, UpstreamFixes};
 
+/// A landing polygon and the point on it, if one was found within the search radius.
+type LinkLanding = Option<(PolyRef, [f32; 3])>;
+
 pub(crate) const H_SCALE: f32 = 0.999;
 
 #[inline]
@@ -218,6 +221,36 @@ impl<'a> NavMeshQuery<'a> {
     /// The navmesh this query reads.
     pub fn nav(&self) -> &'a NavMesh {
         self.nav
+    }
+
+    #[inline]
+    pub(crate) fn passes_filter<F: QueryFilter + ?Sized>(
+        &self,
+        (r, tile, poly): Tp<'_>,
+        filter: &F,
+    ) -> bool {
+        if !filter.pass_filter(r, tile, poly) {
+            return false;
+        }
+        if !tile.managed_link_tile {
+            return true;
+        }
+
+        // Only enter a managed link if both of its ground endpoints pass the
+        // same filter. This also keeps blocked links out of partial paths.
+        let mut next = poly.first_link;
+        if next == NULL_LINK {
+            return false;
+        }
+        while next != NULL_LINK {
+            let edge = tile.links[next as usize];
+            let (r, tile, poly) = self.tp(edge.r#ref);
+            if !filter.pass_filter(r, tile, poly) {
+                return false;
+            }
+            next = edge.next;
+        }
+        true
     }
 
     #[inline]
@@ -454,7 +487,7 @@ impl<'a> NavMeshQuery<'a> {
                     continue;
                 }
                 let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
+                if !self.passes_filter(nei, filter) {
                     continue;
                 }
                 let Some((va, vb)) = self.portal_points_tp(best, nei) else {
@@ -710,7 +743,7 @@ impl<'a> NavMeshQuery<'a> {
         radius: f32,
         filter: &DefaultFilter,
         budget: &mut Budget,
-    ) -> Result<Budgeted<Option<(PolyRef, [f32; 3])>>, Error> {
+    ) -> Result<Budgeted<LinkLanding>, Error> {
         let mut best = f64::INFINITY;
         let mut result = None;
         let radius2 = f64::from(radius) * f64::from(radius);
@@ -989,7 +1022,7 @@ impl<'a> NavMeshQuery<'a> {
                     continue;
                 }
                 let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
+                if !self.passes_filter(nei, filter) {
                     continue;
                 }
                 let cross_side = if link.side != 0xff { link.side >> 1 } else { 0 };
@@ -1292,7 +1325,7 @@ impl<'a> NavMeshQuery<'a> {
                     continue;
                 }
                 let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
+                if !self.passes_filter(nei, filter) {
                     continue;
                 }
                 let cross_side =

@@ -5,6 +5,10 @@ use core::cmp::Reverse;
 use crate::detour::{POLYTYPE_GROUND, QueryFilter, Status};
 use crate::{Budget, Budgeted};
 
+/// The two endpoints and the cost of one active dock seam.
+#[cfg(feature = "crowd-world")]
+type ActiveSeam = (FramePoint, FramePoint, f32);
+
 /// One local corridor in a route, optionally ending at a dock crossing.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -306,7 +310,7 @@ impl FrameSet {
     pub(crate) fn active_seams(
         &self,
         budget: &mut Budget,
-    ) -> Result<Budgeted<Vec<(FramePoint, FramePoint, f32)>>, Error> {
+    ) -> Result<Budgeted<Vec<ActiveSeam>>, Error> {
         let mut seams = Vec::new();
         let filter = DefaultFilter::default();
         for dock in self.docks.values().filter(|d| d.enabled) {

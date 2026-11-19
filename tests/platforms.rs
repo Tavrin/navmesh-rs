@@ -137,6 +137,52 @@ fn route_uses_reachable_directed_docks_and_caller_waits() {
     );
 }
 
+#[cfg(feature = "dynamic")]
+#[test]
+fn gate_on_dock_landing_blocks_routes_until_reopened() {
+    use navmesh_rs::Limits;
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let mut frames = lift();
+    let gate = ModifierId(0);
+    let mut layer = DynamicLayer::new(1, Limits::default()).unwrap();
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            Selector::Prism {
+                verts_xz: vec![[0., 0.], [5., 0.], [5., 10.], [0., 10.]],
+                ymin: -0.5,
+                ymax: 0.5,
+                area: None,
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    frames
+        .mesh_mut(CABIN)
+        .unwrap()
+        .set_dynamic_layer(Some(layer));
+    let goal = FramePoint::new(CABIN, [2., 0., 5.]);
+    for closed in [false, true, false] {
+        frames
+            .mesh_mut(CABIN)
+            .unwrap()
+            .set_modifier_enabled(gate, closed)
+            .unwrap();
+        let result = frames
+            .plan(
+                LOWER,
+                goal,
+                EXTENTS,
+                &DefaultFilter::default(),
+                &mut Budget::unlimited(),
+            )
+            .unwrap();
+        assert_eq!(matches!(result, Budgeted::Complete(Some(_))), !closed);
+        assert!(frames.dock(BOARD).unwrap().1);
+    }
+}
+
 #[test]
 fn world_local_round_trip_at_eight_kilometres() {
     let frames = &mut lift();
@@ -199,7 +245,7 @@ mod rides {
     use super::*;
     use navmesh_rs::Workspace;
     use navmesh_rs::crowd::platforms::{FrameCrowd, FramedCrowd, PlatformAgentId};
-    use navmesh_rs::crowd::{AgentParams, AgentState, Crowd};
+    use navmesh_rs::crowd::{AgentParams, AgentState, ArrivalPolicy, Crowd};
 
     const RIDER: PlatformAgentId = PlatformAgentId(1);
 
@@ -294,6 +340,63 @@ mod rides {
             |f, c| c.update(f, &mut ws, 0.05).unwrap(),
             10_000,
         );
+    }
+
+    fn arrival_at_final_goal<C: FrameCrowd>(
+        frames: &mut FrameSet,
+        crowd: &mut FramedCrowd<C>,
+        policy: ArrivalPolicy,
+        mut tick: impl FnMut(&FrameSet, &mut FramedCrowd<C>),
+    ) {
+        let mut params = AgentParams::default();
+        params.radius = 0.25;
+        params.max_speed = 2.;
+        params.update_flags = 0;
+        params.arrival_policy = policy;
+        params.arrival_distance = 0.5;
+        crowd.add_agent(frames, RIDER, LOWER, params).unwrap();
+        crowd.set_goal(frames, RIDER, Some(UPPER)).unwrap();
+        crowd.set_wait_cost(frames, ALIGHT, Some(5.)).unwrap();
+
+        for _ in 0..240 {
+            tick(frames, crowd);
+        }
+        let (frame, _, agent) = crowd.agent(RIDER).unwrap();
+        assert_eq!(frame, CABIN);
+        assert!(!agent.arrived());
+
+        frames.set_dock_enabled(BOARD, false).unwrap();
+        frames.set_pose(CABIN, pose(4.)).unwrap();
+        frames.set_dock_enabled(ALIGHT, true).unwrap();
+        for _ in 0..240 {
+            tick(frames, crowd);
+        }
+        if policy == ArrivalPolicy::Park {
+            let (frame, _, agent) = crowd.agent(RIDER).unwrap();
+            assert_eq!(frame, WORLD);
+            assert!(agent.arrived());
+            assert_eq!(agent.npos[1], UPPER.position[1]);
+            assert!((agent.npos[0] - UPPER.position[0]).abs() <= params.arrival_distance);
+        } else {
+            assert!(crowd.agent(RIDER).is_none());
+            crowd.add_agent(frames, RIDER, UPPER, params).unwrap();
+        }
+    }
+
+    #[test]
+    fn crowd_applies_arrival_policy_only_at_the_final_goal() {
+        for policy in [ArrivalPolicy::Park, ArrivalPolicy::Remove] {
+            let mut frames = lift();
+            let mut crowd = FramedCrowd::<Crowd>::default();
+            let mut ws = Workspace::new();
+            for id in frames.frame_ids() {
+                let local = Crowd::new(&mut ws, frames.mesh(id).unwrap(), 4, 0.3).unwrap();
+                crowd.attach(&frames, id, local).unwrap();
+            }
+            arrival_at_final_goal(&mut frames, &mut crowd, policy, |f, c| {
+                c.update(f, &mut ws, 0.05).unwrap();
+            });
+        }
     }
 
     #[test]
@@ -434,6 +537,17 @@ mod rides {
                 c.step(frames, &mut Budget::unlimited()).unwrap(),
                 Budgeted::Complete(())
             ));
+        }
+
+        #[test]
+        fn crowd_world_applies_arrival_policy_only_at_the_final_goal() {
+            for policy in [ArrivalPolicy::Park, ArrivalPolicy::Remove] {
+                let mut frames = lift();
+                let mut c = crowd(&frames);
+                c.remove_agent(RIDER).unwrap();
+                arrival_at_final_goal(&mut frames, &mut c, policy, tick);
+                FramedCrowd::from_bytes(&frames, &c.to_bytes(&frames), Limits::default()).unwrap();
+            }
         }
 
         #[cfg(not(feature = "parallel"))]

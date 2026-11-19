@@ -353,15 +353,28 @@ pub(super) fn check_state(
 }
 
 /// Writes a checked state blob into a tile's polygons.
-pub(super) fn apply_state(t: &mut MeshTile, data: &[u8], size: usize) {
-    for (p, s) in t
+pub(super) fn apply_state(
+    t: &mut MeshTile,
+    data: &[u8],
+    size: usize,
+    mut skip: impl FnMut(usize) -> bool,
+) -> bool {
+    let mut changed = false;
+    for (ip, (p, s)) in t
         .polys
         .iter_mut()
         .zip(data[super::TILE_STATE_HEADER_SIZE..size].chunks_exact(super::TILE_POLY_STATE_SIZE))
+        .enumerate()
     {
-        p.flags = u16::from_le_bytes([s[0], s[1]]);
-        p.set_area(s[2]);
+        if !skip(ip) {
+            let flags = u16::from_le_bytes([s[0], s[1]]);
+            let area = s[2] & 63;
+            changed |= p.flags != flags || p.area() != area;
+            p.flags = flags;
+            p.set_area(area);
+        }
     }
+    changed
 }
 
 /// The streaming part of a navmesh's state.
@@ -711,11 +724,8 @@ impl NavMesh {
         if footer[8..40] != t.hash || layout.is_some_and(|l| footer[40..] != l) {
             return Err(Error::InvalidTileState(TileStateError::WrongTile));
         }
-        let ti = target.ti;
         let r = self.link_in(t.tile, target, Some(t.hash), true)?;
-        if let Some(tile) = self.slots[ti].tile.as_deref_mut() {
-            apply_state(tile, state, size);
-        }
+        self.restore_checked_state(target.ti, state, size)?;
         Ok(r)
     }
 
