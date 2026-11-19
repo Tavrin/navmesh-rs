@@ -44,8 +44,8 @@ fn cost_filter() -> DefaultFilter {
         exclude_flags: 0x10,
         ..DefaultFilter::default()
     };
-    for (area, cost) in f.area_cost.iter_mut().enumerate().take(8).skip(1) {
-        *cost = 1.0 + 1.5 * area as f32;
+    for (a, cost) in f.area_cost.iter_mut().enumerate().take(8).skip(1) {
+        *cost = 1.0 + 1.5 * a as f32;
     }
     f
 }

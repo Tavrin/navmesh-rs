@@ -185,6 +185,10 @@ impl<'a> AgentView<'a> {
     pub fn tier(&self) -> Tier {
         self.tier
     }
+    /// Whether this agent has triggered its current point arrival policy.
+    pub fn arrived(&self) -> bool {
+        self.agent.arrived()
+    }
     /// Current position.
     pub fn position(&self) -> V3 {
         self.agent.npos
@@ -550,6 +554,21 @@ impl CrowdWorld {
             put(&v.handle.index.to_le_bytes());
             put(&v.handle.generation.to_le_bytes());
             put(&[a.state as u8, a.target_state as u8]);
+            if a.params.arrival_policy != ArrivalPolicy::Keep
+                || a.params.arrival_distance != 0.5
+                || a.arrived
+            {
+                put(b"arrival");
+                put(&[
+                    match a.params.arrival_policy {
+                        ArrivalPolicy::Keep => 0,
+                        ArrivalPolicy::Park => 1,
+                        ArrivalPolicy::Remove => 2,
+                    },
+                    u8::from(a.arrived),
+                ]);
+                put(&a.params.arrival_distance.to_bits().to_le_bytes());
+            }
             for x in a.npos.iter().chain(&a.vel).chain(&a.nvel).chain(&a.dvel) {
                 put(&x.to_bits().to_le_bytes());
             }
