@@ -82,6 +82,7 @@ impl NavMesh {
 
     /// [`NavMesh::replace_tile`], except that equal content is replaced too (one
     /// salt advance, flags from the bytes), as upstream's remove-then-add does.
+    #[cfg(feature = "tilecache")]
     pub(crate) fn replace_tile_advancing(&mut self, t: PreparedTile) -> Result<Replaced, Error> {
         let plan = self.plan_replace(&t, false)?;
         self.apply_replace(t, plan)

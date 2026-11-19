@@ -53,6 +53,17 @@ All notable changes to this project are documented in this file. The format foll
   layout. Navmeshes with the default layout still write versions 3 and 2, byte for byte as
   before.
 - `replace_ops` fuzz target.
+- `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of
+  the resident tile again keeps its refs and runtime flags; a refused tile no longer comes
+  back under a new salt with its flags reset. The layer comes from the tile header instead
+  of assuming layer 0 (removals still remove layer 0), and bytes whose header names
+  another column than the entry's key are refused. Installation now also computes the
+  tile's SHA-256 identity.
+- `TileCache` rebuilds replace the resident tile in place: a refused rebuild keeps the
+  resident tile instead of losing it. Identical bytes still advance the salt by default,
+  as upstream does, so tile-cache parity is unchanged; the new
+  `TileCache::set_keep_identical_tiles(true)` makes them keep the tile's refs, salt and
+  runtime flags.
 
 ### Fixed
 
@@ -66,20 +77,6 @@ All notable changes to this project are documented in this file. The format foll
   instead of unwraps.
 - Document prepared content identity, including nondefault layout provenance,
   and make the replacement property model retain those installed bytes.
-
-### Changed
-
-- `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of
-  the resident tile again keeps its refs and runtime flags; a refused tile no longer comes
-  back under a new salt with its flags reset. The layer comes from the tile header instead
-  of assuming layer 0 (removals still remove layer 0), and bytes whose header names
-  another column than the entry's key are refused. Installation now also computes the
-  tile's SHA-256 identity.
-- `TileCache` rebuilds replace the resident tile in place: a refused rebuild keeps the
-  resident tile instead of losing it. Identical bytes still advance the salt by default,
-  as upstream does, so tile-cache parity is unchanged; the new
-  `TileCache::set_keep_identical_tiles(true)` makes them keep the tile's refs, salt and
-  runtime flags.
 
 ## [0.2.2] - 2026-11-06
 
