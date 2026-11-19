@@ -38,20 +38,24 @@ mod builder;
 mod endian;
 pub(crate) mod math;
 mod navmesh;
+pub(crate) use tile::LINK_SIZE;
 pub(crate) mod node;
 pub(crate) mod query;
 mod query_local;
 mod resumable;
 mod tile;
 
-pub use builder::{NavMeshCreateParams, create_nav_mesh_data, create_nav_mesh_data_f32};
+pub use builder::{
+    NavMeshCreateParams, create_nav_mesh_data, create_nav_mesh_data_f32,
+    create_nav_mesh_data_with_spare_links,
+};
 pub use endian::{
     nav_mesh_data_swap_endian, nav_mesh_header_swap_endian, nav_mesh_swap_off_mesh_user_ids,
 };
 pub use navmesh::{
-    Committed, EdgeKind, NavMesh, NavMeshParams, PreparedTile, REMOVAL_LOG_CAPACITY, RefLayout,
-    RefState, Replaced, ResidencyRecord, SlotPolicy, TileKey, UnloadedTile, content_hash,
-    prepare_tile, prepare_tile_with_layout,
+    Committed, EdgeKind, Landing, LinkId, LinkReport, LinkSpec, NavMesh, NavMeshParams,
+    PreparedTile, REMOVAL_LOG_CAPACITY, RefLayout, RefState, Replaced, ResidencyRecord, SlotPolicy,
+    TileKey, UnloadedTile, content_hash, prepare_tile, prepare_tile_with_layout,
 };
 pub use query::{
     DefaultFilter, NavMeshQuery, QueryFilter, RaycastHit, SegmentWall, StraightPathPoint,
@@ -218,4 +222,4 @@ pub fn raw_status<T>(r: &Result<T, Error>, ok: impl FnOnce(&T) -> Status) -> u32
 pub(crate) use tile::check_bake_tile_limits;
 
 #[cfg(feature = "recast")]
-pub(crate) use builder::create_with_limits;
+pub(crate) use builder::create_with_spare_links;

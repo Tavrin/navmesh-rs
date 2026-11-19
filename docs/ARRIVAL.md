@@ -36,9 +36,9 @@ further when parking with a large arrival distance. Slots in disconnected region
 still require the caller's ordinary reachability checks.
 
 Reservations are caller-owned; save them separately from world snapshots.
-World snapshots preserve the arrival policy and parked state. Readers accept the
-original version and the extended arrival version; default worlds still write the
-original format.
+World snapshots preserve the arrival policy and parked state in `DCRW` version 3
+alongside external traversal state. Readers accept both legacy version 2 layouts.
+Default worlds still write version 1.
 
 The doorway diagnosis found that all 64 agents passed the opening within 30 s,
 while the late arrivals crowded around two shared goal points. Arrival policies

@@ -471,7 +471,7 @@ impl Build {
                 }
                 let pref = layout.poly_ref(p);
                 let ptp = q.tp(pref);
-                if !filter.pass_filter(pref, ptp.1, ptp.2) {
+                if !q.passes_filter(ptp, filter) {
                     return;
                 }
                 let Some((l, r)) = q.portal_points_tp(ptp, ntp) else {

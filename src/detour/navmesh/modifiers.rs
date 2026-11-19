@@ -3,7 +3,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
-use super::{MeshTile, NavMesh};
+use super::{MeshTile, NULL_LINK, NavMesh};
 use crate::detour::{PolyRef, QueryFilter, TileRef};
 use crate::dynamic::{
     DynamicLayer, Effect, ModifierId, ModifierSpec, SelectionReport, Selector, side,
@@ -242,6 +242,20 @@ impl Modifiers {
         !self.poly_ids(slot, ip).is_empty()
     }
 
+    pub(super) fn effective_state(&self, tile: &MeshTile, slot: usize, ip: usize) -> (u16, u8) {
+        let (mut flags, mut area) = tile.baked_state(ip);
+        for id in self.poly_ids(slot, ip) {
+            if let Some((spec, true)) = self.layer.as_ref().and_then(|layer| layer.get(*id)) {
+                match spec.effect {
+                    Effect::ClearFlags(mask) => flags &= !mask,
+                    Effect::SetFlags(mask) => flags |= mask,
+                    Effect::SetArea(value) => area = value,
+                }
+            }
+        }
+        (flags, area)
+    }
+
     fn apply(
         &self,
         tile: &mut MeshTile,
@@ -250,15 +264,9 @@ impl Modifiers {
     ) -> bool {
         let mut changed = false;
         for ip in polys {
-            let (mut flags, mut area) = tile.baked_state(ip);
-            for id in self.poly_ids(slot, ip) {
-                if let Some((spec, true)) = self.layer.as_ref().and_then(|layer| layer.get(*id)) {
-                    match spec.effect {
-                        Effect::ClearFlags(mask) => flags &= !mask,
-                        Effect::SetFlags(mask) => flags |= mask,
-                        Effect::SetArea(value) => area = value,
-                    }
-                }
+            let (mut flags, area) = self.effective_state(tile, slot, ip);
+            if tile.managed_link_tile && tile.polys[ip].first_link == NULL_LINK {
+                flags = 0;
             }
             let poly = &mut tile.polys[ip];
             changed |= poly.flags != flags || poly.area() != area;
