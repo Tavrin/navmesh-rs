@@ -704,6 +704,39 @@ impl<'a> NavMeshQuery<'a> {
         Ok(Budgeted::of(r?, exhausted))
     }
 
+    pub(crate) fn find_link_landing(
+        &self,
+        point: [f32; 3],
+        radius: f32,
+        filter: &DefaultFilter,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Option<(PolyRef, [f32; 3])>>, Error> {
+        let mut best = f64::INFINITY;
+        let mut result = None;
+        let radius2 = f64::from(radius) * f64::from(radius);
+        let (scan, exhausted) = budget.scoped(|b| {
+            self.query_polygons_until(
+                &point,
+                &[radius; 3],
+                filter,
+                &mut |tile, ip, poly| {
+                    if let Some((snap, distance)) =
+                        super::navmesh::link_landing_candidate(tile, ip, point)
+                        && distance <= radius2
+                        && distance < best
+                    {
+                        best = distance;
+                        result = Some((poly, snap));
+                    }
+                    true
+                },
+                &mut Some(b),
+            )
+        });
+        scan?;
+        Ok(Budgeted::of(result, exhausted))
+    }
+
     fn find_nearest_poly_impl<F: QueryFilter + ?Sized>(
         &self,
         center: &[f32; 3],

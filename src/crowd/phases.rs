@@ -648,6 +648,16 @@ pub(super) struct AvoidScratch<'a> {
     pub(super) query: &'a mut ObstacleAvoidanceQuery,
     pub(super) orca: &'a mut OrcaScratch,
     pub(super) orca_neighbours: &'a mut Vec<OrcaAgent>,
+    pub(super) dock_opening: Option<V3>,
+    #[cfg(feature = "crowd-world")]
+    pub(super) dock_obstacles: &'a [OrcaAgent],
+}
+
+fn is_dock_wall(seg: &[f32; 6], opening: Option<V3>) -> bool {
+    let Some(p) = opening else { return false };
+    let (d, t) = distance_pt_seg_sqr_2d(&p, &seg[..3], &seg[3..]);
+    let y = seg[1] + (seg[4] - seg[1]) * t;
+    d <= 1e-6 && (p[1] - y).abs() <= 0.001
 }
 
 /// The avoidance velocity and the number of velocity samples taken; `None` when the
@@ -674,14 +684,23 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
             s.orca_neighbours.push(others.orca(j));
         }
         let mut walls = [[0.; 4]; 8];
-        for (out, &(_, seg)) in walls.iter_mut().zip(&a.boundary.segments) {
-            *out = [seg[0], seg[2], seg[3], seg[5]];
+        let mut wall_count = 0;
+        for &(_, seg) in &a.boundary.segments {
+            if !is_dock_wall(&seg, s.dock_opening) {
+                walls[wall_count] = [seg[0], seg[2], seg[3], seg[5]];
+                wall_count += 1;
+            }
         }
-        let v = orca::velocity_in(
+        #[cfg(feature = "crowd-world")]
+        let dock_obstacles = s.dock_obstacles;
+        #[cfg(not(feature = "crowd-world"))]
+        let dock_obstacles = &[];
+        let v = orca::velocity_with_obstacles_in(
             ws,
             &OrcaAgent::crowd(a),
             s.orca_neighbours,
-            &walls[..a.boundary.segments.len()],
+            &walls[..wall_count],
+            dock_obstacles,
             &p,
             dt,
             s.orca,
@@ -699,8 +718,17 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
                 others.dvel(j),
             )?;
         }
+        #[cfg(feature = "crowd-world")]
+        for b in s.dock_obstacles {
+            s.query.add_moving_obstacle(
+                [b.position[0], a.npos[1], b.position[1]],
+                b.radius,
+                [b.velocity[0], 0., b.velocity[1]],
+            )?;
+        }
         for &(_, seg) in &a.boundary.segments {
-            if tri_area_2d(&a.npos, &seg[..3], &seg[3..]) < 0. {
+            if is_dock_wall(&seg, s.dock_opening) || tri_area_2d(&a.npos, &seg[..3], &seg[3..]) < 0.
+            {
                 continue;
             }
             s.query.add_segment(v3(&seg[..3]), v3(&seg[3..]))?;

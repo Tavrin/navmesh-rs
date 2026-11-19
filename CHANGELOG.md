@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Moving platform frames with yaw-only poses, runtime docks, cross-frame
+  routes, and stable riders for both crowds. Frame and framed crowd snapshots
+  restore dock availability and riders in transit. See
+  [moving platforms](docs/MOVING-PLATFORMS.md).
+
 - Managed runtime off-mesh connections with stable ids, optional reserved ground
   link slots, typed landing reports, game-controlled availability and versioned
   snapshots. Tile replacement and streaming re-resolve the registered links.

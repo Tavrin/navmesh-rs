@@ -195,3 +195,6 @@ pub mod bake;
 
 #[cfg(feature = "detour")]
 pub mod connectivity;
+
+#[cfg(feature = "detour")]
+pub mod frames;

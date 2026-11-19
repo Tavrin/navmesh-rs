@@ -2,6 +2,7 @@
 //! data-parallel with the `parallel` feature.
 use super::*;
 use crate::crowd::phases::{self, AgentSlots, AgentsView, AvoidScratch};
+use alloc::collections::BTreeMap;
 
 /// The arrays other agents' phases read; no phase writes them.
 struct View<'a> {
@@ -99,6 +100,7 @@ struct Ctx<'n> {
     nav: &'n NavMesh,
     limits: Limits,
     fixes: UpstreamFixes,
+    dock_circle_capacity: usize,
 }
 impl<'n> Ctx<'n> {
     fn worker(&self) -> Result<Worker<'n>, Error> {
@@ -109,7 +111,7 @@ impl<'n> Ctx<'n> {
             max_bytes: usize::MAX,
             ..self.limits
         });
-        let mut avoid = ObstacleAvoidanceQuery::new_in(&mut ws, 6, 8)?;
+        let mut avoid = ObstacleAvoidanceQuery::new_in(&mut ws, 6 + self.dock_circle_capacity, 8)?;
         avoid.set_fixes(self.fixes);
         Ok(Worker {
             ws,
@@ -199,6 +201,16 @@ impl CrowdWorld {
         nav: &NavMesh,
         budget: &mut Budget,
     ) -> Result<Budgeted<StepReport>, Error> {
+        self.step_with_docks(nav, budget, &BTreeMap::new(), &BTreeMap::new())
+    }
+
+    pub(in crate::crowd) fn step_with_docks(
+        &mut self,
+        nav: &NavMesh,
+        budget: &mut Budget,
+        dock_openings: &BTreeMap<usize, V3>,
+        dock_obstacles: &BTreeMap<usize, Vec<OrcaAgent>>,
+    ) -> Result<Budgeted<StepReport>, Error> {
         let dt = self.params.fixed_dt;
         self.active.clear();
         self.active
@@ -232,6 +244,7 @@ impl CrowdWorld {
             nav,
             limits: self.limits,
             fixes: self.fixes,
+            dock_circle_capacity: dock_obstacles.values().map(Vec::len).max().unwrap_or(0),
         };
         let Self {
             params,
@@ -335,11 +348,13 @@ impl CrowdWorld {
         // from the arrays, so integrating each agent right after it is the same as
         // integrating after all of them.
         let view = View::of(pos, vel, dvel, radius, height, max_speed);
-        tally = tally.add(ctx.run(heavy, owner, |w, _, a| {
+        tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
             let mut s = AvoidScratch {
                 query: &mut w.avoid,
                 orca: &mut w.orca,
                 orca_neighbours: &mut w.orca_neighbours,
+                dock_opening: dock_openings.get(&i).copied(),
+                dock_obstacles: dock_obstacles.get(&i).map_or(&[], Vec::as_slice),
             };
             let mut samples = 0;
             if let Some((v, k)) = phases::avoid(&mut w.ws, a, &view, dt, presets, &mut s)? {

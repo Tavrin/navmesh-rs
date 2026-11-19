@@ -628,6 +628,7 @@ fn insert_pos<T>(items: &[T], value: f32, key: impl Fn(&T) -> f32) -> usize {
     }
 }
 mod phases;
+pub mod platforms;
 mod update;
 #[cfg(feature = "crowd-world")]
 pub mod world;

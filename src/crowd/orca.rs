@@ -163,7 +163,7 @@ pub(super) fn clip(v: V2, speed: f32) -> V2 {
 
 // Eq. (5): nearest point on a disc's truncated velocity cone. In overlap,
 // use the next integration step rather than the prediction horizon.
-fn agent_plane(a: &OrcaAgent, b: &OrcaAgent, horizon: f32, dt: f32) -> Plane {
+fn agent_plane(a: &OrcaAgent, b: &OrcaAgent, horizon: f32, dt: f32, responsibility: f32) -> Plane {
     let p = sub(b.position, a.position);
     let v = sub(a.velocity, b.velocity);
     let r = a.radius + b.radius;
@@ -191,7 +191,7 @@ fn agent_plane(a: &OrcaAgent, b: &OrcaAgent, horizon: f32, dt: f32) -> Plane {
         let n = unit(w, unit(mul(p, -1.), [1., 0.]));
         (n, mul(n, r / dt - norm(w)))
     };
-    plane(n, add(a.velocity, mul(u, 0.5)))
+    plane(n, add(a.velocity, mul(u, responsibility)))
 }
 
 // Project the current velocity onto the boundary of the finite segment's
@@ -408,6 +408,19 @@ pub(super) fn velocity_in(
     dt: f32,
     s: &mut OrcaScratch,
 ) -> Result<V2, Error> {
+    velocity_with_obstacles_in(ws, a, neighbours, walls, &[], params, dt, s)
+}
+
+pub(super) fn velocity_with_obstacles_in(
+    ws: &mut Workspace,
+    a: &OrcaAgent,
+    neighbours: &[OrcaAgent],
+    walls: &[[f32; 4]],
+    obstacles: &[OrcaAgent],
+    params: &OrcaParams,
+    dt: f32,
+    s: &mut OrcaScratch,
+) -> Result<V2, Error> {
     a.validate()?;
     params.validate()?;
     for t in [dt, params.time_horizon, params.time_horizon_obstacles] {
@@ -434,7 +447,11 @@ pub(super) fn velocity_in(
             s.order.insert(at, (i, distance));
         }
     }
-    let count = walls.len().checked_add(cap).ok_or(Error::SizeOverflow)?;
+    let count = walls
+        .len()
+        .checked_add(cap)
+        .and_then(|n| n.checked_add(obstacles.len()))
+        .ok_or(Error::SizeOverflow)?;
     ws.reserve(&mut s.planes, count)?;
     ws.reserve(&mut s.projected, count)?;
     for &wall in walls {
@@ -445,11 +462,17 @@ pub(super) fn velocity_in(
         s.planes
             .push(wall_plane(a, wall, params.time_horizon_obstacles, dt));
     }
+    for b in obstacles {
+        ws.work(1)?;
+        b.validate()?;
+        s.planes
+            .push(agent_plane(a, b, params.time_horizon_obstacles, dt, 1.));
+    }
     let static_count = s.planes.len();
     for &(i, _) in &s.order {
         ws.work(1)?;
         s.planes
-            .push(agent_plane(a, &neighbours[i], params.time_horizon, dt));
+            .push(agent_plane(a, &neighbours[i], params.time_horizon, dt, 0.5));
     }
     let (mut v, failed) = solve(
         ws,

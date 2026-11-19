@@ -3,6 +3,7 @@
 use super::phases::{self, AvoidScratch};
 use super::*;
 use AgentState as S;
+use alloc::collections::BTreeMap;
 
 impl Crowd {
     /// [`Crowd::update`] under a work budget (not in recastnavigation): the workspace's
@@ -52,6 +53,16 @@ impl Crowd {
     /// nonnegative. Workspace limits bound allocation and charged simulation work.
     /// An error can leave earlier phases applied; discard that tick's result.
     pub fn update(&mut self, ws: &mut Workspace, nav: &NavMesh, dt: f32) -> Result<(), Error> {
+        self.update_with_docks(ws, nav, dt, &BTreeMap::new())
+    }
+
+    pub(super) fn update_with_docks(
+        &mut self,
+        ws: &mut Workspace,
+        nav: &NavMesh,
+        dt: f32,
+        dock_openings: &BTreeMap<usize, V3>,
+    ) -> Result<(), Error> {
         ws.begin();
         nonnegative(dt)?;
         // Reserve/query scratch and conservatively charge per-agent local query
@@ -232,8 +243,12 @@ impl Crowd {
             query: &mut self.avoidance,
             orca: &mut orca_scratch,
             orca_neighbours: &mut orca_neighbours,
+            dock_opening: None,
+            #[cfg(feature = "crowd-world")]
+            dock_obstacles: &[],
         };
         for &i in &self.active {
+            scratch.dock_opening = dock_openings.get(&i).copied();
             if let Some((nvel, n)) = phases::avoid(
                 ws,
                 &self.agents[i],
