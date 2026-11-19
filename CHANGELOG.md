@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Tile-cache zones for selected columns via `bake::tile_cache_layers`.
+  `TileCache::update_budgeted` rebuilds affected layers in bounded slices,
+  preserving equal-content refs and applying registered modifiers on replacement.
+  See [Tile-cache zones](docs/TILE-CACHE-ZONES.md).
 - Managed runtime off-mesh connections with stable ids, optional reserved ground
   link slots, typed landing reports, game-controlled availability and versioned
   snapshots. Tile replacement and streaming re-resolve the registered links.
