@@ -67,6 +67,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
+- Shared point goals can use mesh-checked goal slots and optional park or remove
+  arrival policies in both crowd managers, preventing congestion at one destination.
+  Existing arrival behavior remains the default.
 - Persisted nondefault ref layouts now tag bare tile state (DNMS version 2)
   and exported tile bytes (NRFL version 1 trailer). All restore paths check
   provenance before mutation, including colliding numeric refs and bare restore

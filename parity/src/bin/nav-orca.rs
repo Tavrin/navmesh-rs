@@ -8,6 +8,8 @@ fn next<T: std::str::FromStr>(tokens: &mut std::str::SplitWhitespace<'_>) -> T {
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("invalid protocol input"))
 }
+#[path = "../doorway_slots.rs"]
+mod doorway_slots;
 #[path = "../orca_relative.rs"]
 mod relative;
 #[path = "../orca_scenarios.rs"]
@@ -16,6 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("relative-metrics" | "arrival-tails") => {
             relative::run()?;
+            return Ok(());
+        }
+        Some("doorway-slots") => {
+            doorway_slots::run()?;
             return Ok(());
         }
         Some("digest") => {

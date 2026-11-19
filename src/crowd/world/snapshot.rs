@@ -1,6 +1,10 @@
 //! The `'DCRW'` snapshot: a little-endian byte image of a [`CrowdWorld`] for
 //! replays and saves (not in recastnavigation).
 //!
+//! Default worlds retain version 1. Version 2 prefixes each agent with its arrival
+//! policy (u8), arrival distance (f32 bits) and arrived flag (u8). Readers accept
+//! both versions; only opted-in worlds need the extension.
+//!
 //! Layout, version 1: magic `DCRW`, version, world parameters, fixes, the sixteen
 //! filters, the eight avoidance presets, the generation of every agent index, then
 //! each agent's full state in index order, then the path queue's eight request
@@ -156,7 +160,16 @@ fn read_params(i: &mut In<'_>, max_radius: f32) -> Result<AgentParams, Error> {
     Ok(p)
 }
 
-fn write_agent(o: &mut Out, a: &CrowdAgent) {
+fn write_agent(o: &mut Out, a: &CrowdAgent, extended: bool) {
+    if extended {
+        o.u8(match a.params.arrival_policy {
+            ArrivalPolicy::Keep => 0,
+            ArrivalPolicy::Park => 1,
+            ArrivalPolicy::Remove => 2,
+        });
+        o.f32(a.params.arrival_distance);
+        o.u8(u8::from(a.arrived));
+    }
     o.u8(a.state as u8);
     o.u8(a.target_state as u8);
     for v in [a.npos, a.vel, a.nvel, a.dvel] {
@@ -216,9 +229,25 @@ fn read_agent(
     i: &mut In<'_>,
     a: &mut CrowdAgent,
     agents: usize,
+    extended: bool,
     max_radius: f32,
     ws: &mut Workspace,
 ) -> Result<(), Error> {
+    let (policy, distance, arrived) = if extended {
+        let policy = match i.u8()? {
+            0 => ArrivalPolicy::Keep,
+            1 => ArrivalPolicy::Park,
+            2 => ArrivalPolicy::Remove,
+            _ => return Err(bad("arrival policy")),
+        };
+        let distance = i.f32("arrival distance")?;
+        if distance <= 0. {
+            return Err(bad("arrival distance"));
+        }
+        (policy, distance, i.flag("arrived")?)
+    } else {
+        (ArrivalPolicy::Keep, 0.5, false)
+    };
     a.state = match i.u8()? {
         0 => AgentState::Invalid,
         1 => AgentState::Walking,
@@ -273,6 +302,9 @@ fn read_agent(
         a.corners.push(StraightPathPoint { pos, flags, r#ref });
     }
     a.params = read_params(i, max_radius)?;
+    a.params.arrival_policy = policy;
+    a.params.arrival_distance = distance;
+    a.arrived = arrived;
     a.target_ref = i.r()?;
     a.target_pos = i.v3("target")?;
     a.partial = i.flag("partial flag")?;
@@ -317,7 +349,13 @@ impl CrowdWorld {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut o = Out(Vec::new());
         o.bytes(MAGIC);
-        o.u32(VERSION);
+        let extended = self.heavy.iter().any(|a| {
+            a.active
+                && (a.params.arrival_policy != ArrivalPolicy::Keep
+                    || a.params.arrival_distance != 0.5
+                    || a.arrived)
+        });
+        o.u32(if extended { 2 } else { VERSION });
         let p = &self.params;
         o.u32(p.max_agents);
         o.u32(p.max_heavy_agents);
@@ -359,7 +397,7 @@ impl CrowdWorld {
         }
         for &s in &self.heavy_of {
             if s != NONE {
-                write_agent(&mut o, &self.heavy[s as usize]);
+                write_agent(&mut o, &self.heavy[s as usize], extended);
             }
         }
         let q = &self.pathq;
@@ -389,7 +427,8 @@ impl CrowdWorld {
         if &i.take::<4>()? != MAGIC {
             return Err(Error::InvalidSnapshot(E::WrongMagic));
         }
-        if i.u32()? != VERSION {
+        let version = i.u32()?;
+        if version != VERSION && version != 2 {
             return Err(Error::InvalidSnapshot(E::WrongVersion));
         }
         let p = CrowdWorldParams {
@@ -472,7 +511,7 @@ impl CrowdWorld {
                 continue;
             }
             let mut a = CrowdAgent::new_in(&mut ws)?;
-            read_agent(&mut i, &mut a, n, p.max_radius, &mut ws)?;
+            read_agent(&mut i, &mut a, n, version == 2, p.max_radius, &mut ws)?;
             let s = w.heavy.len() as u32;
             w.heavy_of[k] = s;
             w.pos[k] = a.npos;
