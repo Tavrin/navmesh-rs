@@ -8,6 +8,10 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Tile-cache zones for selected columns via `bake::tile_cache_layers`.
+  `TileCache::update_budgeted` rebuilds affected layers in bounded slices,
+  preserving equal-content refs and applying registered modifiers on replacement.
+  See [Tile-cache zones](docs/TILE-CACHE-ZONES.md).
 - Opt-in `dynamic` feature for gates and cost zones over baked polygons. The navmesh
   owns the modifier layer, derives runtime flags and areas on install and reload, and
   toggles stable IDs without rebuilding tiles or advancing their salts. Save the layer

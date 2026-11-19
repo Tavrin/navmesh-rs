@@ -280,6 +280,70 @@ impl<'a> TileTask<'a> {
         self.tw.usage.work
     }
 
+    #[cfg(feature = "tilecache")]
+    pub(super) fn cache_layers(
+        &mut self,
+        compressor: &impl crate::tilecache::LayerCompressor,
+    ) -> Result<Vec<Vec<u8>>, Error> {
+        use crate::tilecache::{LayerHeader, MAX_LAYERS_PER_COLUMN, build_layer};
+
+        // The two pipelines share the filtered, eroded, area-marked input.
+        while !matches!(self.state, State::Distance { .. } | State::Regions { .. }) {
+            if let Advance::Done(..) = self.advance()? {
+                return Err(Error::Failed);
+            }
+        }
+        let chf = match mem::replace(&mut self.state, State::Finished) {
+            State::Distance { chf } | State::Regions { chf } => chf,
+            _ => return Err(Error::Failed),
+        };
+        let cfg = self.cfg;
+        let layers = self.tw.trusted_stage(|ws| {
+            recast::HeightfieldLayerSet::build(ws, &chf, cfg.border_size, cfg.walkable_height)
+        })?;
+        if layers.layers.len() > MAX_LAYERS_PER_COLUMN {
+            return Err(Error::FormatLimit("layers per tile"));
+        }
+        let mut output = self
+            .tw
+            .stage(|ws| ws.vec_with_capacity(layers.layers.len()))?;
+        let mut output_bytes = 0usize;
+        for (i, layer) in layers.layers.iter().enumerate() {
+            let cell = |n| u8::try_from(n).map_err(|_| Error::FormatLimit("layer dimension"));
+            let height = |n| u16::try_from(n).map_err(|_| Error::FormatLimit("layer height"));
+            let mut header = LayerHeader::new(cell(layer.width)?, cell(layer.height)?);
+            header.tx = self.x;
+            header.ty = self.y;
+            header.tlayer = i32::try_from(i).map_err(|_| Error::SizeOverflow)?;
+            header.bmin = layer.bmin;
+            header.bmax = layer.bmax;
+            header.hmin = height(layer.hmin)?;
+            header.hmax = height(layer.hmax)?;
+            header.minx = cell(layer.minx)?;
+            header.maxx = cell(layer.maxx)?;
+            header.miny = cell(layer.miny)?;
+            header.maxy = cell(layer.maxy)?;
+            let data = self.tw.stage(|ws| {
+                build_layer(
+                    ws,
+                    compressor,
+                    &header,
+                    &layer.heights,
+                    &layer.areas,
+                    &layer.cons,
+                )
+            })?;
+            output_bytes = output_bytes
+                .checked_add(data.len())
+                .ok_or(Error::SizeOverflow)?;
+            if output_bytes > self.tw.limits.max_tile_bytes {
+                return Err(Error::LimitExceeded);
+            }
+            output.push(data);
+        }
+        Ok(output)
+    }
+
     /// Runs the next stage. After an error the task must be dropped.
     pub(super) fn advance(&mut self) -> Result<Advance, Error> {
         if let Some(source) = self.source.take() {
