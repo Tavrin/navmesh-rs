@@ -597,10 +597,7 @@ impl<'a> NavMeshQuery<'a> {
                 let Some(poly) = tile.polys.get(ip as usize) else {
                     return true;
                 };
-                if filter.pass_filter(r, tile, poly) && !f(tile, ip as usize, r) {
-                    return false;
-                }
-                true
+                !filter.pass_filter(r, tile, poly) || f(tile, ip as usize, r)
             })
         });
         Ok(())
