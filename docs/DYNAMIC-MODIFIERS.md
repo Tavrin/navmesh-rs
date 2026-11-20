@@ -73,11 +73,28 @@ clearing the entire layer replaces or discards its base edits as well.
 `try_set_dynamic_layer` checks the resulting snapshot against the supplied
 layer's byte limit before changing the mesh. The infallible `set_dynamic_layer`
 also keeps newly captured edits when they grow the snapshot beyond that limit.
-Legacy tile-state restores apply to unmanaged polygons. Newly written unload
-blobs mark directly edited, unmanaged polygons in the existing padding byte.
-On `commit_with_state`, that mark allows a newly registered selector to capture
-the caller state, with explicitly saved base fields taking precedence.
-Unmarked entries on managed polygons use the current layer's result.
+Tile state blobs (`store_tile_state`, and the state returned by `unload_tile`)
+keep their layout and footer version. Each polygon entry's padding byte records
+where the stored values came from:
+
+- 0: an ordinary polygon. Its stored flags and area are applied on restore
+  unless the current layer manages the polygon.
+- 1: written only by `unload_tile`, for an unmanaged polygon with caller edits.
+  On `commit_with_state`, this mark allows a newly registered selector to
+  capture the caller state, with explicitly saved base fields taking precedence.
+- 2: a polygon the layer managed when the state was stored (selected by a spec,
+  enabled or not, or holding a caller base edit). Its stored values are
+  effective ones, so both `restore_tile_state` and `commit_with_state` ignore
+  them and leave the polygon as the layer it has at that moment derives it, over
+  the caller base saved in that layer. A gate opened, removed or moved between
+  saving and restoring therefore leaves no stale effect.
+
+Blobs written before this change carry 0 on managed polygons, so they are read
+as 0: stored values are applied as written unless the current layer manages the
+polygon. Version 0.2.4 and older readers ignore the padding byte and apply the
+stored values of value 2 entries, which is the old behavior. Other padding
+values are ignored. Unmarked entries on managed polygons use the current
+layer's result.
 
 The mesh applies its current layer during add, commit, restore and replacement,
 including install jobs and tile-cache rebuilds. Prepared tiles can be built on

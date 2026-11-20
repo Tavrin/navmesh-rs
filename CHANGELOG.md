@@ -6,6 +6,18 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Fixed
+
+- Saving a tile's state and restoring it, by unloading and reloading the tile or
+  by `store_tile_state` and `restore_tile_state` on a loaded tile, no longer
+  brings back the effect of a gate that was opened, removed or moved in between.
+  Polygons a gate layer manages are now marked in the state's padding byte
+  (value 2) and take their flags and areas from the layer at restore time, over
+  the caller's own values. Padding values are 0 (ordinary), 1 (caller-edited
+  polygon in an unload state) and 2 (managed). States written by earlier
+  versions carry 0 there and load as before, with their stored values applied.
+  Version 0.2.4 and older readers ignore value 2 and apply the stored values.
+
 ## [0.2.4] - 2026-11-20
 
 ### Added
