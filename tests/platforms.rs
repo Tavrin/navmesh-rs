@@ -550,6 +550,22 @@ mod rides {
             }
         }
 
+        #[test]
+        fn restore_rejects_dock_wait_offers_for_unknown_docks() {
+            let frames = lift();
+            let mut bytes = crowd(&frames).to_bytes(&frames);
+            // The last record is the one wait offer, ahead of the checksum.
+            let end = bytes.len() - 32;
+            assert_eq!(bytes[end - 8..end - 4], ALIGHT.0.to_le_bytes());
+            bytes[end - 8..end - 4].copy_from_slice(&99u32.to_le_bytes());
+            let checksum = navmesh_rs::detour::content_hash(&bytes[..end]);
+            bytes[end..].copy_from_slice(&checksum);
+            assert!(matches!(
+                FramedCrowd::from_bytes(&frames, &bytes, Limits::default()),
+                Err(Error::InvalidSnapshot(SnapshotError::InvalidValue(_)))
+            ));
+        }
+
         #[cfg(not(feature = "parallel"))]
         #[test]
         fn crowd_world_rides_lift() {

@@ -69,8 +69,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
-- CrowdWorld writes `DCRW` version 3 for arrival policies or external traversal.
-  It reads both legacy version 2 layouts and still writes version 1 for default worlds.
+- CrowdWorld writes `DCRW` version 4 or later for arrival policies or external traversal.
+  It reads the legacy version 2 and 3 layouts. `to_bytes` records the navmesh change epoch
+  of the last step so a restored world replans exactly where the original would.
+- Tile bytes: trailing bytes that are not an exact 12-byte reference-layout trailer are
+  ignored again, as before layouts existed; a trailer with an unknown version gives
+  `TileDataError::WrongVersion`, and a trailer naming the default layout no longer
+  changes the tile's content hash.
 - `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
   `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
 - `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning

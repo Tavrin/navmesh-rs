@@ -154,7 +154,9 @@ impl FramedCrowd<CrowdWorld> {
             }
             let cost = input.float()?;
             nonnegative(cost).map_err(|_| bad("dock wait cost"))?;
-            restored.waits.insert(id, cost);
+            restored
+                .set_wait_cost(frames, id, Some(cost))
+                .map_err(|_| bad("dock wait dock"))?;
         }
         if !input.0.is_empty() {
             return Err(Error::InvalidSnapshot(SnapshotError::TrailingBytes));

@@ -126,21 +126,24 @@ check integrity. Obtain persisted records from the application's save store.
 On restore, open an empty mesh, restore its residency, then commit the required
 tiles. Saved polygon refs are rebound to the new mesh instance. Restore the
 crowd world after loading its required tiles. An active crowd search must
-still match its mesh when saved. The embedded `DCRW` uses zero in the existing
-search epoch field, and restore rebinds it to the restored mesh's epoch.
+still match its mesh when saved, and a crowd save fails with `MeshChanged` when
+the mesh changed after the last step. The embedded `DCRW` uses zero in the
+search epoch and last-step epoch fields, and restore rebinds both to the
+restored mesh's epochs.
 
 The profile `NPCW` and framed `DCFR` wrappers use the ordinary `DCRW`
 reader and writer. The original base layout (version 1) loads with default
-arrival and traversal settings. The extended layout (version 3) adds the
+arrival and traversal settings. The extended layout (version 4) adds the
 runtime-link epoch and the agents' arrival and external traversal state.
-The reader also accepts the two historical version 2 layouts, each with
-one of those extensions. Version 4 adds deferred replanning state.
+The reader also accepts the two historical layouts, version 2 (arrival state
+only) and version 3 (runtime-link and traversal state only). Version 5 adds
+deferred replanning state and the mesh epoch of the last step.
 
 Mixed crowds save as `NPCM` version 1. The header carries a u64 profile count,
 followed by each profile ID (u32) in ascending order and the SHA-256 of its
-`NPRS` record. A `DCRW` version 5 payload follows, with a u32 profile ID before
+`NPRS` record. A `DCRW` version 6 payload follows, with a u32 profile ID before
 each occupied agent's state and after each queue request handle (zero in a
-free request slot). The remaining fields follow version 4. Save after stepping
+free request slot). The remaining fields follow version 5. Save after stepping
 following mesh edits. Restore residency and modifiers for all registered
 profiles before restoring the crowd. The live sliced search is rebound to
 the reconstructed epoch of its request's mesh.

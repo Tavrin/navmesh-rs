@@ -287,6 +287,23 @@ fn budget_defers_in_index_order_and_survives_snapshot() {
     assert_eq!(step(&mut world, &nav).replans, 0);
 }
 
+#[test]
+fn snapshot_after_an_unstepped_edit_replans_like_the_original() {
+    let mut nav = scene(true, false);
+    install_gate(&mut nav);
+    let mut world = world(&nav);
+    add(&nav, &mut world, [2., 0., 5.]);
+    step(&mut world, &nav);
+    // The edit lands after the last step and before the save.
+    nav.set_modifier_enabled(GATE, true).unwrap();
+    let mut restored = CrowdWorld::from_bytes(&nav, &world.to_bytes(), Limits::UNLIMITED).unwrap();
+    let (original, replayed) = (step(&mut world, &nav), step(&mut restored, &nav));
+    assert_eq!(original.replans, 1);
+    assert_eq!(replayed.replans, original.replans);
+    assert_eq!(restored.digest(), world.digest());
+    assert_eq!(restored.to_bytes(), world.to_bytes());
+}
+
 #[cfg(feature = "parallel")]
 #[test]
 fn stamp_replan_replay_is_identical_across_worker_counts() {

@@ -389,6 +389,40 @@ fn world_replans_and_can_abort_or_restore_a_pending_external_traversal() {
 
 #[cfg(feature = "crowd-world")]
 #[test]
+fn world_rejects_a_pending_traversal_the_live_mesh_does_not_hold() {
+    use navmesh_rs::Budget;
+    use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams, Goal};
+    use navmesh_rs::crowd::{AgentParams, ArrivalPolicy, OffMeshMode};
+
+    let (mut nav, _, b) = scene(1, 0);
+    nav.add_runtime_link(spec(), true).unwrap();
+    let mut w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+    let mut p = AgentParams::default();
+    p.off_mesh = OffMeshMode::External;
+    p.arrival_policy = ArrivalPolicy::Park;
+    let a = w.add_agent(&nav, START, p).unwrap();
+    w.set_goal(&nav, a, Goal::Point { poly: b, pos: END })
+        .unwrap();
+    nav.set_runtime_link_enabled(ID, false).unwrap();
+    w.step(&nav, &mut Budget::unlimited()).unwrap();
+    nav.set_runtime_link_enabled(ID, true).unwrap();
+    w.step(&nav, &mut Budget::unlimited()).unwrap();
+    assert!(w.off_mesh_arrivals().next().is_some());
+    // The same ground tiles without the runtime link: the pending polygon is gone.
+    let mut bare = NavMesh::new(&params()).unwrap();
+    bare.restore_residency(&nav.residency()).unwrap();
+    bare.add_tile(quad(0, 1, 1)).unwrap();
+    bare.add_tile(quad(3, 0, 1)).unwrap();
+    assert_eq!(
+        CrowdWorld::from_bytes(&bare, &w.to_bytes(), Limits::UNLIMITED).err(),
+        Some(Error::InvalidSnapshot(SnapshotError::InvalidValue(
+            "pending external traversal"
+        )))
+    );
+}
+
+#[cfg(feature = "crowd-world")]
+#[test]
 fn framed_world_restores_pending_traversal_and_arrival_policy() {
     use navmesh_rs::Budget;
     use navmesh_rs::crowd::platforms::{FramedCrowd, PlatformAgentId};

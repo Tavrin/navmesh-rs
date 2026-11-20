@@ -994,9 +994,9 @@ fn crowd_world_snapshots_are_bound_to_profile_and_replay_with_restored_refs() {
     params.path_queue.iterations = 1;
     for (arrival_policy, off_mesh, version) in [
         (ArrivalPolicy::Keep, OffMeshMode::Animate, 1u32),
-        (ArrivalPolicy::Park, OffMeshMode::Animate, 3),
-        (ArrivalPolicy::Keep, OffMeshMode::External, 3),
-        (ArrivalPolicy::Park, OffMeshMode::External, 3),
+        (ArrivalPolicy::Park, OffMeshMode::Animate, 4),
+        (ArrivalPolicy::Keep, OffMeshMode::External, 4),
+        (ArrivalPolicy::Park, OffMeshMode::External, 4),
     ] {
         let mut world = ProfileCrowdWorld::new(&a, &params, Limits::default()).unwrap();
         let mut p = AgentParams::default();
