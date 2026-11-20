@@ -36,20 +36,44 @@ pub struct RouteIndex {
 }
 impl RouteIndex {
     /// Builds the directed index for stitched records. Missing destinations and
-    /// records derived solely from isolated sectors are rejected.
+    /// records derived solely from isolated sectors are rejected, and so are exits
+    /// whose destination sector's record lists another content id (records of
+    /// different bakes mixed after a partial re-bake).
     pub fn build_exact(graph: &SectorGraph, profile: u32) -> Result<Self, Error> {
         for record in graph.records(profile) {
             if !record.is_stitched()
                 || record
                     .destinations()
-                    .any(|(k, r)| graph.super_region(profile, k, r).is_none())
+                    .any(|(k, r, _)| graph.super_region(profile, k, r).is_none())
             {
                 return Err(Error::InvalidInput("incomplete stitched graph"));
+            }
+            for (k, _, content) in record.destinations() {
+                let listed = graph
+                    .super_record(profile, graph.params().super_of(k))
+                    .and_then(|d| {
+                        let i = d
+                            .sectors()
+                            .binary_search_by_key(&(k.z, k.x), |(s, _)| (s.z, s.x))
+                            .ok()?;
+                        d.sector_content_ids().get(i).copied()
+                    });
+                if listed != Some(content) {
+                    return Err(Error::InvalidInput("stitched records from different bakes"));
+                }
             }
         }
         Self::build(graph, profile)
     }
     /// Compiles the current graph, rejecting stale records and invalid costs.
+    ///
+    /// Over unstitched records (isolated summaries) the result is a hint, not
+    /// proof: portal overlap is matched symmetrically although links can be
+    /// one-way, an off-mesh link lands in the first region whose box holds its far
+    /// end, and off-mesh links beyond the neighbouring super-sectors are dropped.
+    /// Such an index can report routes that do not exist and miss ones that do.
+    /// Use [`build_exact`](Self::build_exact) on records stitched by
+    /// [`SectorGraph::from_mesh`] for exact reachability.
     pub fn build(graph: &SectorGraph, profile: u32) -> Result<Self, Error> {
         let mut keys = Vec::new();
         for record in graph.records(profile) {

@@ -2,6 +2,8 @@
 
 pub mod bake_world;
 pub mod persisted;
+#[cfg(feature = "route")]
+pub mod route_records;
 
 use navmesh_rs::detour::{self, DefaultFilter, NavMesh, NavMeshCreateParams, NavMeshQuery};
 use navmesh_rs::recast::{

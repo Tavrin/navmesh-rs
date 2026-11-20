@@ -6,7 +6,7 @@ use crate::detour::{
     EXT_LINK, Link, MeshTile, NULL_LINK, NavMesh, NavMeshParams, OFFMESH_CON_BIDIR,
     POLYTYPE_OFFMESH_CONNECTION, Poly, PolyRef, QueryFilter, content_hash,
 };
-use crate::{Budget, Budgeted, Error, Limits};
+use crate::{Budget, Budgeted, Error, Limits, SnapshotError};
 use alloc::collections::{BTreeMap, BinaryHeap};
 use alloc::vec;
 use alloc::vec::Vec;
@@ -15,7 +15,7 @@ use core::cmp::Reverse;
 /// Magic bytes at the start of a sector summary record.
 pub const SECTOR_MAGIC: [u8; 4] = *b"DNSS";
 /// Version of the sector summary record this crate writes and reads.
-pub const SECTOR_VERSION: u16 = 2;
+pub const SECTOR_VERSION: u16 = 3;
 /// Quantized cost of an unreachable transition pair.
 pub const UNREACHABLE: u16 = 0xFFFF;
 
@@ -24,6 +24,7 @@ const TILE: usize = 16;
 const REGION: usize = 28;
 const PORTAL: usize = 36;
 const OFFMESH: usize = 32;
+const EXIT: usize = 16;
 /// Most transitions (portals plus off-mesh entries) of one sector; the cost table of
 /// a full sector is then 32 MiB.
 const MAX_TRANSITIONS: usize = 4096;
@@ -112,7 +113,8 @@ pub struct OffMeshEntry {
 /// `u16`, padding `u16`). Three counted arrays follow, each prefixed by a `u32`:
 /// directed region pairs (two `u16`), polygon membership run starts (tile `u16`,
 /// polygon `u32`, region `u16`, with 65535 marking filtered or past-end), and
-/// stitched exits (from `u16`, sector x and z `i32`, to `u16`). The final
+/// stitched exits (from `u16`, sector x and z `i32`, to `u16`, destination
+/// [`content_id`](Self::content_id) `u32`). The final
 /// `N x N` cost table is ordered by source row, then destination column.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectorSummary {
@@ -130,7 +132,9 @@ pub struct SectorSummary {
     costs: Vec<u16>,
     pub(super) arcs: Vec<(u16, u16)>,
     membership: Vec<(u16, u32, u16)>,
-    pub(super) exits: Option<Vec<(u16, SectorKey, u16)>>,
+    /// Stitched exits: source region, destination sector, destination region and
+    /// the destination summary's [`content_id`](Self::content_id).
+    pub(super) exits: Option<Vec<(u16, SectorKey, u16, u32)>>,
 }
 
 fn charge(budget: &mut Budget, n: u64) -> Result<(), Error> {
@@ -241,8 +245,9 @@ impl SectorSummary {
     /// Reads only tiles inside the sector and links between them; neighbours being
     /// resident or not changes nothing. The result is a pure function of the sector's
     /// tile bytes, the filter and `params`. One budget unit per polygon, link, edge,
-    /// heap pop and relaxation; exhaustion returns no summary (call again with a larger
-    /// budget). Errors: [`Error::InvalidParameter`] for bad `params`,
+    /// heap pop and relaxation, plus one per cell of the `N x N` transition cost table
+    /// for each of its allocation, its fill and its quantization, charged before that
+    /// work; exhaustion returns no summary (call again with a larger budget). Errors: [`Error::InvalidParameter`] for bad `params`,
     /// [`Error::FormatLimit`] for more than 65,535 tiles, regions or portals or more
     /// than 4,096 transitions.
     pub fn build<F: QueryFilter + ?Sized>(
@@ -631,7 +636,10 @@ impl SectorSummary {
         if n > MAX_TRANSITIONS {
             return Err(Error::FormatLimit("sector transitions"));
         }
-        // Exact transition-to-transition costs: one Dijkstra per source.
+        // Exact transition-to-transition costs: one Dijkstra per source. The table is
+        // charged before it is allocated.
+        let cells = (n as u64) * (n as u64);
+        charge(budget, cells)?;
         let mut raw = vec![f32::INFINITY; n * n];
         let mut dist = vec![f32::INFINITY; nodes.len()];
         let mut from = vec![NONE; nodes.len()];
@@ -688,6 +696,7 @@ impl SectorSummary {
                     }
                 }
             }
+            charge(budget, n as u64)?;
             for (ti, target) in seeds.iter().enumerate() {
                 let g = target.node as usize;
                 let v = if ti == si {
@@ -707,7 +716,8 @@ impl SectorSummary {
             }
         }
         // Floor quantization against a per-sector quantum: never saturates, always a
-        // lower bound.
+        // lower bound. Two passes over the table.
+        charge(budget, cells.saturating_mul(2))?;
         let max_cost = raw
             .iter()
             .copied()
@@ -799,6 +809,30 @@ impl SectorSummary {
     pub fn tiles(&self) -> &[SectorTile] {
         &self.tiles
     }
+    /// Fingerprint of the bake this summary's region numbering comes from: FNV-1a
+    /// over the sector key, sector size, profile and every source tile's coordinates
+    /// and content id. Stitched exits into this sector carry it, so records from
+    /// different bakes are detected where they are combined. It excludes the
+    /// summary's own exits, so it is defined before any sector is stitched.
+    pub fn content_id(&self) -> u32 {
+        let mut h = 0x811c_9dc5u32;
+        let mut eat = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+            }
+        };
+        eat(&self.key.x.to_le_bytes());
+        eat(&self.key.z.to_le_bytes());
+        eat(&self.tiles_per_sector.to_le_bytes());
+        eat(&self.profile.to_le_bytes());
+        for t in &self.tiles {
+            eat(&t.x.to_le_bytes());
+            eat(&t.z.to_le_bytes());
+            eat(&[t.layer]);
+            eat(&t.content_id.to_le_bytes());
+        }
+        h
+    }
     /// Regions, numbered by their first polygon in (tile, polygon index) order.
     pub fn regions(&self) -> &[Region] {
         &self.regions
@@ -843,7 +877,7 @@ impl SectorSummary {
             + self.arcs.len() * 4
             + self.membership.len() * 8
             + 4
-            + self.exits.as_ref().map_or(0, |e| 12 * e.len())
+            + self.exits.as_ref().map_or(0, |e| EXIT * e.len())
             + 2 * n * n
     }
 
@@ -910,11 +944,12 @@ impl SectorSummary {
         }
         let exits = self.exits.as_deref().unwrap_or_default();
         w.u32(exits.len() as u32);
-        for &(a, k, b) in exits {
+        for &(a, k, b, c) in exits {
             w.u16(a);
             w.i32(k.x);
             w.i32(k.z);
             w.u16(b);
+            w.u32(c);
         }
         for &c in &self.costs {
             w.u16(c);
@@ -923,18 +958,27 @@ impl SectorSummary {
     }
 
     /// Decodes and validates a `'DNSS'` record. Accepted bytes re-encode to the same
-    /// bytes. Errors: [`Error::InvalidInput`] for a wrong magic, version, flags,
-    /// padding, length, non-finite or unordered float, out-of-range index or side, a
-    /// tile outside the sector, unsorted tiles, or a nonzero cost diagonal;
-    /// [`Error::FormatLimit`] for more than 4,096 transitions;
-    /// [`Error::LimitExceeded`] above `limits.max_bytes`.
+    /// bytes. Errors: [`Error::InvalidSnapshot`] with
+    /// [`SnapshotError::WrongVersion`](crate::SnapshotError::WrongVersion) for another
+    /// record version; [`Error::InvalidInput`] for a wrong magic, flags, padding,
+    /// length, non-finite or unordered float, out-of-range index or side, a tile
+    /// outside the sector, unsorted tiles, a portal whose tile is not on its side, a
+    /// self-loop exit, an exit into this sector with another content id, a nonzero
+    /// cost diagonal, or a finite cost between transitions the region arcs do not
+    /// connect; [`Error::FormatLimit`] for more than 4,096 transitions;
+    /// [`Error::LimitExceeded`] above `limits.max_bytes`, or when the connectivity
+    /// check would exceed `limits.max_work` (one unit per region visit, arc and
+    /// checked cost row entry).
     pub fn from_bytes(data: &[u8], limits: &Limits) -> Result<Self, Error> {
         check_bytes(data.len(), limits)?;
         let mut r = Reader::new(data, "sector summary");
         let magic = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
         r.require(magic == SECTOR_MAGIC)?;
         let (version, flags) = (r.u16()?, r.u16()?);
-        r.require(version == SECTOR_VERSION && flags <= 1)?;
+        if version != SECTOR_VERSION {
+            return Err(Error::InvalidSnapshot(SnapshotError::WrongVersion));
+        }
+        r.require(flags <= 1)?;
         let key = SectorKey {
             x: r.i32()?,
             z: r.i32()?,
@@ -1008,6 +1052,15 @@ impl SectorSummary {
             r.require(matches!(p.side, 0 | 2 | 4 | 6) && p.split <= 2)?;
             r.require(usize::from(p.region) < nr && usize::from(p.tile_index) < nt)?;
             r.require(ordered(p.extent[0], p.extent[1]) && ordered(p.y_range[0], p.y_range[1]))?;
+            // A portal lies on its sector side, so its tile is in that border column.
+            let t = &tiles[usize::from(p.tile_index)];
+            let (lx, lz) = (i64::from(t.x) - x0, i64::from(t.z) - z0);
+            r.require(match p.side {
+                0 => lx == k - 1,
+                4 => lx == 0,
+                2 => lz == k - 1,
+                _ => lz == 0,
+            })?;
             portals.push(p);
         }
         let mut offmesh = Vec::with_capacity(nm);
@@ -1072,7 +1125,11 @@ impl SectorSummary {
         let ne = r.u32()? as usize;
         r.require(
             (flags == 1 || ne == 0)
-                && expected as u64 + 12 + na as u64 * 4 + nmembers as u64 * 8 + ne as u64 * 12
+                && expected as u64
+                    + 12
+                    + na as u64 * 4
+                    + nmembers as u64 * 8
+                    + ne as u64 * EXIT as u64
                     == data.len() as u64,
         )?;
         let mut exits = Vec::with_capacity(ne);
@@ -1084,15 +1141,15 @@ impl SectorSummary {
                     z: r.i32()?,
                 },
                 r.u16()?,
+                r.u32()?,
             );
             r.require(
                 usize::from(e.0) < nr
-                    && !(e.1 == key && usize::from(e.2) >= nr)
+                    && !(e.1 == key && (usize::from(e.2) >= nr || e.2 == e.0))
                     && exits.last().is_none_or(|p| *p < e),
             )?;
             exits.push(e);
         }
-        let exits = (flags == 1).then_some(exits);
         let mut costs = Vec::with_capacity(n * n);
         for i in 0..n * n {
             let c = r.u16()?;
@@ -1100,7 +1157,14 @@ impl SectorSummary {
             costs.push(c);
         }
         r.finish()?;
-        Ok(SectorSummary {
+        let region_of = |t: usize| {
+            portals
+                .get(t)
+                .map_or_else(|| offmesh[t - np].region, |p| p.region)
+        };
+        reachable_costs(&arcs, nr, n, &costs, region_of, limits).and_then(|ok| r.require(ok))?;
+        let exits = (flags == 1).then_some(exits);
+        let summary = SectorSummary {
             key,
             tiles_per_sector,
             layers,
@@ -1116,8 +1180,76 @@ impl SectorSummary {
             arcs,
             membership,
             exits,
-        })
+        };
+        let own = summary.content_id();
+        r.require(
+            summary
+                .exits
+                .iter()
+                .flatten()
+                .all(|e| e.1 != key || e.3 == own),
+        )?;
+        Ok(summary)
     }
+}
+
+/// Whether every finite cost joins two transitions whose regions are connected by
+/// directed region arcs (the cost table cannot claim a path the arcs rule out).
+/// Charges one unit per region visit, arc and checked cost against
+/// `limits.max_work`.
+fn reachable_costs(
+    arcs: &[(u16, u16)],
+    regions: usize,
+    n: usize,
+    costs: &[u16],
+    region_of: impl Fn(usize) -> u16,
+    limits: &Limits,
+) -> Result<bool, Error> {
+    let mut budget = Budget::from_limits(limits);
+    // Arcs are sorted by source: offsets of each region's outgoing arcs.
+    let mut first = vec![0usize; regions + 1];
+    for &(a, _) in arcs {
+        first[usize::from(a) + 1] += 1;
+    }
+    for i in 0..regions {
+        first[i + 1] += first[i];
+    }
+    let mut rows: Vec<(u16, usize)> = (0..n).map(|t| (region_of(t), t)).collect();
+    rows.sort_unstable();
+    let mut seen = vec![usize::MAX; regions];
+    let mut stack = Vec::new();
+    let mut at = 0;
+    while at < rows.len() {
+        let source = rows[at].0;
+        charge(&mut budget, 1)?;
+        seen[usize::from(source)] = at;
+        stack.push(source);
+        while let Some(r) = stack.pop() {
+            let r = usize::from(r);
+            for &(_, b) in &arcs[first[r]..first[r + 1]] {
+                charge(&mut budget, 1)?;
+                if seen[usize::from(b)] != at {
+                    seen[usize::from(b)] = at;
+                    stack.push(b);
+                }
+            }
+        }
+        let stamp = at;
+        while let Some(&(region, from)) = rows.get(at) {
+            if region != source {
+                break;
+            }
+            charge(&mut budget, n as u64)?;
+            for to in 0..n {
+                if costs[from * n + to] != UNREACHABLE && seen[usize::from(region_of(to))] != stamp
+                {
+                    return Ok(false);
+                }
+            }
+            at += 1;
+        }
+    }
+    Ok(true)
 }
 
 /// Summarizes one sector from its tile bytes alone, as a bake does: the tiles are

@@ -15,12 +15,39 @@ use alloc::{
 use core::cmp::Reverse;
 
 type Region = (SectorKey, u16);
+/// Euclidean distance, never infinite for finite points: far-apart huge coordinates
+/// fall back to double precision and saturate at `f32::MAX`.
 pub(super) fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
-    crate::common::sqrtf(
+    let d = crate::common::sqrtf(
         (a[0] - b[0]) * (a[0] - b[0])
             + (a[1] - b[1]) * (a[1] - b[1])
             + (a[2] - b[2]) * (a[2] - b[2]),
-    )
+    );
+    if d.is_finite() {
+        return d;
+    }
+    // Scale by the largest component so the square root sees values of at most 3.
+    let delta = [0, 1, 2].map(|i| f64::from(a[i]) - f64::from(b[i]));
+    let m = delta.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    if m.is_nan() || m == 0.0 {
+        return if m == 0.0 { 0.0 } else { f32::MAX };
+    }
+    let unit: f64 = delta.iter().map(|v| (v / m) * (v / m)).sum();
+    (m * f64::from(crate::common::sqrtf(unit as f32))).min(f64::from(f32::MAX)) as f32
+}
+
+/// A label cost that stays ordered: overflow saturates at `f32::MAX` instead of
+/// becoming infinite (which would read as unreachable).
+fn saturated(cost: f32) -> f32 {
+    if cost.is_finite() { cost } else { f32::MAX }
+}
+
+/// Charges `n` units: what the budget has left now, the rest as debt the request
+/// pays before its next step.
+fn owe(budget: &mut Budget, debt: &mut u64, n: u64) {
+    let now = n.min(budget.remaining());
+    budget.spend(now);
+    *debt = debt.saturating_add(n - now);
 }
 #[derive(Clone, Copy)]
 struct Portal {
@@ -55,12 +82,22 @@ impl<'a> RouteAtlas<'a> {
             return Err(Error::InvalidParameter("route area cost"));
         }
         let profile = profile_hash(&filter);
+        // The profile id is a 32-bit hash: bind to the whole filter, bit for bit.
+        let same_filter = graph.bound_filter.as_ref().is_some_and(|f| {
+            f.include_flags == filter.include_flags
+                && f.exclude_flags == filter.exclude_flags
+                && f.area_cost
+                    .iter()
+                    .zip(&filter.area_cost)
+                    .all(|(a, b)| a.to_bits() == b.to_bits())
+        });
         if graph.bound_epoch != Some(nav.epoch())
             || !graph
                 .owner
                 .as_ref()
                 .is_some_and(|owner| alloc::sync::Arc::ptr_eq(owner, nav.report_identity()))
             || graph.bound_profile != Some(profile)
+            || !same_filter
         {
             return Err(Error::MeshChanged);
         }
@@ -158,13 +195,28 @@ impl<'a> RouteAtlas<'a> {
             epoch: nav.epoch(),
         })
     }
-    fn missing(&self, nav: &NavMesh, sector: SectorKey) -> bool {
-        nav.epoch() != self.epoch
-            && self.graph.sector(self.profile, sector).is_some_and(|s| {
-                s.tiles()
-                    .iter()
-                    .any(|t| nav.tile_index_at(t.x, t.z, i32::from(t.layer)).is_none())
-            })
+    /// Whether a tile of `sector` is not resident. A scan (only after streaming)
+    /// charges one unit per tile examined.
+    fn missing(
+        &self,
+        nav: &NavMesh,
+        sector: SectorKey,
+        budget: &mut Budget,
+        debt: &mut u64,
+    ) -> bool {
+        if nav.epoch() == self.epoch {
+            return false;
+        }
+        let Some(s) = self.graph.sector(self.profile, sector) else {
+            return false;
+        };
+        let mut scanned = 0;
+        let gone = s.tiles().iter().any(|t| {
+            scanned += 1;
+            nav.tile_index_at(t.x, t.z, i32::from(t.layer)).is_none()
+        });
+        owe(budget, debt, scanned);
+        gone
     }
     fn region(&self, nav: &NavMesh, r: PolyRef) -> Result<Region, Error> {
         let (_, slot, poly) = nav.decode_poly_id(r);
@@ -357,8 +409,21 @@ struct Request<'a> {
     spare: Option<PortalWindow>,
     skip: usize,
     lookahead: usize,
+    /// Work already done but not yet charged (allocation, finalization, string
+    /// pulling, tile scans); paid before the next step.
+    debt: u64,
+    /// The next single-sector window uses the whole node pool (after a smaller
+    /// window ran out of nodes).
+    wide: bool,
+    /// Node pool of the current single-sector window.
+    pool: usize,
 }
 const START: usize = usize::MAX;
+/// Node limit of the first-move prefix search.
+const PREFIX_NODES: usize = 256;
+/// Node-pool entries a work unit pays for when a refinement window allocates its
+/// pool (the pool is initialized in full).
+const NODES_PER_UNIT: usize = 256;
 impl<'a> Request<'a> {
     fn step(
         &mut self,
@@ -367,6 +432,14 @@ impl<'a> Request<'a> {
         nodes: usize,
         budget: &mut Budget,
     ) -> Result<(), Error> {
+        if self.debt > 0 {
+            let now = self.debt.min(budget.remaining());
+            budget.spend(now);
+            self.debt -= now;
+            if self.debt > 0 {
+                return Ok(());
+            }
+        }
         if let Some(coarse) = &mut self.coarse {
             if coarse.resume(atlas.graph, budget)?.is_done() {
                 let path = coarse.corridor_reversed().ok_or(Error::Failed)?;
@@ -402,15 +475,17 @@ impl<'a> Request<'a> {
                     .entry
                     .zip(p.exit)
                     .and_then(|(a, b)| expansion.sector.cost(a, b));
-                let direct = distance(expansion.position, p.crossing.position) * atlas.minimum;
-                let d = expansion.cost + table.unwrap_or(direct).max(direct);
+                // Saturating sums keep huge coordinates ordered and finite (an
+                // infinite label would read as unreachable, and 0 x inf as NaN).
+                let direct =
+                    saturated(distance(expansion.position, p.crossing.position) * atlas.minimum);
+                let d = saturated(expansion.cost + table.unwrap_or(direct).max(direct));
                 if self.labels.improve(next, d, expansion.parent) {
-                    self.open.push(Reverse((
-                        (d + atlas.minimum * distance(p.crossing.position, self.goal.position))
-                            .to_bits(),
-                        d.to_bits(),
-                        next,
-                    )));
+                    let h = saturated(
+                        atlas.minimum * distance(p.crossing.position, self.goal.position),
+                    );
+                    self.open
+                        .push(Reverse((saturated(d + h).to_bits(), d.to_bits(), next)));
                 }
             }
             self.active = None;
@@ -472,7 +547,7 @@ impl<'a> Request<'a> {
         budget: &mut Budget,
     ) -> Result<(), Error> {
         if self.fine.is_none() {
-            if atlas.missing(nav, self.region.0) {
+            if atlas.missing(nav, self.region.0, budget, &mut self.debt) {
                 self.state = RouteState::Waiting(self.region.0);
                 return Ok(());
             }
@@ -510,15 +585,16 @@ impl<'a> Request<'a> {
                 target,
                 alloc::vec![self.region.0],
                 &atlas.filter,
-                nodes.min(256),
+                PREFIX_NODES.min(nodes),
             ));
         }
+        // The prefix search is sized for its hash table: it stays short.
         let result = self.fine.as_mut().ok_or(Error::Failed)?.resume(
             nav,
             atlas.graph.params(),
             &atlas.filter,
             budget,
-            nodes,
+            PREFIX_NODES.min(nodes),
             true,
             |r| atlas.region(nav, r) == Ok(self.region),
         );
@@ -562,7 +638,7 @@ impl<'a> Request<'a> {
                 if plan.crossings < self.lookahead.min(self.route.len()) {
                     let id = self.route[self.route.len() - 1 - plan.crossings];
                     let key = atlas.portals[id].crossing.sector;
-                    if atlas.missing(nav, key) {
+                    if atlas.missing(nav, key, budget, &mut self.debt) {
                         self.state = RouteState::Waiting(key);
                         return Ok(true);
                     }
@@ -577,7 +653,7 @@ impl<'a> Request<'a> {
                         z: k.z.saturating_add(offset % 3 - 1),
                     };
                     if atlas.graph.sector(atlas.profile, key).is_some() {
-                        if atlas.missing(nav, key) {
+                        if atlas.missing(nav, key, budget, &mut self.debt) {
                             self.state = RouteState::Waiting(key);
                             return Ok(true);
                         }
@@ -648,12 +724,13 @@ impl<'a> Request<'a> {
             let next = self.route.last().map(|&i| atlas.portals[i].crossing);
             let end = next.map_or(self.goal, |c| WindowPoint::new(c.exit, c.position));
             // A complete sector is needed to reproduce the full-residency window.
-            for t in atlas
+            let tiles = atlas
                 .graph
                 .sector(atlas.profile, self.region.0)
                 .ok_or(Error::MeshChanged)?
-                .tiles()
-            {
+                .tiles();
+            owe(budget, &mut self.debt, tiles.len() as u64);
+            for t in tiles {
                 if nav.tile_index_at(t.x, t.z, i32::from(t.layer)).is_none() {
                     self.state = RouteState::Waiting(self.region.0);
                     return Ok(());
@@ -690,6 +767,15 @@ impl<'a> Request<'a> {
                 .sector(atlas.profile, self.region.0)
                 .ok_or(Error::MeshChanged)?
                 .polygon_count() as usize;
+            // A small pool first; after it runs out, the whole pool, which
+            // `Navigator::new` sized to hold any sector of the atlas.
+            let pool = if self.wide {
+                nodes
+            } else {
+                nodes.min(polys.saturating_mul(4).max(8))
+            };
+            owe(budget, &mut self.debt, pool.div_ceil(NODES_PER_UNIT) as u64);
+            self.pool = pool;
             self.window = Some(CorridorWindow::new(
                 nav,
                 atlas.graph.params(),
@@ -697,7 +783,7 @@ impl<'a> Request<'a> {
                 atlas.filter.clone(),
                 self.start,
                 end,
-                nodes.min(polys.saturating_mul(4).max(8)),
+                pool,
             )?);
             return Ok(());
         }
@@ -706,11 +792,25 @@ impl<'a> Request<'a> {
             return Ok(());
         }
         let status = w.finish(nav, nodes)?;
+        owe(
+            budget,
+            &mut self.debt,
+            w.result().map_or(0, |(corridor, _)| corridor.len() as u64),
+        );
         if status
             .has_detail(Status::PARTIAL_RESULT | Status::BUFFER_TOO_SMALL | Status::OUT_OF_NODES)
         {
+            self.window = None;
+            // Out of nodes in a smaller pool: retry the same window with the whole
+            // pool before failing. A partial result in a complete pool means the
+            // endpoint is unreachable inside the window; a larger pool cannot help.
+            if !self.wide && status.has_detail(Status::OUT_OF_NODES) && self.pool < nodes {
+                self.wide = true;
+                return Ok(());
+            }
             return Err(Error::LimitExceeded);
         }
+        self.wide = false;
         self.segment = w.take_corridor();
         if let Some(&i) = self.route.last() {
             let c = atlas.portals[i].crossing;
@@ -739,8 +839,21 @@ pub struct Navigator<'a> {
 }
 impl<'a> Navigator<'a> {
     /// Creates a scheduler with a bounded Detour node pool per active window.
+    ///
+    /// `nodes` must hold every passable polygon of the atlas's largest sector, so a
+    /// single-sector refinement window can always complete. Errors:
+    /// [`Error::InvalidParameter`] when `nodes` is above 65,535 or below that
+    /// polygon count (or zero).
     pub fn new(atlas: &'a RouteAtlas<'a>, nodes: usize) -> Result<Self, Error> {
-        if !(1..=65535).contains(&nodes) {
+        let largest = atlas
+            .graph
+            .sectors
+            .iter()
+            .filter(|((p, _), _)| *p == atlas.profile)
+            .map(|(_, s)| s.polygon_count() as usize)
+            .max()
+            .unwrap_or(0);
+        if !(largest.max(1)..=65535).contains(&nodes) {
             return Err(Error::InvalidParameter("window nodes"));
         }
         Ok(Self {
@@ -818,6 +931,9 @@ impl<'a> Navigator<'a> {
                 fine: None,
                 spare: None,
                 skip: 0,
+                debt: 0,
+                wide: false,
+                pool: 0,
                 lookahead: if self
                     .atlas
                     .graph
@@ -837,26 +953,42 @@ impl<'a> Navigator<'a> {
         Ok(id)
     }
     /// Validates an intervening mesh edit and wakes waiting windows after streaming.
-    /// Call outside the frame budget. An edit to content invalidates the atlas.
+    /// Call outside the frame budget. An edit to content invalidates the atlas and
+    /// fails every request with [`Error::MeshChanged`]. A request whose published
+    /// segment or prefix crosses an unloaded tile fails alone, with
+    /// [`RouteState::Failed`]`(`[`Error::MeshChanged`]`)`; the others continue.
     pub fn sync(&mut self, nav: &NavMesh) -> Result<(), Error> {
         if let Err(error) = self.atlas.validate(nav, self.epoch) {
             self.invalidate();
             return Err(error);
         }
         if nav.epoch() != self.epoch {
-            if self.requests.values().any(|r| {
-                r.held_prefix
-                    .as_ref()
-                    .is_some_and(|p| p.path.iter().any(|r| nav.ref_state(*r) != RefState::Valid))
-                    || r.state == RouteState::Segment
+            let lost: Vec<RequestId> = self
+                .requests
+                .iter()
+                .filter(|(_, r)| {
+                    r.held_prefix.as_ref().is_some_and(|p| {
+                        p.path.iter().any(|r| nav.ref_state(*r) != RefState::Valid)
+                    }) || r.state == RouteState::Segment
                         && r.segment
                             .iter()
                             .any(|p| nav.ref_state(*p) != RefState::Valid)
-            }) {
-                self.invalidate();
-                return Err(Error::MeshChanged);
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            for id in &lost {
+                self.ready.retain(|_, queue| {
+                    queue.retain(|k| k != id);
+                    !queue.is_empty()
+                });
+                if let Some(r) = self.requests.get_mut(id) {
+                    Self::fail(r);
+                }
             }
             for (&id, r) in &mut self.requests {
+                if lost.contains(&id) {
+                    continue;
+                }
                 r.plan = None;
                 r.fine = None;
                 r.window = None;
@@ -875,12 +1007,16 @@ impl<'a> Navigator<'a> {
     fn invalidate(&mut self) {
         self.ready.clear();
         for r in self.requests.values_mut() {
-            r.window = None;
-            r.held_prefix = None;
-            r.fine = None;
-            r.segment.clear();
-            r.state = RouteState::Failed(Error::MeshChanged);
+            Self::fail(r);
         }
+    }
+    fn fail(r: &mut Request<'_>) {
+        r.window = None;
+        r.held_prefix = None;
+        r.fine = None;
+        r.segment.clear();
+        r.corners.clear();
+        r.state = RouteState::Failed(Error::MeshChanged);
     }
     /// Runs one request for at most the given slice of the caller's shared budget.
     /// Returns true when a request ran. False ends the update loop when the
@@ -894,7 +1030,11 @@ impl<'a> Navigator<'a> {
         if nav.epoch() != self.epoch {
             return Err(Error::MeshChanged);
         }
-        self.atlas.validate(nav, self.epoch)?;
+        if let Err(error) = self.atlas.validate(nav, self.epoch) {
+            // Never leave a corridor through the edit readable from the getters.
+            self.invalidate();
+            return Err(error);
+        }
         let limit = budget.remaining().min(max_unit);
         if limit == 0 {
             return Ok(false);
@@ -916,6 +1056,9 @@ impl<'a> Navigator<'a> {
             }
         }
         if r.state == RouteState::Segment {
+            // The funnel examines each corridor portal once (plus the query setup);
+            // what the slice cannot pay now is paid before the request's next step.
+            owe(&mut slice, &mut r.debt, r.segment.len() as u64 + 2);
             let pulled = crate::detour::NavMeshQuery::new(nav, 1).and_then(|q| {
                 let status = q.find_straight_path(
                     &origin,
@@ -1023,5 +1166,25 @@ impl<'a> Navigator<'a> {
             !queue.is_empty()
         });
         self.requests.remove(&id).is_some()
+    }
+}
+
+#[cfg(test)]
+mod label_regression {
+    use super::{distance, saturated};
+
+    #[test]
+    fn huge_coordinates_keep_labels_finite_and_ordered() {
+        let (a, b) = ([-3e38f32, 0.0, -3e38], [3e38f32, 0.0, 3e38]);
+        // The single-precision sum overflows; the distance must not.
+        let d = distance(a, b);
+        assert_eq!(d, f32::MAX);
+        // A zero minimum area cost gives zero, not NaN (0 x inf).
+        assert_eq!(saturated(d * 0.0), 0.0);
+        // A label past the largest float still orders before "unreached".
+        let label = saturated(d + d * 2.0);
+        assert!(label.is_finite() && label < f32::INFINITY);
+        assert_eq!(distance([0.0; 3], [3.0, 0.0, 4.0]), 5.0);
+        assert!((distance([1e30, 0.0, 0.0], [-1e30, 0.0, 0.0]) / 2e30 - 1.0).abs() < 1e-6);
     }
 }

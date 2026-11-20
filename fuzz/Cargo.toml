@@ -56,6 +56,7 @@ bench = false
 [features]
 parallel = ["navmesh-rs/parallel", "dep:rayon"]
 dynamic = ["navmesh-rs/dynamic"]
+route = ["navmesh-rs/route"]
 
 [[bin]]
 name = "parallel_bake"
@@ -255,3 +256,19 @@ path = "fuzz_targets/framed_profile_crowd.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "sector_summary"
+path = "fuzz_targets/sector_summary.rs"
+test = false
+doc = false
+bench = false
+required-features = ["route"]
+
+[[bin]]
+name = "super_record"
+path = "fuzz_targets/super_record.rs"
+test = false
+doc = false
+bench = false
+required-features = ["route"]
