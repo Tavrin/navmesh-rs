@@ -8,7 +8,8 @@ use super::math::*;
 use super::tile::{MeshTile, Poly, peek_header};
 use super::{
     DETAIL_EDGE_BOUNDARY, EXT_LINK, NAVMESH_STATE_MAGIC, NAVMESH_STATE_VERSION, NULL_LINK,
-    OFFMESH_CON_BIDIR, POLYTYPE_OFFMESH_CONNECTION, PolyRef, TileRef, VERTS_PER_POLYGON,
+    OFFMESH_CON_BIDIR, OffMeshKind, POLYTYPE_OFFMESH_CONNECTION, PolyRef, TileRef,
+    VERTS_PER_POLYGON,
 };
 use crate::common::floorf;
 use crate::{Error, Limits, TileDataError};
@@ -700,6 +701,7 @@ enum OffMeshPair {
     Legacy,
     Global,
     Baked,
+    RefreshSteps,
 }
 
 // A sampled landing is inside its ground polygon. Rank stacked polygons by
@@ -1989,8 +1991,11 @@ impl NavMesh {
         for i in 0..ncons {
             let tt = self.tile_unchecked(target as u32);
             let con = tt.off_mesh_cons[i];
-            let baked = con.kind().is_some();
-            if baked != (pair == OffMeshPair::Baked) {
+            let kind = con.kind();
+            let baked = kind.is_some();
+            if baked != matches!(pair, OffMeshPair::Baked | OffMeshPair::RefreshSteps)
+                || (pair == OffMeshPair::RefreshSteps && kind != Some(OffMeshKind::Step))
+            {
                 continue;
             }
             match pair {
@@ -2002,7 +2007,7 @@ impl NavMesh {
                 {
                     continue;
                 }
-                OffMeshPair::Baked => {
+                OffMeshPair::Baked | OffMeshPair::RefreshSteps => {
                     let landing = &self.tile_unchecked(ti as u32).header;
                     if self.baked_link_destination(tt, &con)
                         != (landing.x, landing.y, landing.layer)
@@ -2029,6 +2034,22 @@ impl NavMesh {
             };
             if sqr(nearest[0] - p[0]) + sqr(nearest[2] - p[2]) > sqr(con.rad) {
                 continue;
+            }
+            if kind == Some(OffMeshKind::Step) {
+                let end = tile_base | ip as PolyRef;
+                let duplicate = self.legacy_covers_step(tt, cp, end);
+                if duplicate || pair == OffMeshPair::RefreshSteps {
+                    let attached = Self::poly_links(tt, cp).any(|link| link.edge == 1);
+                    if duplicate {
+                        if attached {
+                            remove_links_where(self.tile_mut(target), Some(cp), |r| r == end);
+                        }
+                        continue;
+                    }
+                    if attached {
+                        continue;
+                    }
+                }
             }
             let tt = self.tile_mut(target);
             let v = tt.polys[cp].verts[1] as usize * 3;
@@ -2070,6 +2091,34 @@ impl NavMesh {
                 }
             }
         }
+    }
+
+    fn poly_links(tile: &MeshTile, poly: usize) -> impl Iterator<Item = &super::Link> {
+        core::iter::successors(
+            tile.links.get(tile.polys[poly].first_link as usize),
+            |link| tile.links.get(link.next as usize),
+        )
+    }
+
+    // The departure and both connection polygons are in the owner tile.
+    // Their attached end refs identify the exact directed pair across a seam.
+    fn legacy_covers_step(&self, tile: &MeshTile, step: usize, end: PolyRef) -> bool {
+        let Some(start) = Self::poly_links(tile, step).find(|link| link.edge == 0) else {
+            return false;
+        };
+        let first = tile.header.off_mesh_base as usize;
+        let (_, owner, start_poly) = self.decode_poly_id(start.r#ref);
+        Self::poly_links(tile, start_poly as usize).any(|link| {
+            let (_, slot, poly) = self.decode_poly_id(link.r#ref);
+            let poly = poly as usize;
+            if slot != owner || poly < first {
+                return false;
+            }
+            tile.off_mesh_cons
+                .get(poly - first)
+                .is_some_and(|con| con.kind().is_none())
+                && Self::poly_links(tile, poly).any(|link| link.edge == 1 && link.r#ref == end)
+        })
     }
 
     fn baked_link_destination(
@@ -2300,6 +2349,23 @@ impl NavMesh {
             }
             self.reset_global_endpoints(&resident);
             self.global_off_mesh = false;
+        }
+        for &owner in &resident {
+            if !self
+                .tile_unchecked(owner as u32)
+                .off_mesh_cons
+                .iter()
+                .any(|con| con.kind() == Some(OffMeshKind::Step))
+            {
+                continue;
+            }
+            for (x, y, layer) in self.baked_destinations(owner) {
+                if let Some(landing) = self.tile_index_at(x, y, layer)
+                    && owner != landing
+                {
+                    self.link_off_mesh(landing, owner, -1, OffMeshPair::RefreshSteps);
+                }
+            }
         }
     }
 

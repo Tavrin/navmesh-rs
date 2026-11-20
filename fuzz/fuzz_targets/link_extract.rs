@@ -53,12 +53,7 @@ fuzz_target!(|data: &[u8]| {
         0.,
         1.,
     ];
-    let mut marker = AreaVolume::default();
-    marker.area = 42;
-    marker.verts = &marker_verts;
-    marker.hmin = 0.;
-    marker.hmax = y + 1.;
-    let volumes = [marker];
+    let volumes = [AreaVolume::ladder(&marker_verts, 0., y + 1.)];
     let mut input = Input::new(&verts, &tris);
     input.volumes = &volumes;
     let mut cfg = BakeConfig::default();
@@ -89,7 +84,7 @@ fuzz_target!(|data: &[u8]| {
     let distance = f32::from(data[7] % 20) * 0.5;
     let clearance = f32::from(data[8] % 10) * 0.2;
     let step = f32::from(data[9] % 20) * 0.2;
-    cfg.extended_links.ladders = (data[6] & 1 != 0).then_some(LadderLinks::new(42, distance, 4, 1));
+    cfg.extended_links.ladders = (data[6] & 1 != 0).then_some(LadderLinks::new(distance, 4, 1));
     cfg.extended_links.steps = (data[6] & 2 != 0).then_some(StepLinks::new(distance, step, 5, 1));
     cfg.extended_links.level_gaps =
         (data[6] & 4 != 0).then_some(GapLinks::new(distance, clearance, 6, 1));

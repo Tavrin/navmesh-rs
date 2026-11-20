@@ -117,7 +117,7 @@ pub(super) struct VolumeRef<'a> {
     pub(super) verts: Cow<'a, [f32]>,
     pub(super) hmin: f32,
     pub(super) hmax: f32,
-    pub(super) area: u8,
+    pub(super) area: Option<u8>,
 }
 
 impl<'a> VolumeRef<'a> {
@@ -126,7 +126,7 @@ impl<'a> VolumeRef<'a> {
             verts: Cow::Borrowed(v.verts),
             hmin: v.hmin,
             hmax: v.hmax,
-            area: v.area,
+            area: (!v.ladder).then_some(v.area),
         }
     }
 }
@@ -228,6 +228,7 @@ pub(super) struct TileTask<'a> {
     pub(super) links: super::links::TileLinks,
     solid: Option<Heightfield>,
     incoming_ladder_links: u32,
+    grid_origin: [f32; 3],
 }
 
 impl<'a> TileTask<'a> {
@@ -235,8 +236,8 @@ impl<'a> TileTask<'a> {
     pub(super) fn new(
         c: &BakeConfig,
         cfg: &Config,
-        x: i32,
-        y: i32,
+        key: super::TileKey,
+        grid_origin: [f32; 3],
         verts: Cow<'a, [f32]>,
         source: TriSource<'a>,
         volumes: Vec<VolumeRef<'a>>,
@@ -253,8 +254,8 @@ impl<'a> TileTask<'a> {
             },
             c: *c,
             cfg: *cfg,
-            x,
-            y,
+            x: key.x,
+            y: key.z,
             verts,
             volumes,
             off_mesh,
@@ -264,6 +265,7 @@ impl<'a> TileTask<'a> {
             links: super::links::TileLinks::default(),
             solid: None,
             incoming_ladder_links: 0,
+            grid_origin,
         }
     }
 
@@ -388,8 +390,12 @@ impl<'a> TileTask<'a> {
                 let climb = self.cfg.walkable_climb;
                 if !tris.is_empty() {
                     let verts = &self.verts;
+                    let grid = self.c.extended_links.ladders.map(|_| {
+                        super::links::LadderGrid::new(self.grid_origin, [self.x, self.y], &self.cfg)
+                            .raster
+                    });
                     self.tw
-                        .stage(|ws| hf.rasterize_triangles(ws, verts, &tris, &areas, climb))?;
+                        .stage(|ws| hf.rasterize_indexed(ws, verts, &tris, &areas, climb, grid))?;
                 }
                 self.state = State::Filter { hf, which: 0 };
                 Ok(Advance::More)
@@ -457,12 +463,10 @@ impl<'a> TileTask<'a> {
             }
             State::Volumes { mut chf, next } => {
                 if let Some(v) = self.volumes.get(next)
-                    && !self.c.extended_links.is_ladder_marker(v.area)
+                    && let Some(area) = v.area
                 {
                     self.tw.trusted_stage(|ws| {
-                        recast::mark_convex_poly_area(
-                            ws, &v.verts, v.hmin, v.hmax, v.area, &mut chf,
-                        )
+                        recast::mark_convex_poly_area(ws, &v.verts, v.hmin, v.hmax, area, &mut chf)
                     })?;
                 }
                 self.state = self.after_volumes(chf, next + 1);
@@ -628,8 +632,10 @@ impl<'a> TileTask<'a> {
             } => {
                 let solid = self.solid.take().ok_or(Error::Failed)?;
                 (self.links, self.incoming_ladder_links) = self.tw.stage(|ws| {
-                    let legacy = super::links::extract(ws, &self.c, &mesh, &chf, &solid)?;
-                    let mut extended = Vec::new();
+                    let mut links = super::links::TileLinks {
+                        legacy: super::links::extract(ws, &self.c, &mesh, &chf, &solid)?,
+                        extended: Vec::new(),
+                    };
                     let incoming = super::links::extract_extended(
                         ws,
                         &self.c,
@@ -637,9 +643,14 @@ impl<'a> TileTask<'a> {
                         &chf,
                         &solid,
                         &self.volumes,
-                        &mut extended,
+                        super::links::LadderGrid::new(
+                            self.grid_origin,
+                            [self.x, self.y],
+                            &self.cfg,
+                        ),
+                        &mut links,
                     )?;
-                    Ok((super::links::TileLinks { legacy, extended }, incoming))
+                    Ok((links, incoming))
                 })?;
                 self.state = State::Dnav {
                     mesh,
@@ -937,8 +948,8 @@ mod report_tests {
         let mut task = TileTask::new(
             &cfg,
             &cfg.recast,
-            0,
-            0,
+            super::super::TileKey { x: 0, z: 0 },
+            [0.; 3],
             Cow::Borrowed(&[]),
             TriSource::Fetched {
                 areas: Vec::new(),

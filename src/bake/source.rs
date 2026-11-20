@@ -2,8 +2,8 @@
 
 use alloc::vec::Vec;
 
-use super::Input;
 use super::manifest::{Fnv64, GridLayout};
+use super::{AreaVolume, Input};
 use crate::common::{floorf, fmax, fmin};
 use crate::recast;
 use crate::{Error, Workspace};
@@ -47,8 +47,8 @@ pub trait GeometrySource: Sync {
         out: &mut TriangleSink,
     ) -> Result<(), Error>;
 
-    /// Pushes every convex area volume whose xz bounds overlap `[bmin, bmax]`,
-    /// in the order they are applied (later volumes overwrite earlier ones).
+    /// Pushes every convex area or ladder volume whose xz bounds overlap `[bmin, bmax]`.
+    /// Later paint volumes overwrite earlier ones. Use [`VolumeSink::push_ladder`] for ladders.
     fn volumes(&self, bmin: [f32; 3], bmax: [f32; 3], out: &mut VolumeSink) -> Result<(), Error>;
 
     /// Pushes every off-mesh connection with an endpoint inside `[bmin, bmax]` (xz).
@@ -214,7 +214,7 @@ pub(super) struct OwnedVolume {
     pub(super) verts: Vec<f32>,
     pub(super) hmin: f32,
     pub(super) hmax: f32,
-    pub(super) area: u8,
+    pub(super) area: Option<u8>,
 }
 
 /// Receives the area volumes of one fetch (not in recastnavigation).
@@ -224,15 +224,22 @@ pub struct VolumeSink {
     volumes: Vec<OwnedVolume>,
     last: Option<ItemId>,
     used: usize,
+    extract_ladders: bool,
 }
 
 impl VolumeSink {
-    pub(crate) fn new(bmin: [f32; 3], bmax: [f32; 3], cap_bytes: usize) -> Self {
+    pub(crate) fn new(
+        bmin: [f32; 3],
+        bmax: [f32; 3],
+        cap_bytes: usize,
+        extract_ladders: bool,
+    ) -> Self {
         Self {
             window: Window::new(bmin, bmax, cap_bytes),
             volumes: Vec::new(),
             last: None,
             used: 0,
+            extract_ladders,
         }
     }
 
@@ -251,6 +258,36 @@ impl VolumeSink {
         hmax: f32,
         area: u8,
     ) -> Result<(), Error> {
+        self.push_volume(id, verts, hmin, hmax, Some(area))
+    }
+
+    /// Adds a convex ladder shaft footprint and inclusive range of landing heights.
+    /// Area markings and ladders share the same ascending id sequence.
+    ///
+    /// # Errors
+    /// As with [`Self::push`].
+    pub fn push_ladder(
+        &mut self,
+        id: ItemId,
+        verts: &[f32],
+        hmin: f32,
+        hmax: f32,
+    ) -> Result<(), Error> {
+        self.push_volume(id, verts, hmin, hmax, None)
+    }
+
+    fn push_input(&mut self, id: ItemId, v: &AreaVolume<'_>) -> Result<(), Error> {
+        self.push_volume(id, v.verts, v.hmin, v.hmax, (!v.ladder).then_some(v.area))
+    }
+
+    fn push_volume(
+        &mut self,
+        id: ItemId,
+        verts: &[f32],
+        hmin: f32,
+        hmax: f32,
+        area: Option<u8>,
+    ) -> Result<(), Error> {
         ascending(&mut self.last, id, "volume ids must ascend")?;
         if verts.len() < 9
             || !verts.len().is_multiple_of(3)
@@ -258,9 +295,12 @@ impl VolumeSink {
             || !hmin.is_finite()
             || !hmax.is_finite()
             || hmin > hmax
-            || area > 63
+            || area.is_some_and(|area| area > 63)
         {
             return Err(Error::InvalidInput("area volume"));
+        }
+        if area.is_none() && !self.extract_ladders {
+            return Ok(());
         }
         let (lo, hi) = recast::calc_bounds(verts);
         if !self.window.overlaps([lo[0], lo[2]], [hi[0], hi[2]]) {
@@ -299,7 +339,7 @@ impl VolumeSink {
             }
             h.u32(v.hmin.to_bits());
             h.u32(v.hmax.to_bits());
-            h.u8(v.area);
+            h.u8(v.area.unwrap_or(crate::detour::MAX_AREAS as u8));
         }
     }
 
@@ -460,7 +500,7 @@ impl GeometrySource for Input<'_> {
 
     fn volumes(&self, _bmin: [f32; 3], _bmax: [f32; 3], out: &mut VolumeSink) -> Result<(), Error> {
         for (i, v) in self.volumes.iter().enumerate() {
-            out.push(i as ItemId, v.verts, v.hmin, v.hmax, v.area)?;
+            out.push_input(i as ItemId, v)?;
         }
         Ok(())
     }
@@ -684,7 +724,11 @@ impl<'a> Input<'a> {
             never.1,
             &mut TriangleSink::new(never.0, never.1, 0),
         )?;
-        input.volumes(never.0, never.1, &mut VolumeSink::new(never.0, never.1, 0))?;
+        input.volumes(
+            never.0,
+            never.1,
+            &mut VolumeSink::new(never.0, never.1, 0, false),
+        )?;
         input.off_mesh(never.0, never.1, &mut OffMeshSink::new(never.0, never.1, 0))?;
         let cells = Cells {
             origin: [grid.origin[0], grid.origin[2]],
@@ -768,7 +812,7 @@ impl GeometrySource for IndexedInput<'_> {
                 .volumes
                 .get(i as usize)
                 .ok_or(Error::InvalidInput("area volume"))?;
-            out.push(ItemId::from(i), v.verts, v.hmin, v.hmax, v.area)?;
+            out.push_input(ItemId::from(i), v)?;
         }
         Ok(())
     }

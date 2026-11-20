@@ -323,17 +323,16 @@ fn ladder_scene(blocked: bool) -> Floors {
 }
 
 fn ladder_marker() -> AreaVolume<'static> {
-    let mut volume = AreaVolume::default();
-    volume.verts = &[10., 0., 2., 10., 0., 10., 22., 0., 10., 22., 0., 2.];
-    volume.hmin = 0.;
-    volume.hmax = 4.3;
-    volume.area = 42;
-    volume
+    AreaVolume::ladder(
+        &[10., 0., 2., 10., 0., 10., 22., 0., 10., 22., 0., 2.],
+        0.,
+        4.3,
+    )
 }
 
 fn ladder_config() -> BakeConfig {
     let mut c = config();
-    c.extended_links.ladders = Some(LadderLinks::new(42, 6., 8, 1));
+    c.extended_links.ladders = Some(LadderLinks::new(6., 8, 1));
     c
 }
 
@@ -575,4 +574,254 @@ fn level_gap_rejects_a_jump_above_the_distance_limit() {
     let scene = gap_scene();
     let baked = bake::tiles(&scene.input(), &gap_config(7.), &mut Workspace::new()).unwrap();
     assert!(!has_kind(&baked, OffMeshKind::LevelGap));
+}
+
+#[test]
+fn enabling_ladders_preserves_null_and_walkable_area_paint() {
+    let mut scene = Floors::default();
+    scene.quad(0., 16., 0., true);
+    let mut hole = AreaVolume::default();
+    hole.verts = &[2., 0., 2., 2., 0., 10., 6., 0., 10., 6., 0., 2.];
+    hole.hmax = 1.;
+    let mut walkable = hole;
+    walkable.verts = &[10., 0., 2., 10., 0., 10., 14., 0., 10., 14., 0., 2.];
+    walkable.area = 63;
+    let volumes = [hole, walkable];
+    let mut input = scene.input();
+    input.areas = Some(&[7, 7]);
+    input.volumes = &volumes;
+    let baked = bake::tiles(&input, &ladder_config(), &mut Workspace::new()).unwrap();
+    assert!(!has_kind(&baked, OffMeshKind::Ladder));
+    let nav = baked.into_navmesh(Default::default()).unwrap();
+    let (at_hole, _, _) = NavMeshQuery::new(&nav, 32)
+        .unwrap()
+        .find_nearest_poly(&[4., 0.1, 6.], &[0.2; 3], &DefaultFilter::default())
+        .unwrap();
+    assert_eq!(at_hole, 0);
+    assert_eq!(nav.poly_area(find_ground(&nav, [12., 0.1, 6.])).unwrap(), 0);
+    assert_eq!(nav.poly_area(find_ground(&nav, [8., 0.1, 6.])).unwrap(), 7);
+}
+
+#[test]
+fn ladder_volume_never_paints_in_a_profile_without_ladders() {
+    use navmesh_rs::bake::profiles::{ProfileBakeSpec, ProfileId, ProfileRevision};
+
+    let scene = ladder_scene(false);
+    let bare = scene.input();
+    let volumes = [ladder_marker()];
+    let mut with_shaft = bare;
+    with_shaft.volumes = &volumes;
+    let bake_profile = |id, cfg, input: &Input<'_>| {
+        let grid = GridLayout::from_input(input, &cfg).unwrap();
+        let profile = ProfileBakeSpec::new(ProfileId::new(id), cfg, grid).unwrap();
+        let index = input.indexed(&grid, &mut Workspace::new()).unwrap();
+        let mut job = profile
+            .bake(
+                &index,
+                ProfileRevision::new([0; 16], 1),
+                grid.keys(),
+                JobOptions::default(),
+            )
+            .unwrap();
+        while !job.step(&mut Budget::unlimited()).unwrap().is_done() {}
+        std::iter::from_fn(|| job.next_ready().map(|item| item.tile().clone())).collect::<Vec<_>>()
+    };
+
+    let enabled = bake_profile(1, ladder_config(), &with_shaft);
+    assert_eq!(
+        enabled
+            .iter()
+            .map(|tile| tile.extended_links.len())
+            .sum::<usize>(),
+        2
+    );
+    assert_eq!(
+        bake_profile(2, config(), &with_shaft),
+        bake_profile(2, config(), &bare),
+    );
+}
+
+#[test]
+fn ladder_footprint_and_ordinary_area_can_overlap() {
+    let scene = ladder_scene(false);
+    let shaft = ladder_marker();
+    let mut paint = AreaVolume::default();
+    paint.verts = shaft.verts;
+    paint.hmin = shaft.hmin;
+    paint.hmax = shaft.hmax;
+    paint.area = 42;
+    let volumes = [shaft, paint];
+    let mut input = scene.input();
+    input.volumes = &volumes;
+    let baked = bake::tiles(&input, &ladder_config(), &mut Workspace::new()).unwrap();
+    assert!(has_kind(&baked, OffMeshKind::Ladder));
+    let nav = baked.into_navmesh(Default::default()).unwrap();
+    assert_eq!(
+        nav.poly_area(find_ground(&nav, [12., 0.1, 6.])).unwrap(),
+        42
+    );
+    assert_eq!(nav.poly_area(find_ground(&nav, [6., 0.1, 6.])).unwrap(), 0);
+}
+
+#[test]
+fn level_gap_rejects_a_wall_below_jump_clearance() {
+    let mut scene = gap_scene();
+    let c = gap_config(12.);
+    assert!(has_kind(
+        &bake::tiles(&scene.input(), &c, &mut Workspace::new()).unwrap(),
+        OffMeshKind::LevelGap
+    ));
+    scene.quad(11., 12., 0.3, false);
+    // The wall leaves unsupported cells on either side and fits under the
+    // raised sweep. The centerline floor trace must still reject it.
+    let blocked = bake::tiles(&scene.input(), &c, &mut Workspace::new()).unwrap();
+    assert!(!has_kind(&blocked, OffMeshKind::LevelGap));
+}
+
+#[test]
+fn legacy_climb_wins_over_a_step_in_the_same_direction() {
+    let scene = stair_scene();
+    let a = [5., 0.1, 6.];
+    let b = [22., 1.3, 6.];
+    for tile_size in [64, 32] {
+        let mut c = step_config(1.2);
+        c.recast.tile_size = tile_size;
+        let mut legacy = options();
+        legacy.drop = None;
+        c.links = Some(legacy);
+        let baked = bake::tiles(&scene.input(), &c, &mut Workspace::new()).unwrap();
+        assert!(
+            baked
+                .tiles
+                .iter()
+                .flat_map(|t| &t.links)
+                .any(|l| l.kind == LinkKind::Climb)
+        );
+        if tile_size == 64 {
+            assert!(
+                baked
+                    .tiles
+                    .iter()
+                    .flat_map(|t| &t.extended_links)
+                    .all(|l| l.start[1] > l.end[1])
+            );
+        }
+        let mut nav = baked.into_navmesh(Default::default()).unwrap();
+        for global in [false, true, false] {
+            nav.set_global_off_mesh_links(global);
+            for tile in (0..nav.max_tiles() as usize).filter_map(|i| nav.tile(i)) {
+                for con in &tile.off_mesh_cons {
+                    if con.kind() != Some(OffMeshKind::Step) || con.pos[1] >= con.pos[4] {
+                        continue;
+                    }
+                    let mut link = tile.polys[usize::from(con.poly)].first_link;
+                    while let Some(entry) = tile.links.get(link as usize) {
+                        assert_ne!(
+                            entry.edge, 1,
+                            "duplicated upward traversal across a tile seam"
+                        );
+                        link = entry.next;
+                    }
+                }
+            }
+            let up = path(&nav, a, b);
+            assert_eq!(up.last(), Some(&find_ground(&nav, b)));
+            assert!(
+                traversals(&nav, &up).is_empty(),
+                "upward route must use legacy climb"
+            );
+            let down = path(&nav, b, a);
+            assert_eq!(down.last(), Some(&find_ground(&nav, a)));
+            assert_eq!(traversals(&nav, &down), [OffMeshKind::Step]);
+        }
+    }
+}
+
+#[test]
+fn border_ladder_has_one_owner_per_segment_and_matching_incoming_slots() {
+    let scene = ladder_scene(false);
+    let mut c = ladder_config();
+    c.recast.cs = 0.4;
+    c.recast.tile_size = 40;
+    c.walkable_radius = 0.4;
+    let mut input = scene.input();
+    let bare = bake::tiles(&input, &c, &mut Workspace::new()).unwrap();
+    let volumes = [ladder_marker(), ladder_marker()];
+    input.volumes = &volumes;
+    let baked = bake::tiles(&input, &c, &mut Workspace::new()).unwrap();
+    let links: Vec<_> = baked.tiles.iter().flat_map(|t| &t.extended_links).collect();
+    assert_eq!(links.len(), 2);
+    assert_eq!(
+        links[0].end.map(f32::to_bits),
+        links[1].start.map(f32::to_bits)
+    );
+    assert!(links.iter().all(|l| (l.start[0] < 16.) != (l.end[0] < 16.)));
+    for (tile, bare) in baked.tiles.iter().zip(&bare.tiles) {
+        assert_eq!(tile.extended_links.len(), 1);
+        let cap = |data: &[u8]| {
+            navmesh_rs::detour::MeshTile::parse(data.to_vec())
+                .unwrap()
+                .header
+                .max_link_count
+        };
+        // One outbound link uses three slots; one inbound link uses one.
+        assert_eq!(
+            cap(tile.data.as_deref().unwrap()) - cap(bare.data.as_deref().unwrap()),
+            4
+        );
+    }
+    let (bottom, top) = (links[0].start, links[1].end);
+    let nav = baked.into_navmesh(Default::default()).unwrap();
+    for (start, end) in [(bottom, top), (top, bottom)] {
+        let path = path(&nav, start, end);
+        assert_eq!(path.last(), Some(&find_ground(&nav, end)));
+        assert_eq!(traversals(&nav, &path), [OffMeshKind::Ladder; 2]);
+    }
+}
+
+#[test]
+fn extended_options_off_preserve_tile_bytes_and_legacy_links() {
+    let scene = ladder_scene(false);
+    let bare = scene.input();
+    let mut c = config();
+    c.links = Some(options());
+    let baseline = bake::tiles(&bare, &c, &mut Workspace::new()).unwrap();
+    let volumes = [ladder_marker()];
+    let mut with_shaft = bare;
+    with_shaft.volumes = &volumes;
+    c.extended_links = Default::default();
+    let unchanged = bake::tiles(&with_shaft, &c, &mut Workspace::new()).unwrap();
+    assert_eq!(baseline.tiles, unchanged.tiles);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn extended_link_bytes_and_order_match_across_thread_counts() {
+    let volumes = [ladder_marker()];
+    let ladder = ladder_scene(false);
+    let mut shaft = ladder.input();
+    shaft.volumes = &volumes;
+    let stair = stair_scene();
+    let gap = gap_scene();
+    for (input, c, kind) in [
+        (shaft, ladder_config(), OffMeshKind::Ladder),
+        (stair.input(), step_config(1.2), OffMeshKind::Step),
+        (gap.input(), gap_config(12.), OffMeshKind::LevelGap),
+    ] {
+        let serial = bake::tiles(&input, &c, &mut Workspace::new()).unwrap();
+        assert!(has_kind(&serial, kind));
+        for threads in [1, 4, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let parallel = pool
+                .install(|| bake::tiles_parallel(&input, &c, &mut Workspace::new()))
+                .unwrap();
+            assert_eq!(
+                serial.tiles, parallel.tiles,
+                "{kind:?} at {threads} threads"
+            );
+        }
+    }
 }

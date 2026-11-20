@@ -8,10 +8,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
-- Opt-in bake extraction for tagged ladders, short stair steps across disconnected
+- Opt-in bake extraction for authored ladder volumes, short stair steps across disconnected
   surfaces, and jumps across level gaps. Each profile configures its own clearance,
   reach and traversal cost areas. Both crowds report the traversal kind in external
-  mode. See [extended bake links](docs/BAKED-TRAVERSAL.md).
+  mode. Ladder volumes leave area paint intact in every profile, and each
+  cross-tile ladder segment has one owner. Level gaps reject walls below the
+  jump clearance, and legacy links take precedence over duplicate steps.
+  See [extended bake links](docs/BAKED-TRAVERSAL.md).
 
 ## [0.2.3] - 2026-11-20
 

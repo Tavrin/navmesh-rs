@@ -1,8 +1,12 @@
-use super::{BakeConfig, ExtendedExtractedLink, clear, column, landing_key};
+use super::{
+    BakeConfig, ExtendedExtractedLink, ExtractedLink, clear, clear_with_grid, column, landing_key,
+};
 use crate::bake::VolumeRef;
-use crate::common::{ceilf, floorf, sqrtf};
+use crate::common::{ceilf, sqrtf};
 use crate::detour::OffMeshKind;
-use crate::recast::{CompactHeightfield, Heightfield, MESH_NULL_IDX, NULL_AREA, PolyMesh};
+use crate::recast::{
+    CompactHeightfield, Heightfield, MESH_NULL_IDX, NULL_AREA, PolyMesh, RasterGrid,
+};
 use crate::{Error, Workspace};
 use alloc::vec::Vec;
 
@@ -10,7 +14,7 @@ use alloc::vec::Vec;
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct ExtendedLinkExtraction {
-    /// Ladders authored with tagged area volumes.
+    /// Ladders authored with dedicated ladder volumes.
     pub ladders: Option<LadderLinks>,
     /// Short, solid steps above the ordinary walkable climb.
     pub steps: Option<StepLinks>,
@@ -22,8 +26,6 @@ pub struct ExtendedLinkExtraction {
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct LadderLinks {
-    /// Area id identifying ladder volumes in this profile's input.
-    pub marker_area: u8,
     /// Maximum horizontal reach from the shaft axis to a landing.
     pub reach: f32,
     /// Detour area used for the ladder traversal cost.
@@ -33,14 +35,9 @@ pub struct LadderLinks {
 }
 
 impl LadderLinks {
-    /// Marks volumes with `marker_area` and sets the link's area, flags and landing reach.
-    pub fn new(marker_area: u8, reach: f32, area: u8, flags: u16) -> Self {
-        Self {
-            marker_area,
-            reach,
-            area,
-            flags,
-        }
+    /// Sets the link's area, flags and landing reach.
+    pub fn new(reach: f32, area: u8, flags: u16) -> Self {
+        Self { reach, area, flags }
     }
 }
 
@@ -99,9 +96,7 @@ impl GapLinks {
 impl ExtendedLinkExtraction {
     pub(in crate::bake) fn validate(self) -> Result<(), Error> {
         let valid = |v: f32| v.is_finite() && v >= 0.0;
-        if self
-            .ladders
-            .is_some_and(|l| l.marker_area > 63 || l.area > 63 || !valid(l.reach))
+        if self.ladders.is_some_and(|l| l.area > 63 || !valid(l.reach))
             || self
                 .steps
                 .is_some_and(|l| l.area > 63 || !valid(l.distance) || !valid(l.height))
@@ -118,25 +113,24 @@ impl ExtendedLinkExtraction {
         self.ladders.is_some() || self.steps.is_some() || self.level_gaps.is_some()
     }
 
-    pub(in crate::bake) fn is_ladder_marker(self, area: u8) -> bool {
-        self.ladders.is_some_and(|l| l.marker_area == area)
-    }
-
     // Tagged suffix, absent when disabled, shared by both bake identities.
     pub(in crate::bake) fn encode(self, mut write: impl FnMut(&[u8])) {
+        // An out-of-range area byte invalidates cached results from the earlier
+        // extraction rules without changing identities when extensions are off.
+        let revised = crate::detour::MAX_AREAS as u8;
         if let Some(l) = self.ladders {
-            write(&[0xa8, l.marker_area, l.area]);
+            write(&[0xa8, revised, l.area]);
             write(&l.flags.to_le_bytes());
             write(&l.reach.to_le_bytes());
         }
         if let Some(l) = self.steps {
-            write(&[0xa9, l.area]);
+            write(&[0xa9, revised, l.area]);
             write(&l.flags.to_le_bytes());
             write(&l.distance.to_le_bytes());
             write(&l.height.to_le_bytes());
         }
         if let Some(l) = self.level_gaps {
-            write(&[0xaa, l.area]);
+            write(&[0xaa, revised, l.area]);
             write(&l.flags.to_le_bytes());
             write(&l.distance.to_le_bytes());
             write(&l.clearance.to_le_bytes());
@@ -156,6 +150,7 @@ enum FloorTrace {
     Gap,
     Walkable,
     Step,
+    Obstructed,
 }
 
 struct Geometry<'a> {
@@ -183,21 +178,27 @@ impl Geometry<'_> {
         &self,
         ws: &mut Workspace,
         col: usize,
+        grid: Option<LadderGrid>,
     ) -> Result<impl Iterator<Item = Landing> + '_, Error> {
         let h = self.field;
         let cell = h.cells[col];
         ws.work(u64::from(cell.count))?;
-        let center = [
-            h.bmin[0] + (col % h.width as usize) as f32 * h.cs + h.cs * 0.5,
-            0.0,
-            h.bmin[2] + (col / h.width as usize) as f32 * h.cs + h.cs * 0.5,
-        ];
+        let center = grid.map_or_else(
+            || {
+                [
+                    h.bmin[0] + (col % h.width as usize) as f32 * h.cs + h.cs * 0.5,
+                    0.0,
+                    h.bmin[2] + (col / h.width as usize) as f32 * h.cs + h.cs * 0.5,
+                ]
+            },
+            |grid| grid.center(col, h.width),
+        );
         Ok(
             (cell.index as usize..cell.index as usize + cell.count as usize).filter_map(
                 move |span| {
                     let s = h.spans[span];
                     (h.areas[span] != NULL_AREA
-                        && s.reg != 0
+                        && (grid.is_some() || s.reg != 0)
                         && s.h as f32 * h.ch >= self.c.walkable_height)
                         .then_some(Landing {
                             point: [center[0], h.bmin[1] + s.y as f32 * h.ch, center[2]],
@@ -269,23 +270,33 @@ impl Geometry<'_> {
             let mut floor = None;
             for span in self.solid.column(col) {
                 ws.work(1)?;
+                if ya == yb
+                    && span.smax != ya
+                    && (f32::from(ya) - f32::from(span.smax)) * h.ch < self.c.walkable_climb
+                {
+                    return Ok(FloorTrace::Obstructed);
+                }
                 if (ya.min(yb)..=ya.max(yb)).contains(&span.smax) {
                     floor = Some(span.smax);
                 }
             }
-            let Some(floor) = floor else {
+            if let Some(floor) = floor {
+                let change = previous.abs_diff(floor);
+                if i32::from(change) > h.walkable_climb
+                    && f32::from(change) * h.ch > self.c.walkable_climb
+                {
+                    result = FloorTrace::Step;
+                }
+                previous = floor;
+            } else if ya != yb {
                 return Ok(FloorTrace::Gap);
-            };
-            let change = previous.abs_diff(floor);
-            if i32::from(change) > h.walkable_climb
-                && f32::from(change) * h.ch > self.c.walkable_climb
-            {
-                result = FloorTrace::Step;
+            } else {
+                // Still check the remaining cells for obstacles after crossing a void.
+                result = FloorTrace::Gap;
             }
             if cell == end {
                 return Ok(result);
             }
-            previous = floor;
             let [x, z] = next;
             for (i, t) in [x, z].into_iter().enumerate() {
                 if cell[i] != end[i] && t <= [z, x][i] {
@@ -458,7 +469,7 @@ fn boundary_sample(
         return Ok(None);
     };
     let mut source = None::<Landing>;
-    for a in g.landings(ws, col)? {
+    for a in g.landings(ws, col, None)? {
         ws.work(1)?;
         let error = (a.point[1] - origin[1]).abs();
         if error <= 2.0 * h.ch
@@ -479,7 +490,7 @@ fn boundary_sample(
             edge[2] + normal[1] * offset,
         ];
         let Some(col) = column(h, p) else { break };
-        for b in g.landings(ws, col)? {
+        for b in g.landings(ws, col, None)? {
             ws.work(1)?;
             if let Some(link) = kind.candidate(g, ws, a, b)? {
                 let key = landing_key(ws, g.mesh, b.point, b.span)?;
@@ -492,14 +503,69 @@ fn boundary_sample(
     Ok(None)
 }
 
+/// The global voxel lattice and the index of this tile's first bordered cell.
+#[derive(Clone, Copy)]
+pub(in crate::bake) struct LadderGrid {
+    pub(in crate::bake) raster: RasterGrid,
+    border: i32,
+    tile_size: i32,
+}
+
+impl LadderGrid {
+    pub(in crate::bake) fn new(
+        origin: [f32; 3],
+        tile: [i32; 2],
+        cfg: &crate::recast::Config,
+    ) -> Self {
+        Self {
+            raster: RasterGrid {
+                origin: [origin[0], origin[2]],
+                first: tile
+                    .map(|i| i64::from(i) * i64::from(cfg.tile_size) - i64::from(cfg.border_size)),
+                cell_size: cfg.cs,
+            },
+            border: cfg.border_size,
+            tile_size: cfg.tile_size,
+        }
+    }
+
+    fn coords(column: usize, width: i32) -> [i32; 2] {
+        let width = width as usize;
+        [(column % width) as i32, (column / width) as i32]
+    }
+
+    fn center(self, column: usize, width: i32) -> [f32; 3] {
+        let [x, z] = Self::coords(column, width);
+        [
+            self.raster.position(0, x, 0.5) as f32,
+            0.,
+            self.raster.position(1, z, 0.5) as f32,
+        ]
+    }
+
+    pub(super) fn covered_cells(self, axis: usize, lo: f32, hi: f32, radius: f32) -> (i32, i32) {
+        (
+            self.raster.cell(axis, f64::from(lo) - f64::from(radius)),
+            self.raster.cell(axis, f64::from(hi) + f64::from(radius)),
+        )
+    }
+
+    fn owns(self, column: usize, width: i32) -> bool {
+        Self::coords(column, width)
+            .into_iter()
+            .all(|i| (self.border..self.border + self.tile_size).contains(&i))
+    }
+}
+
 // The convex volume defines a vertical shaft and the landing search footprint.
 fn ladder_links(
     g: &Geometry<'_>,
     ws: &mut Workspace,
     options: LadderLinks,
     volume: &VolumeRef<'_>,
+    grid: LadderGrid,
     out: &mut Vec<ExtendedExtractedLink>,
-    incoming: &mut u32,
+    incoming: &mut Vec<ExtendedExtractedLink>,
 ) -> Result<(), Error> {
     let mut axis = [0.0f64; 2];
     let verts = volume.verts.as_chunks::<3>().0;
@@ -514,18 +580,28 @@ fn ladder_links(
     ];
     let h = g.field;
     let bounds = |a: usize, n: i32| {
-        let origin = h.bmin[a * 2];
-        let lo = floorf((axis[a] - options.reach - origin) / h.cs) as i32;
-        let hi = floorf((axis[a] + options.reach - origin) / h.cs) as i32;
+        let (lo, hi) = grid.covered_cells(a, axis[a], axis[a], options.reach);
         lo.max(0)..=hi.min(n - 1)
     };
     let shaft = |y| [axis[0], y, axis[1]];
+    let clears = |ws: &mut Workspace, a, b| {
+        clear_with_grid(
+            ws,
+            g.solid,
+            a,
+            b,
+            0.0,
+            g.c.walkable_height,
+            g.c.walkable_radius,
+            Some(grid),
+        )
+    };
     let reach = f64::from(options.reach);
     let mut floors = Vec::<(u16, f64, Landing)>::new();
     for z in bounds(1, h.height) {
         for x in bounds(0, h.width) {
             ws.work(1)?;
-            for landing in g.landings(ws, (x + z * h.width) as usize)? {
+            for landing in g.landings(ws, (x + z * h.width) as usize, Some(grid))? {
                 ws.work(1 + verts.len() as u64)?;
                 let p = landing.point;
                 let distance = distance_sq(p, shaft(p[1]));
@@ -538,7 +614,7 @@ fn ladder_links(
                 }
                 let y = h.spans[landing.span].y;
                 let index = floors.binary_search_by_key(&y, |&(y, _, _)| y);
-                if index.is_ok_and(|i| floors[i].1 <= distance) || !g.clears(ws, p, shaft(p[1]))? {
+                if index.is_ok_and(|i| floors[i].1 <= distance) || !clears(ws, p, shaft(p[1]))? {
                     continue;
                 }
                 match index {
@@ -555,31 +631,37 @@ fn ladder_links(
     for pair in floors.windows(2) {
         let (_, _, a) = pair[0];
         let (_, _, b) = pair[1];
-        let start_local = g.local(a.point);
-        let end_local = g.local(b.point);
+        // The departure tile owns the segment. The arrival tile computes the
+        // same pair from the shared lattice and only reserves its reverse slot.
+        let start_local = grid.owns(a.column, h.width);
+        let end_local = grid.owns(b.column, h.width);
         if !(start_local || end_local)
             || b.point[1] - a.point[1] <= g.c.walkable_climb
-            || !g.clears(ws, shaft(a.point[1]), shaft(b.point[1]))?
+            || !clears(ws, shaft(a.point[1]), shaft(b.point[1]))?
         {
             continue;
         }
-        if end_local && !start_local {
-            *incoming = incoming.checked_add(1).ok_or(Error::SizeOverflow)?;
-        }
-        if start_local
-            && landing_key(ws, g.mesh, a.point, a.span)? < g.mesh.npolys as usize
-            && (!end_local || landing_key(ws, g.mesh, b.point, b.span)? < g.mesh.npolys as usize)
+        let polys = g.mesh.npolys as usize;
+        if (start_local && landing_key(ws, g.mesh, a.point, a.span)? >= polys)
+            || (end_local && landing_key(ws, g.mesh, b.point, b.span)? >= polys)
         {
-            let link = g.link(a, b, OffMeshKind::Ladder, options.area, options.flags);
-            ws.work(out.len() as u64)?;
-            if !out.contains(&link) {
-                ws.push(out, link)?;
-            }
+            continue;
+        }
+        let link = g.link(a, b, OffMeshKind::Ladder, options.area, options.flags);
+        let links = if start_local {
+            &mut *out
+        } else {
+            &mut *incoming
+        };
+        ws.work(links.len() as u64)?;
+        if !links.contains(&link) {
+            ws.push(links, link)?;
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(in crate::bake) fn extract_extended(
     ws: &mut Workspace,
     c: &BakeConfig,
@@ -587,7 +669,8 @@ pub(in crate::bake) fn extract_extended(
     field: &CompactHeightfield,
     solid: &Heightfield,
     volumes: &[VolumeRef<'_>],
-    out: &mut Vec<ExtendedExtractedLink>,
+    ladder_grid: LadderGrid,
+    links: &mut super::TileLinks,
 ) -> Result<u32, Error> {
     let g = Geometry {
         c,
@@ -595,17 +678,73 @@ pub(in crate::bake) fn extract_extended(
         field,
         solid,
     };
-    let mut incoming = 0;
+    let mut incoming = Vec::new();
     if let Some(options) = c.extended_links.ladders {
-        for volume in volumes.iter().filter(|v| v.area == options.marker_area) {
-            ladder_links(&g, ws, options, volume, out, &mut incoming)?;
+        for volume in volumes.iter().filter(|v| v.area.is_none()) {
+            ladder_links(
+                &g,
+                ws,
+                options,
+                volume,
+                ladder_grid,
+                &mut links.extended,
+                &mut incoming,
+            )?;
         }
     }
     if let Some(options) = c.extended_links.steps {
-        boundary_links(&g, ws, BoundaryKind::Step(options), out)?;
+        let first_step = links.extended.len();
+        boundary_links(&g, ws, BoundaryKind::Step(options), &mut links.extended)?;
+        dedupe_steps(&g, ws, &links.legacy, &mut links.extended, first_step)?;
     }
     if let Some(options) = c.extended_links.level_gaps {
-        boundary_links(&g, ws, BoundaryKind::Gap(options), out)?;
+        boundary_links(&g, ws, BoundaryKind::Gap(options), &mut links.extended)?;
     }
-    Ok(incoming)
+    u32::try_from(incoming.len()).map_err(|_| Error::SizeOverflow)
+}
+
+// Both endpoints of an intra-tile link can be identified here. A seam link
+// is checked when its destination tile is resident and its polygon is known.
+fn dedupe_steps(
+    g: &Geometry<'_>,
+    ws: &mut Workspace,
+    legacy: &[ExtractedLink],
+    out: &mut Vec<ExtendedExtractedLink>,
+    first_step: usize,
+) -> Result<(), Error> {
+    if legacy.is_empty() || first_step == out.len() {
+        return Ok(());
+    }
+    let polygons = g.mesh.npolys as usize;
+    let mut pairs = ws.vec_with_capacity(legacy.len())?;
+    for link in legacy {
+        ws.work(1)?;
+        if g.local(link.end) {
+            pairs.push((
+                landing_key(ws, g.mesh, link.start, 0)?,
+                landing_key(ws, g.mesh, link.end, 0)?,
+            ));
+        }
+    }
+    let search_work = u64::from(usize::BITS - pairs.len().leading_zeros());
+    ws.work(pairs.len() as u64 * search_work)?;
+    pairs.sort_unstable();
+    let mut kept = first_step;
+    for index in first_step..out.len() {
+        let link = &out[index];
+        ws.work(search_work + 1)?;
+        if g.local(link.end) {
+            let pair = (
+                landing_key(ws, g.mesh, link.start, 0)?,
+                landing_key(ws, g.mesh, link.end, 0)?,
+            );
+            if pair.0 < polygons && pair.1 < polygons && pairs.binary_search(&pair).is_ok() {
+                continue;
+            }
+        }
+        out.swap(kept, index);
+        kept += 1;
+    }
+    out.truncate(kept);
+    Ok(())
 }

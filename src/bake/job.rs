@@ -76,7 +76,8 @@ impl<S: GeometrySource> Plan<'_, S> {
         let (bmin, bmax) = self.grid.tile_bounds(key);
         let cap = self.cfg.tile_limits.max_bytes;
         let mut triangles = TriangleSink::new(bmin, bmax, cap);
-        let mut volumes = VolumeSink::new(bmin, bmax, cap);
+        let mut volumes =
+            VolumeSink::new(bmin, bmax, cap, self.cfg.extended_links.ladders.is_some());
         let mut off_mesh = OffMeshSink::new(bmin, bmax, cap);
         self.src.triangles(bmin, bmax, &mut triangles)?;
         self.src.volumes(bmin, bmax, &mut volumes)?;
@@ -101,8 +102,8 @@ impl<S: GeometrySource> Plan<'_, S> {
         let mut task = TileTask::new(
             self.cfg,
             &tile_cfg,
-            key.x,
-            key.z,
+            key,
+            self.grid.origin,
             Cow::Owned(verts),
             TriSource::Fetched { areas, mode },
             VolumeRef::from_sink(fetched.volumes),
@@ -197,15 +198,15 @@ pub fn tile_cache_layers(
     let (bmin, bmax) = (tile_cfg.bmin, tile_cfg.bmax);
     let cap = cfg.tile_limits.max_bytes;
     let mut triangles = TriangleSink::new(bmin, bmax, cap);
-    let mut volumes = VolumeSink::new(bmin, bmax, cap);
+    let mut volumes = VolumeSink::new(bmin, bmax, cap, false);
     src.triangles(bmin, bmax, &mut triangles).map_err(at)?;
     src.volumes(bmin, bmax, &mut volumes).map_err(at)?;
     let (verts, areas, mode) = triangles.into_parts();
     let mut task = TileTask::new(
         cfg,
         &tile_cfg,
-        key.x,
-        key.z,
+        key,
+        grid.origin,
         Cow::Owned(verts),
         TriSource::Fetched { areas, mode },
         VolumeRef::from_sink(volumes),

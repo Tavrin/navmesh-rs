@@ -37,6 +37,8 @@ pub use area::{
 pub use compact::{CompactCell, CompactHeightfield, CompactSpan};
 pub use contour::{CONTOUR_TESS_AREA_EDGES, CONTOUR_TESS_WALL_EDGES, Contour, ContourSet};
 pub use detail::PolyMeshDetail;
+#[cfg(feature = "detour")]
+pub(crate) use heightfield::RasterGrid;
 pub use heightfield::{Heightfield, Span};
 pub use layers::{HeightfieldLayer, HeightfieldLayerSet};
 pub use mesh::{PolyMesh, TriangulationReport};
