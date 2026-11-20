@@ -366,7 +366,7 @@ impl NavMesh {
             let salt = self.next_salt(self.slots[ti].salt)?;
             // The slot is only released after every check has succeeded.
             self.clear_runtime_edges();
-            drop(self.detach(ti));
+            drop(self.detach(ti, false));
             self.release_slot(ti, salt);
         } else {
             let bytes = super::super::builder::encode_link_tile(key, layer, &specs, &self.limits)?;
@@ -545,7 +545,7 @@ impl NavMesh {
                 self.stamp_link_landings(report);
             }
             #[cfg(feature = "dynamic")]
-            let modified = self.modifiers.governs(ti, ip).then(|| {
+            let modified = self.modifiers.manages_state(ti, ip).then(|| {
                 self.modifiers
                     .effective_state(self.tile_unchecked(ti as u32), ti, ip)
             });
