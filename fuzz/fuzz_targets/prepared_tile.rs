@@ -50,7 +50,8 @@ fuzz_target!(|data: &[u8]| {
         (Ok(ra), Ok(t)) => {
             let again = t.clone();
             let mut padded = data.to_vec();
-            padded.extend_from_slice(&[0; 8]);
+            // 13 bytes: the tail can never be exactly one 12-byte layout trailer.
+            padded.extend_from_slice(&[0; 13]);
             let padded_tile =
                 prepare_tile(&params, TILE_LIMITS, padded).expect("trailing bytes accepted");
             assert_ne!(t.content_hash(), padded_tile.content_hash());
