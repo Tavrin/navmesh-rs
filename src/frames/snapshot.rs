@@ -132,6 +132,8 @@ impl FrameSet {
 }
 
 fn binding(frame: &FrameNav) -> [u8; 32] {
+    // The `Profiles` arm exists only with `recast` and `crowd-world`; without them this match has one arm.
+    #[allow(clippy::infallible_destructuring_match)]
     let nav = match frame {
         FrameNav::Native(nav) => nav,
         #[cfg(all(feature = "recast", feature = "crowd-world"))]
