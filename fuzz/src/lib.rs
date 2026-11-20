@@ -1,6 +1,7 @@
 //! Shared code of the fuzz targets and the seed writer.
 
 pub mod bake_world;
+pub mod persisted;
 
 use navmesh_rs::detour::{self, DefaultFilter, NavMesh, NavMeshCreateParams, NavMeshQuery};
 use navmesh_rs::recast::{

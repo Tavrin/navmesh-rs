@@ -149,3 +149,22 @@ content changes nothing, other content advances the slot's salt once, every refu
 leaves the epoch and residency record as they were, and every ref taken is exactly as
 stale, valid or unloaded as the model says. It has no seed generator; it starts from an
 empty corpus.
+
+Persisted-record readers. Each of these targets feeds the input to the reader twice: as is,
+and as a list of byte patches applied to a valid record built once in `src/persisted.rs`
+(first byte: patch window, whole body, first 64 bytes or last 160 bytes; then 3-byte
+`[position lo, position hi, value]` patches), with the record's trailing SHA-256 recomputed
+so the patched bytes reach the checks behind the checksum. Nested records inside a record
+keep their own checksums and are not repaired. An accepted record must encode back to the
+same bytes, except for the crowd records (`DCFR`, `NPCW`, `NPCM`, `NPFM`), whose re-encoding must be a fixed point:
+the embedded crowd reader accepts some out-of-range field values and normalises them. None has a seed generator; they start from an empty corpus.
+
+| Target | Record |
+|---|---|
+| `runtime_links` | runtime link layer (`DNLK`) restored into an empty mesh, then ground tiles added |
+| `frame_snapshot` | moving-platform frame state (`DNFR`); a rejected record leaves the frame set unchanged |
+| `framed_crowd_snapshot` | framed crowd (`DCFR`) bound to a lift, then stepped under a budget |
+| `profile_catalog` | bake-profile catalog (`NPCG`), checked against its revision, settings and layout |
+| `profile_records` | mode byte, then slot history (`NPRS`), saved polygon reference (`NPRF`) or single-profile crowd (`NPCW`) |
+| `profile_mixed_crowd` | mixed-profile crowd (`NPCM`) bound to two installed profiles |
+| `framed_profile_crowd` | framed mixed-profile crowd (`NPFM`) bound to a two-frame world of profile meshes |
