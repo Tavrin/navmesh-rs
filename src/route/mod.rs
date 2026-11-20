@@ -181,4 +181,5 @@ pub use window::{CorridorWindow, WindowPoint};
 mod stitched;
 
 mod navigator;
+mod portal_window;
 pub use navigator::{Navigator, RequestId, RouteAtlas, RouteState};

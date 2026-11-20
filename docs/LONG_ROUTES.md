@@ -76,15 +76,25 @@ queries. Bind them against a complete installed world before certifying a route.
 Prepare a `RouteAtlas` with the same mesh and filter, then create a `Navigator`.
 Submit two `WindowPoint` endpoints with `request`. Call `update` repeatedly
 with one shared frame budget and the maximum units per scheduler turn. An
-unanswered request gets priority over a continuation. Level-three search
-selects a directed corridor. Level-two search connects portal representatives
-within it using the sector cost tables. The scheduler refines each sector on
-the live mesh and publishes `RouteState::Segment`. Follow the polygon refs
-from `segment` to the position from `toward`, then call `advance`. The last
-acknowledgment sets `Complete`. Call `cancel` to release the request.
+unanswered request gets priority over a continuation. The directed region
+search checks reachability. A short live search in the reciprocal start region
+can publish a prefix toward a coarse crossing. Keep calling `update` while
+the agent walks. The prefix and its endpoint stay available until acknowledged,
+and the continuation starts at that endpoint.
 
-A missing landing lets the agent reach its departure point before reporting
-`Waiting`. Call `sync` after residency changes. It compares slot identities
+Level-two search considers several concrete crossing positions on a wide
+border. Live refinement spans multiple sectors and a one-sector margin. It
+prices each step between incoming and outgoing portal midpoints using the
+current polygon's area cost. If the node limit is reached, the scheduler
+shortens the window and can fall back to single-sector refinement.
+
+On `RouteState::Segment`, `segment` gives the polygon corridor, `corners` gives
+its string-pulled steering points and `toward` gives the endpoint to acknowledge
+with `advance`. The last acknowledgment sets `Complete`. Call `cancel` to release the request.
+
+If a window or its margin needs a missing sector, the navigator reports
+`Waiting` for that sector after the caller acknowledges the available segment.
+It uses the same window after reload. Call `sync` after residency changes. It compares slot identities
 outside the frame budget, restarts active windows and wakes waiting requests.
 A changed tile generation, modifier revision or runtime-link edit returns
 `MeshChanged`. Rebuild the graph and atlas and resubmit from the current

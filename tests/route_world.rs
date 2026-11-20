@@ -490,6 +490,49 @@ fn long_route_flat_comparator_in_frames() {
     };
     let source = RouteWorld { base, field };
     let grid = source.base.layout(&cfg);
+    // Large fixtures can be prepared in independently verified tile ranges.
+    if let Ok(batch) = std::env::var("NAV_ROUTE_BAKE_COUNT") {
+        let first = env("NAV_ROUTE_BAKE_OFFSET", 0usize);
+        let keys = grid.keys();
+        let end = first
+            .saturating_add(batch.parse::<usize>().unwrap())
+            .min(keys.len());
+        let dir = PathBuf::from(std::env::var_os("NAV_ROUTE_FIXTURE").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!dir.join("complete").exists() && first < end);
+        let mut job = BakeJob::new(
+            &source,
+            &cfg,
+            &grid,
+            keys[first..end].to_vec(),
+            JobOptions::default(),
+        )
+        .unwrap();
+        let mut manifest = String::new();
+        loop {
+            let progress = job.run_parallel_chunk().unwrap();
+            while let Some(output) = job.next_ready() {
+                let k = output.key;
+                let hash = output.data.map_or_else(
+                    || "-".into(),
+                    |bytes| {
+                        let hash = format!("{:x}", Sha256::digest(&bytes));
+                        std::fs::write(dir.join(format!("{}-{}.dnav", k.x, k.z)), bytes).unwrap();
+                        hash
+                    },
+                );
+                manifest.push_str(&format!("{} {} {hash}\n", k.x, k.z));
+            }
+            if progress == Progress::Done {
+                break;
+            }
+        }
+        assert_eq!(manifest.lines().count(), end - first);
+        std::fs::write(dir.join(format!("manifest-{first}-{end}")), manifest).unwrap();
+        std::fs::write(dir.join(format!("identity-{first}-{end}")), identity).unwrap();
+        println!("baked {first}..{end} of {}", keys.len());
+        return;
+    }
     let mut nav = NavMesh::with_policy(
         &grid.nav_mesh_params(grid.keys().len() as i32, 1 << 20),
         Limits::UNLIMITED,

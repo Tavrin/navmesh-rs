@@ -797,3 +797,53 @@ fn navigator_stops_at_a_streamed_border_and_resumes_the_same_corridor() {
     assert_eq!(path, vec![a.polygon, tile, b.polygon]);
     assert_eq!(scheduler.state(id), Some(RouteState::Complete));
 }
+
+#[cfg(feature = "route")]
+#[test]
+fn navigator_publishes_an_early_prefix_then_pulls_across_borders() {
+    use navmesh_rs::route::{
+        Navigator, RouteAtlas, RouteState, SectorGraph, SectorParams, WindowPoint,
+    };
+    let nav = mesh(&(0..64).collect::<Vec<_>>());
+    let filter = DefaultFilter::default();
+    let graph =
+        SectorGraph::from_mesh(&nav, &SectorParams::new(1, 64), &filter, nav.limits()).unwrap();
+    let atlas = RouteAtlas::new(&graph, &nav, filter).unwrap();
+    let mut scheduler = Navigator::new(&atlas, 512).unwrap();
+    let start = WindowPoint::new(at(&nav, 0), pos(0));
+    let goal = WindowPoint::new(at(&nav, 63), pos(63));
+    let id = scheduler.request(&nav, start, goal).unwrap();
+    scheduler.update(&nav, &mut Budget::new(16), 16).unwrap();
+    assert_eq!(scheduler.state(id), Some(RouteState::Segment));
+    let at_prefix = scheduler.toward(id).unwrap();
+    assert!(at_prefix.position[0] > start.position[0] && at_prefix.position[0] < goal.position[0]);
+    // Leave the prefix outstanding until its successor is ready.
+    let mut budget = Budget::new(10000);
+    while scheduler.update(&nav, &mut budget, 16).unwrap() {}
+    assert_eq!(scheduler.toward(id).unwrap().position, at_prefix.position);
+    scheduler.advance(id).unwrap();
+    assert_eq!(scheduler.state(id), Some(RouteState::Segment));
+    let mut multi_sector_windows = 0;
+    let mut last = at_prefix;
+    for _ in 0..10000 {
+        scheduler.update(&nav, &mut Budget::new(1), 1).unwrap();
+        match scheduler.state(id).unwrap() {
+            RouteState::Segment => {
+                let segment = scheduler.segment(id).unwrap();
+                assert_eq!(segment.first(), Some(&last.polygon));
+                let corners = scheduler.corners(id).unwrap();
+                assert_eq!(corners.first().unwrap().pos, last.position);
+                assert!(corners.len() <= 2);
+                multi_sector_windows += usize::from(segment.len() > 2);
+                last = scheduler.toward(id).unwrap();
+                scheduler.advance(id).unwrap();
+            }
+            RouteState::Complete => break,
+            RouteState::Planning => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(last.polygon, goal.polygon);
+    assert_eq!(scheduler.state(id), Some(RouteState::Complete));
+    assert!(multi_sector_windows >= 2);
+}
