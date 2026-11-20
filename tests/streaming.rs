@@ -1496,6 +1496,10 @@ fn persisted_layout_collision_and_legacy_files() {
 
 #[test]
 fn tile_trailers_are_ignored_unless_exact_and_hash_as_untagged() {
+    // Explicit ref layouts, and so layout trailers, exist only with 64-bit refs.
+    if PolyRef::BITS != 64 {
+        return;
+    }
     let p = params(8);
     let trailer = |version: u32, l: RefLayout| {
         let mut t = b"NRFL".to_vec();
