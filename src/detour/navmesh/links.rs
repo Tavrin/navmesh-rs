@@ -749,18 +749,9 @@ fn find_runtime_landing(t: &MeshTile, point: [f32; 3], radius: f32) -> Option<(u
     let mut hit = None;
     let mut best = f64::INFINITY;
     query_polygons_in_tile_with(t, &min, &max, &mut |ip| {
-        if t.polys[ip as usize].poly_type() != super::super::POLYTYPE_GROUND {
+        let Some((snap, d)) = link_landing_candidate(t, ip as usize, point) else {
             return true;
-        }
-        let (snap, _) = closest_point_on_poly_in_tile(t, ip as usize, &point);
-        let d: f64 = snap
-            .into_iter()
-            .zip(point)
-            .map(|(a, b)| {
-                let delta = f64::from(a) - f64::from(b);
-                delta * delta
-            })
-            .sum();
+        };
         if d <= f64::from(radius) * f64::from(radius) && d < best {
             best = d;
             hit = Some((ip, snap));

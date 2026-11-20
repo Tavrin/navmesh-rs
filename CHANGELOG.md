@@ -8,6 +8,11 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Moving platform frames with yaw-only poses, runtime docks, cross-frame
+  routes, and stable riders for both crowds. Frame and framed crowd snapshots
+  restore dock availability and riders in transit. See
+  [moving platforms](docs/MOVING-PLATFORMS.md).
+
 - Tile-cache zones for selected columns via `bake::tile_cache_layers`.
   `TileCache::update_budgeted` rebuilds affected layers in bounded slices,
   preserving equal-content refs and applying registered modifiers on replacement.

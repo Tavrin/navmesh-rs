@@ -554,6 +554,27 @@ pub(crate) fn poly_height(tile: &MeshTile, ip: usize, pos: &[f32]) -> Option<f32
     Some(closest_point_on_detail_edges(tile, ip, pos, false)[1])
 }
 
+// Shared by in-mesh runtime links and cross-frame dock endpoints.
+pub(crate) fn link_landing_candidate(
+    tile: &MeshTile,
+    ip: usize,
+    point: [f32; 3],
+) -> Option<([f32; 3], f64)> {
+    if tile.polys.get(ip)?.poly_type() != super::POLYTYPE_GROUND {
+        return None;
+    }
+    let (snap, _) = closest_point_on_poly_in_tile(tile, ip, &point);
+    let d = snap
+        .into_iter()
+        .zip(point)
+        .map(|(a, b)| {
+            let delta = f64::from(a) - f64::from(b);
+            delta * delta
+        })
+        .sum();
+    Some((snap, d))
+}
+
 /// `dtNavMesh::closestPointOnPoly` on polygon `ip` of `tile`.
 pub(crate) fn closest_point_on_poly_in_tile(tile: &MeshTile, ip: usize, pos: &[f32]) -> (V3, bool) {
     let mut closest = v3(pos);

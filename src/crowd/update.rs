@@ -3,6 +3,7 @@
 use super::phases::{self, AvoidScratch};
 use super::*;
 use AgentState as S;
+use alloc::collections::BTreeMap;
 
 impl Crowd {
     /// [`Crowd::update`] under a work budget (not in recastnavigation): the workspace's
@@ -52,6 +53,16 @@ impl Crowd {
     /// nonnegative. Workspace limits bound allocation and charged simulation work.
     /// An error can leave earlier phases applied; discard that tick's result.
     pub fn update(&mut self, ws: &mut Workspace, nav: &NavMesh, dt: f32) -> Result<(), Error> {
+        self.update_with_docks(ws, nav, dt, &BTreeMap::new())
+    }
+
+    pub(super) fn update_with_docks(
+        &mut self,
+        ws: &mut Workspace,
+        nav: &NavMesh,
+        dt: f32,
+        local_targets: &BTreeMap<usize, platforms::LocalTarget>,
+    ) -> Result<(), Error> {
         ws.begin();
         nonnegative(dt)?;
         // Reserve/query scratch and conservatively charge per-agent local query
@@ -215,7 +226,14 @@ impl Crowd {
             }
         }
         for &i in &self.active {
-            phases::find_corners(&mut self.agents[i], &mut q, &self.filters)?;
+            phases::find_corners(
+                &mut self.agents[i],
+                &mut q,
+                &self.filters,
+                local_targets
+                    .get(&i)
+                    .and_then(platforms::LocalTarget::precise_point),
+            )?;
         }
         for &i in &self.active {
             phases::trigger_offmesh(&mut self.agents[i], &q);
@@ -232,8 +250,14 @@ impl Crowd {
             query: &mut self.avoidance,
             orca: &mut orca_scratch,
             orca_neighbours: &mut orca_neighbours,
+            dock_opening: None,
+            #[cfg(feature = "crowd-world")]
+            dock_obstacles: &[],
         };
         for &i in &self.active {
+            scratch.dock_opening = local_targets
+                .get(&i)
+                .and_then(platforms::LocalTarget::opening);
             if let Some((nvel, n)) = phases::avoid(
                 ws,
                 &self.agents[i],
@@ -269,7 +293,9 @@ impl Crowd {
         }
         for &i in &self.active {
             phases::check_finite(&self.agents[i])?;
-            if arrival::finish_arrival(&mut self.agents[i]) {
+            if !matches!(local_targets.get(&i), Some(platforms::LocalTarget::Dock(_)))
+                && arrival::finish_arrival(&mut self.agents[i])
+            {
                 self.agents[i].reset_slot();
             }
         }
