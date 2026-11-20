@@ -1168,3 +1168,7 @@ fn independent_profile_bake_cost() {
         }
     }
 }
+
+#[cfg(feature = "crowd-world")]
+#[path = "profiles/mixed_crowds.rs"]
+mod mixed_crowds;

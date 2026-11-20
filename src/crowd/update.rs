@@ -87,7 +87,7 @@ impl Crowd {
         let links_changed = self.link_epoch != link_epoch;
         let mut remaining = self.replan_limit;
         if self.stamp_revalidation && nav.change_epoch() != self.replan_epoch {
-            self.pathq.revalidate_search(nav, self.replan_epoch);
+            self.pathq.revalidate_search(0, nav, self.replan_epoch);
         }
         for &i in replan::order(&self.active, self.replan_cursor) {
             let before = remaining;
@@ -128,7 +128,7 @@ impl Crowd {
             &mut self.pathq,
             &self.filters,
             ws,
-            nav,
+            queue::MeshSource::single(nav),
             &mut q,
             100,
         )?;
@@ -138,7 +138,8 @@ impl Crowd {
             &mut q,
             &self.filters,
             dt,
-        );
+            queue::MeshSource::single(nav),
+        )?;
         self.grid.clear();
         for (j, &i) in self.active.iter().enumerate() {
             let a = &self.agents[i];

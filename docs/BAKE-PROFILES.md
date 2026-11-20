@@ -50,9 +50,28 @@ Use `ProfileMeshes` to select a mesh by ID. A query borrows one mesh for its
 lifetime, including sliced searches. A polygon or tile ref belongs to the mesh
 instance that issued it, even when another profile produces the same numeric
 bits. Connectivity graphs, crowd updates and crowd targets check that binding.
-Structural connectivity ignores area and cost filters. Each crowd has its own
-agents and avoidance neighbours. Resize an agent by removing it and admitting
-it to the destination profile.
+Structural connectivity ignores area and cost filters. Resize an agent by
+removing it and admitting it to the destination profile.
+
+## Shared avoidance
+
+Use `MixedProfileCrowdWorld` with a `ProfileMeshes` collection and the profile
+IDs to admit. Supply a profile when you add an agent and query that profile
+for each point goal. Admission and parameter updates check the agent's radius
+and height against that profile's bake. Registered meshes share a coordinate
+frame and stay bound to the crowd across compatible catalog revisions.
+
+One fixed step gathers all agents in global slot order. ORCA and sampled
+avoidance use one neighbour grid and every neighbour's own radius and height.
+Corridors, walls, off-mesh traversal and per-profile change stamps use the
+agent's bound mesh. The eight-slot path queue and the replan budget serve all
+profiles in the same order on every thread count. An external traversal event
+carries the profile ID with its mesh-local refs. Respond through
+`complete_off_mesh` or `abort_off_mesh`.
+
+Use `ProfileCrowd` or `ProfileCrowdWorld` for a single profile with its own
+avoidance neighbourhood. Their existing entry points and save layouts still
+apply.
 
 ## Gates, cache zones and platforms
 
@@ -65,18 +84,21 @@ tiles attach after a catalog update, reload or residency restore. Save the
 [modifier record](DYNAMIC-MODIFIERS.md) separately for each profile and
 register it before restoring the crowd. Catalog hashes describe baked tiles.
 
-Version 1 profile catalogs describe ordinary layer-zero bake output. The
-profile API currently has no bindings for tile-cache zones, generated runtime
-link layers or platform frames. Use separate native meshes for these systems.
-A [tile-cache zone](TILE-CACHE-ZONES.md) for each size requires layers built at
-that size's erosion radius and its own cache and obstacle state. For
-[moving platforms](MOVING-PLATFORMS.md), assemble a separate `FrameSet` and
-`FramedCrowd` per size from the corresponding baked world and platform tiles.
-The framed save stores riders and frame bindings. The application must associate
-that save with the correct size. `NPCW` saves bind a single catalog and mesh.
-Direct mutation of the underlying mesh could bypass catalog validation. Adding
-catalog support requires binding the additional layers, cache rebuild identities
-or frame meshes and migrating the affected saves.
+Version 1 profile catalogs describe ordinary layer-zero bake output, including
+authored off-mesh connections. Tile-cache zones and generated runtime link
+tiles use the native mesh API. A [tile-cache zone](TILE-CACHE-ZONES.md) for
+each size requires layers built at that size's erosion radius and individual
+cache and obstacle state.
+
+For [moving platforms](MOVING-PLATFORMS.md), use `FrameSet::with_profiles`
+and `add_profile_frame` to supply each frame's catalogs and meshes. Attach a
+`FramedMixedProfileCrowdWorld` simulation to each frame that riders can use.
+A rider keeps its profile and stable rider ID when crossing a dock. Both
+landings are resolved on that rider's profile meshes. Riders on the same
+deck share avoidance. Across open seams, nearby agents are moving avoidance
+obstacles, as in the native framed crowd. Supply platform poses and update
+dock availability before stepping. Attach the rider's profile in each frame
+along its route.
 
 ## On-disk bindings
 
@@ -107,12 +129,29 @@ crowd world after loading its required tiles. An active crowd search must
 still match its mesh when saved. The embedded `DCRW` uses zero in the existing
 search epoch field, and restore rebinds it to the restored mesh's epoch.
 
-Both the profile `NPCW` and framed `DCFR` wrappers use the ordinary `DCRW`
+The profile `NPCW` and framed `DCFR` wrappers use the ordinary `DCRW`
 reader and writer. The original base layout (version 1) loads with default
 arrival and traversal settings. The extended layout (version 3) adds the
 runtime-link epoch and the agents' arrival and external traversal state.
 The reader also accepts the two historical version 2 layouts, each with
-one of those extensions. Unknown inner versions return
+one of those extensions. Version 4 adds deferred replanning state.
+
+Mixed crowds save as `NPCM` version 1. The header carries a u64 profile count,
+followed by each profile ID (u32) in ascending order and the SHA-256 of its
+`NPRS` record. A `DCRW` version 5 payload follows, with a u32 profile ID before
+each occupied agent's state and after each queue request handle (zero in a
+free request slot). The remaining fields follow version 4. Save after stepping
+following mesh edits. Restore residency and modifiers for all registered
+profiles before restoring the crowd. The live sliced search is rebound to
+the reconstructed epoch of its request's mesh.
+
+Framed mixed worlds save as `NPFM` version 1. This record binds the matching
+`DNFR` frame snapshot and embeds each frame's `NPCM` payload along with stable
+rider IDs, local handles, destinations and offered dock wait costs. Save and
+restore the frame snapshot separately. Both new wrappers end with a SHA-256
+checksum of their preceding bytes.
+
+Unknown inner versions return
 `Error::InvalidSnapshot(SnapshotError::WrongVersion)`, through
 `ProfileError::Navigation` for a profile restore. Unknown catalog or profile
 wrapper versions return `ProfileError::UnsupportedVersion`.

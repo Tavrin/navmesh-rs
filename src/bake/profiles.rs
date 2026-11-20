@@ -17,10 +17,12 @@ mod crowds;
 mod runtime;
 
 pub use catalog::{CatalogTile, ProfileCatalog, ProfileCatalogBuilder, ProfileMeshOptions};
+#[cfg(feature = "crowd-world")]
+pub use crowds::{
+    FramedMixedProfileCrowdWorld, MixedProfileCrowdWorld, ProfileCrowdWorld, ProfileWorldAgent,
+};
 #[cfg(feature = "crowd")]
 pub use crowds::{ProfileAgent, ProfileCrowd};
-#[cfg(feature = "crowd-world")]
-pub use crowds::{ProfileCrowdWorld, ProfileWorldAgent};
 pub use runtime::{
     ProfileConnectivity, ProfileCorner, ProfileMesh, ProfileMeshes, ProfilePoint, ProfilePolyRef,
     ProfilePreparedTile, ProfileQuery, ProfileTileRef,

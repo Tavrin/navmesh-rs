@@ -3,14 +3,21 @@
 //! Frame zero is the static world. Platform meshes, polygon refs and routes
 //! stay in local coordinates while the caller updates platform poses.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::Error;
+#[cfg(all(feature = "recast", feature = "crowd-world"))]
+use crate::bake::profiles::{ProfileId, ProfileMeshes};
 use crate::detour::{DefaultFilter, LinkId, NavMesh, NavMeshQuery, PolyRef};
 
 mod route;
 mod snapshot;
+#[cfg(feature = "crowd-world")]
+pub(crate) use route::ActiveSeam;
+#[cfg(all(feature = "recast", feature = "crowd-world"))]
+pub(crate) use route::FrameRouting;
 pub use route::{FrameLeg, FramePlan};
 
 type Point = [f32; 3];
@@ -130,8 +137,14 @@ impl DockSpec {
     }
 }
 
+enum FrameNav {
+    Native(Box<NavMesh>),
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    Profiles(ProfileMeshes),
+}
+
 struct Frame {
-    nav: NavMesh,
+    nav: FrameNav,
     pose: FramePose,
 }
 
@@ -156,6 +169,16 @@ pub struct FrameSet {
 impl FrameSet {
     /// Takes ownership of the static world mesh.
     pub fn new(world: NavMesh) -> Self {
+        Self::with_world(FrameNav::Native(Box::new(world)))
+    }
+
+    /// Creates a world frame with independently baked profile meshes.
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    pub fn with_profiles(world: ProfileMeshes) -> Self {
+        Self::with_world(FrameNav::Profiles(world))
+    }
+
+    fn with_world(world: FrameNav) -> Self {
         Self {
             frames: BTreeMap::from([(
                 FrameId::WORLD,
@@ -170,6 +193,21 @@ impl FrameSet {
 
     /// Installs a platform under an unused, nonzero frame id.
     pub fn add_frame(&mut self, id: FrameId, nav: NavMesh, pose: FramePose) -> Result<(), Error> {
+        self.insert_frame(id, FrameNav::Native(Box::new(nav)), pose)
+    }
+
+    /// Installs a platform holding its own catalog-bound profile meshes.
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    pub fn add_profile_frame(
+        &mut self,
+        id: FrameId,
+        meshes: ProfileMeshes,
+        pose: FramePose,
+    ) -> Result<(), Error> {
+        self.insert_frame(id, FrameNav::Profiles(meshes), pose)
+    }
+
+    fn insert_frame(&mut self, id: FrameId, nav: FrameNav, pose: FramePose) -> Result<(), Error> {
         pose.validate()?;
         if self.frames.contains_key(&id) {
             return Err(Error::InvalidParameter("duplicate frame id"));
@@ -180,12 +218,38 @@ impl FrameSet {
 
     /// Reads the mesh in a frame. Polygon refs are scoped to that mesh.
     pub fn mesh(&self, id: FrameId) -> Option<&NavMesh> {
-        Some(&self.frames.get(&id)?.nav)
+        match &self.frames.get(&id)?.nav {
+            FrameNav::Native(nav) => Some(nav),
+            #[cfg(all(feature = "recast", feature = "crowd-world"))]
+            FrameNav::Profiles(_) => None,
+        }
     }
 
     /// Updates a frame's resident tiles and its ordinary runtime off-mesh links.
     pub fn mesh_mut(&mut self, id: FrameId) -> Option<&mut NavMesh> {
-        Some(&mut self.frames.get_mut(&id)?.nav)
+        match &mut self.frames.get_mut(&id)?.nav {
+            FrameNav::Native(nav) => Some(nav),
+            #[cfg(all(feature = "recast", feature = "crowd-world"))]
+            FrameNav::Profiles(_) => None,
+        }
+    }
+
+    /// Reads the catalog-bound meshes in a profile frame.
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    pub fn profile_meshes(&self, id: FrameId) -> Option<&ProfileMeshes> {
+        match &self.frames.get(&id)?.nav {
+            FrameNav::Profiles(meshes) => Some(meshes),
+            FrameNav::Native(_) => None,
+        }
+    }
+
+    /// Updates a profile frame's catalogs, residency and modifiers.
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    pub fn profile_meshes_mut(&mut self, id: FrameId) -> Option<&mut ProfileMeshes> {
+        match &mut self.frames.get_mut(&id)?.nav {
+            FrameNav::Profiles(meshes) => Some(meshes),
+            FrameNav::Native(_) => None,
+        }
     }
 
     /// The registered frame ids, in ascending order.
@@ -265,7 +329,9 @@ impl FrameSet {
         }
         for p in [spec.a, spec.b] {
             validate_point(p.position)?;
-            self.require_mesh(p.frame)?;
+            if !self.frames.contains_key(&p.frame) {
+                return Err(Error::InvalidParameter("unknown frame"));
+            }
         }
         Ok(())
     }

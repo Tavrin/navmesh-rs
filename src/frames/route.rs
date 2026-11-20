@@ -7,7 +7,7 @@ use crate::{Budget, Budgeted};
 
 /// The two endpoints and the cost of one active dock seam.
 #[cfg(feature = "crowd-world")]
-type ActiveSeam = (FramePoint, FramePoint, f32);
+pub(crate) type ActiveSeam = (FramePoint, FramePoint, f32);
 
 /// One local corridor in a route, optionally ending at a dock crossing.
 #[derive(Clone, Debug, PartialEq)]
@@ -110,6 +110,98 @@ impl FrameSet {
         budget: &mut Budget,
         dock_cost: impl Fn(DockSpec, bool) -> Option<f32>,
     ) -> Result<Budgeted<Option<FramePlan>>, Error> {
+        FrameRouting::native(self).plan_from(from, to, half_extents, filter, budget, dock_cost)
+    }
+
+    #[cfg(feature = "crowd-world")]
+    pub(crate) fn active_seams(
+        &self,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<Vec<ActiveSeam>>, Error> {
+        FrameRouting::native(self).active_seams(budget)
+    }
+
+    /// Resolves an enabled dock's departure point and validates a crossing from
+    /// the agent's current position. Returns the destination ref and local point
+    /// once the agent is on the dock seam. No crossing is offered across a gap.
+    ///
+    /// The supplied polygon must be the agent's current ground polygon.
+    pub fn dock_landing(
+        &self,
+        id: LinkId,
+        from: FramePoint,
+        poly: PolyRef,
+        filter: &DefaultFilter,
+    ) -> Result<Option<(PolyRef, FramePoint)>, Error> {
+        FrameRouting::native(self).dock_landing(id, from, poly, filter)
+    }
+
+    pub(crate) fn dock_open(
+        &self,
+        id: LinkId,
+        a: FramePoint,
+        b: FramePoint,
+    ) -> Result<bool, Error> {
+        FrameRouting::native(self).dock_open(id, a, b)
+    }
+
+    pub(crate) fn cross_dock(
+        &self,
+        id: LinkId,
+        from: (PolyRef, FramePoint),
+        departure: FramePoint,
+        dest: (PolyRef, FramePoint),
+        filter: &DefaultFilter,
+    ) -> Result<Option<(PolyRef, FramePoint)>, Error> {
+        FrameRouting::native(self).cross_dock(id, from, departure, dest, filter)
+    }
+}
+
+pub(crate) struct FrameRouting<'a> {
+    frames: &'a FrameSet,
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    profile: Option<ProfileId>,
+}
+
+impl<'a> FrameRouting<'a> {
+    fn native(frames: &'a FrameSet) -> Self {
+        Self {
+            frames,
+            #[cfg(all(feature = "recast", feature = "crowd-world"))]
+            profile: None,
+        }
+    }
+
+    #[cfg(all(feature = "recast", feature = "crowd-world"))]
+    pub(crate) fn for_profile(frames: &'a FrameSet, profile: ProfileId) -> Self {
+        Self {
+            frames,
+            profile: Some(profile),
+        }
+    }
+
+    fn mesh(&self, id: FrameId) -> Option<&'a NavMesh> {
+        #[cfg(all(feature = "recast", feature = "crowd-world"))]
+        if let Some(profile) = self.profile {
+            return Some(&self.frames.profile_meshes(id)?.get(profile).ok()?.nav);
+        }
+        self.frames.mesh(id)
+    }
+
+    fn require_mesh(&self, id: FrameId) -> Result<&'a NavMesh, Error> {
+        self.mesh(id)
+            .ok_or(Error::InvalidParameter("unknown frame"))
+    }
+
+    pub(crate) fn plan_from(
+        &self,
+        from: (FramePoint, Option<PolyRef>),
+        to: FramePoint,
+        half_extents: Point,
+        filter: &DefaultFilter,
+        budget: &mut Budget,
+        dock_cost: impl Fn(DockSpec, bool) -> Option<f32>,
+    ) -> Result<Budgeted<Option<FramePlan>>, Error> {
         if filter.area_cost.iter().any(|v| !v.is_finite() || *v < 0.) {
             return Err(Error::InvalidParameter("filter costs"));
         }
@@ -134,7 +226,7 @@ impl FrameSet {
                 return Ok(None);
             };
             let mut edges = Vec::new();
-            for dock in self.docks.values() {
+            for dock in self.frames.docks.values() {
                 if !budget.spend(1) {
                     return Ok(None);
                 }
@@ -146,6 +238,9 @@ impl FrameSet {
                     return Err(Error::InvalidParameter("dock wait cost"));
                 }
                 let wait = f64::from(wait);
+                if self.mesh(spec.a.frame).is_none() || self.mesh(spec.b.frame).is_none() {
+                    continue;
+                }
                 let Some((a, b)) = self.landings(spec, filter, budget)? else {
                     if budget.is_exhausted() {
                         return Ok(None);
@@ -313,9 +408,12 @@ impl FrameSet {
     ) -> Result<Budgeted<Vec<ActiveSeam>>, Error> {
         let mut seams = Vec::new();
         let filter = DefaultFilter::default();
-        for dock in self.docks.values().filter(|d| d.enabled) {
+        for dock in self.frames.docks.values().filter(|d| d.enabled) {
             if !budget.spend(1) {
                 return Ok(Budgeted::Exhausted(Vec::new()));
+            }
+            if self.mesh(dock.spec.a.frame).is_none() || self.mesh(dock.spec.b.frame).is_none() {
+                continue;
             }
             let ends = self.landings(dock.spec, &filter, budget)?;
             if budget.is_exhausted() {
@@ -331,8 +429,10 @@ impl FrameSet {
     }
 
     fn aligned(&self, a: FramePoint, b: FramePoint) -> Result<bool, Error> {
-        Ok(distance_squared(self.world_wide(a)?, self.world_wide(b)?)
-            <= SEAM_EPSILON * SEAM_EPSILON)
+        Ok(
+            distance_squared(self.frames.world_wide(a)?, self.frames.world_wide(b)?)
+                <= SEAM_EPSILON * SEAM_EPSILON,
+        )
     }
 
     /// Resolves an enabled dock's departure point and validates a crossing from
@@ -340,7 +440,7 @@ impl FrameSet {
     /// once the agent is on the dock seam. No crossing is offered across a gap.
     ///
     /// The supplied polygon must be the agent's current ground polygon.
-    pub fn dock_landing(
+    fn dock_landing(
         &self,
         id: LinkId,
         from: FramePoint,
@@ -348,7 +448,7 @@ impl FrameSet {
         filter: &DefaultFilter,
     ) -> Result<Option<(PolyRef, FramePoint)>, Error> {
         validate_point(from.position)?;
-        let Some(dock) = self.docks.get(&id).filter(|d| d.enabled) else {
+        let Some(dock) = self.frames.docks.get(&id).filter(|d| d.enabled) else {
             return Ok(None);
         };
         let Some((mut a, mut b)) = self.landings(dock.spec, filter, &mut Budget::unlimited())?
@@ -367,7 +467,7 @@ impl FrameSet {
         a: FramePoint,
         b: FramePoint,
     ) -> Result<bool, Error> {
-        let Some(dock) = self.docks.get(&id).filter(|d| d.enabled) else {
+        let Some(dock) = self.frames.docks.get(&id).filter(|d| d.enabled) else {
             return Ok(false);
         };
         let forward = (dock.spec.a.frame, dock.spec.b.frame);
@@ -412,9 +512,10 @@ impl FrameSet {
             return Ok(None);
         }
         let pose = self
+            .frames
             .pose(dest.frame)
             .ok_or(Error::InvalidParameter("unknown frame"))?;
-        let local = finite_result(pose.local(self.world_wide(from)?))
+        let local = finite_result(pose.local(self.frames.world_wide(from)?))
             .ok_or(Error::InvalidParameter("dock landing"))?;
         let q = NavMeshQuery::new(dest_nav, 1)?;
         let landing = FramePoint::new(dest.frame, q.closest_point_on_poly(dest_poly, &local)?.0);
