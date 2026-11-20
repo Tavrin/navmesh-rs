@@ -582,3 +582,38 @@ Crowd target extended to the ORCA mode, seeded from the archived corpus (641 fil
 New target for `NavMesh::replace_tile` (model described in `fuzz/README.md`). Build only:
 `cargo +nightly fuzz build replace_ops` exits 0. No campaign has been run yet; the release rule
 (coverage flat for 10 minutes, 10 to 120 CPU-minutes, no crash) is still to be met.
+
+## 0.2.3 release run, 2026-11-20
+
+Toolchain: nightly, `cargo-fuzz`, libFuzzer with AddressSanitizer, `-rss_limit_mb=512`, seed 1. Rule:
+one fuzzer process per target, starting from the target's corpus; stop after 600 seconds without a
+coverage increase once at least 600 CPU-seconds have run, or at 7,200 CPU-seconds; no crash. The
+runs were done in three batches. `Coverage` is libFuzzer's edge count at the end of the run; every
+run started from an empty seed set and its own corpus.
+
+Four targets (`prepared_tile`, `framed_crowd_snapshot`, `profile_mixed_crowd`,
+`framed_profile_crowd`) ran in more than one batch. The table reports the final clean run of each.
+Earlier runs of these targets found problems that were fixed before the final run: a padding check
+in a fuzz target, an epoch tolerance in a test helper, and slow-unit reports caused by suspended
+runs (the reported inputs replayed in about 0.1 seconds).
+
+| Target | Stop reason | CPU seconds | Executions | Coverage |
+|---|---|---:|---:|---:|
+| `any_angle_query` | coverage flat | 2,488 | 88,863,110 | 1,682 |
+| `crowd_world_snapshot` | coverage flat | 2,062 | 24,340,365 | 1,192 |
+| `dndy_record` | coverage flat | 608 | 34,341,238 | 407 |
+| `incremental_bake` | CPU cap (7,200), still gaining edges | 7,200 | 111,209 | 9,081 |
+| `link_extract` | coverage flat | 619 | 73,153 | 3,433 |
+| `replace_ops` | coverage flat | 1,007 | 462,677 | 2,614 |
+| `runtime_links` | coverage flat | 1,037 | 7,061,692 | 2,076 |
+| `frame_snapshot` | coverage flat | 1,223 | 2,746,223 | 1,562 |
+| `profile_catalog` | coverage flat | 923 | 21,723,926 | 370 |
+| `profile_records` | coverage flat | 2,884 | 8,444,996 | 8,872 |
+| `prepared_tile` | coverage flat | 1,883 | 21,892,782 | 2,374 |
+| `sector_summary` | coverage flat | 2,271 | 24,386,205 | 4,859 |
+| `super_record` | coverage flat | 2,421 | 27,586,332 | 4,284 |
+| `framed_crowd_snapshot` | coverage flat | 4,113 | 4,558,767 | 4,931 |
+| `profile_mixed_crowd` | coverage flat | 1,402 | 2,197,893 | 4,624 |
+| `framed_profile_crowd` | coverage flat | 601 | 478,266 | 4,427 |
+
+The final runs wrote no artifact files.

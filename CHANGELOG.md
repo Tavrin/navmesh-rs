@@ -6,142 +6,142 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-11-20
+
 ### Added
 
-- Independent agent-size bake profiles with checked tile halos, versioned
-  catalogs, and profile-bound streaming, queries, connectivity and crowds.
-  See [Agent-size bake profiles](docs/BAKE-PROFILES.md).
-- Shared ORCA and sampled avoidance for agents on different bake profiles in
-  one crowd world, with profile-local routing, replanning, traversal and
-  moving-platform landings. Mixed snapshots preserve agent and queue profile
-  bindings.
-- Moving platform frames with yaw-only poses, runtime docks, cross-frame
-  routes, and stable riders for both crowds. Frame and framed crowd snapshots
-  restore dock availability and riders in transit. See
-  [moving platforms](docs/MOVING-PLATFORMS.md).
-
-- Tile-cache zones for selected columns via `bake::tile_cache_layers`.
-  `TileCache::update_budgeted` rebuilds affected layers in bounded slices,
-  preserving equal-content refs and applying registered modifiers on replacement.
+- Agent-size bake profiles: each agent size is baked as its own profile, with checked tile
+  halos and versioned catalogs. Streaming, queries, connectivity and crowds are bound to a
+  profile. See [Agent-size bake profiles](docs/BAKE-PROFILES.md).
+- Mixed-size crowds: agents on different bake profiles share one crowd world, with ORCA and
+  sampled avoidance between them. Routing, replanning, traversal and moving-platform landings
+  are per profile. Mixed snapshots keep each agent's and queue's profile binding.
+- Moving platform frames with yaw-only poses, runtime docks, routes across frames, and stable
+  riders for both crowds. Frame and framed-crowd snapshots restore dock availability and riders
+  that are in transit. See [moving platforms](docs/MOVING-PLATFORMS.md).
+- Tile-cache zones: `bake::tile_cache_layers` bakes selected columns as tile-cache layers.
+  `TileCache::update_budgeted` rebuilds the affected layers in bounded slices, keeps refs when
+  the new content is equal, and applies registered modifiers when it replaces a tile.
   See [Tile-cache zones](docs/TILE-CACHE-ZONES.md).
-- Managed runtime off-mesh connections with stable ids, optional reserved ground
-  link slots, typed landing reports, game-controlled availability and versioned
-  snapshots. Tile replacement and streaming re-resolve the registered links.
-- `OffMeshMode::External` in both crowds, with pending arrival reports and
-  explicit completion or abort. See [runtime links](docs/RUNTIME-LINKS.md).
-- Opt-in `dynamic` feature for gates and cost zones over baked polygons. The navmesh
-  owns the modifier layer, derives runtime flags and areas on install and reload, and
-  toggles stable IDs without rebuilding tiles or advancing their salts. Save the layer
-  in the versioned `DNDY` format. See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
-- Managed links require both landings to pass the query filter, so closing a
-  gate on either landing blocks paths through the link.
-- Tile change stamps cover residency, replacement, modifier edits and runtime
-  link changes. CrowdWorld replans affected corridors in the next step, with
-  an optional per-step cap. Crowd can opt in with `set_stamp_revalidation`.
-  See [crowd replanning](docs/CROWD-REPLANNING.md).
-
-- `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
-  agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
-  corridors, walls, corners and neighbours, and a sorted-cell neighbour grid rebuilt
-  each step (radix-sorted, no per-cell or 16-bit id cap). The per-agent phases run
-  data-parallel on the current rayon pool with the `parallel` feature; digests are
-  identical for any thread count. `step` charges `STEP_WORK_PER_AGENT` per active agent
-  plus the path queue's node expansions to a `Budget` before simulating and refuses
-  the step, untouched, when it does not fit. With an unchanged navmesh, agents
-  match `Crowd` with `UpstreamFixes::NEAREST_NEIGHBOURS` bit for bit. `'DCRW'` snapshots
-  (`to_bytes`/`from_bytes`) restore a world that steps identically on the same navmesh, including
-  in-progress sliced searches; malformed bytes give
-  `Error::InvalidSnapshot`.
+- Managed runtime off-mesh connections: stable ids, optional reserved ground link slots,
+  typed landing reports, availability controlled by the game, and versioned snapshots. Tile
+  replacement and streaming re-resolve the registered links.
+- `OffMeshMode::External` in both crowds: arrival reports stay pending until the game
+  completes or aborts the traversal. See [runtime links](docs/RUNTIME-LINKS.md).
+- Opt-in `dynamic` feature: gates and cost zones over baked polygons. The navmesh owns the
+  modifier layer and derives runtime flags and areas when modifiers are installed or reloaded.
+  Toggling a modifier by its stable id does not rebuild tiles or advance their salts. The
+  layer is saved in the versioned `DNDY` format. See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
+- A managed link is usable only if both landings pass the query filter, so closing a gate at
+  either landing blocks paths through the link.
+- Tile change stamps cover residency, replacement, modifier edits and runtime link changes.
+  `CrowdWorld` replans the affected corridors in the next step, with an optional per-step cap.
+  `Crowd` can opt in with `set_stamp_revalidation`. See [crowd replanning](docs/CROWD-REPLANNING.md).
+- `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24 agents.
+  - Agents use generational `AgentHandle`s. Hot per-agent data is in flat arrays; corridors,
+    walls, corners and neighbours are in a side pool.
+  - Neighbours come from a sorted-cell grid rebuilt each step (radix-sorted, with no per-cell
+    or 16-bit id cap).
+  - With the `parallel` feature, the per-agent phases run on the current rayon pool, and
+    digests are identical for any thread count.
+  - `step` charges `STEP_WORK_PER_AGENT` per active agent, plus the path queue's node
+    expansions, to a `Budget` before simulating. If the work does not fit, it refuses the step
+    and changes nothing.
+  - On an unchanged navmesh, each agent matches `Crowd` with `UpstreamFixes::NEAREST_NEIGHBOURS`
+    bit for bit.
+  - `'DCRW'` snapshots (`to_bytes`/`from_bytes`) restore a world that steps identically on the
+    same navmesh, including sliced searches in progress. Malformed bytes give
+    `Error::InvalidSnapshot`.
 - `PathQueue::pending`.
-- Shared goal fields (`crowd::field`): `GoalField`, a budgeted, resumable Dijkstra
-  flood from a goal over a region's polygons (radius or tile set) with Detour's
-  portal-midpoint cost model and a `(cost, tile, polygon)` tie rule independent of
-  tile slots, stored per tile without a node-pool cap. One-way off-mesh connections
-  are followed through a reverse link index. Every structural change starts a full budgeted rebuild. Previous values may
-  be served as `Stale`; `Fresh` values are exact only at `Ready` with a matching
-  mesh epoch. Lookups validate current residency and salt, and steering reports
-  freshness. Radius regions grow on refresh; cache keys include mesh identity.
-  Zero-budget cache steps refresh all entries for the mesh. Admission includes
-  column storage and key copies; exhausted cache counters return a typed error.
-  `GoalField::steer` funnels through the next three polygons. `GoalFieldCache`
-  shares fields by goal, filter and region with reference counts, least recently
-  used eviction and a byte cap that refuses oversized regions.
+- Shared goal fields (`crowd::field`).
+  - `GoalField` is a budgeted, resumable Dijkstra flood from a goal over the polygons of a
+    region (a radius or a tile set). It uses Detour's portal-midpoint cost model and a
+    `(cost, tile, polygon)` tie rule that does not depend on tile slots. Costs are stored per
+    tile, with no node-pool cap. One-way off-mesh connections are followed through a reverse
+    link index.
+  - Every structural change starts a full budgeted rebuild. Until then, previous values may be
+    served as `Stale`. `Fresh` values are exact only when the field is `Ready` and the mesh
+    epoch matches. Lookups check current residency and salt, and steering reports freshness.
+  - Radius regions grow on refresh; cache keys include mesh identity. A cache step with a zero
+    budget refreshes every entry for the mesh. Admission counts column storage and key copies;
+    when the cache counters are exhausted it returns a typed error.
+  - `GoalField::steer` steers through a funnel over the next three polygons.
+  - `GoalFieldCache` shares fields by goal, filter and region, with reference counts,
+    least-recently-used eviction and a byte cap. It refuses regions that are too large for the cap.
+- `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning `Replaced`:
+  swap the tile at a prepared tile's column and layer, all or nothing. Equal content (same
+  SHA-256) changes nothing: no salt advance, no epoch change, and runtime flags and areas are
+  kept. Other content takes the same slot with one salt advance. A refused replacement leaves
+  the resident tile with its salt, refs and runtime state.
+- Opt-in ref layouts for 64-bit refs: `RefLayout`, `NavMesh::with_layout`,
+  `NavMesh::ref_layout` and `prepare_tile_with_layout`. `RefLayout::WIDE_SALT` (22 salt,
+  28 tile, 14 polygon bits) allows 4,194,302 salt advances per slot instead of 65,534, with at
+  most 16,384 polygons per tile. The default layout and its refs are unchanged.
+- `NavMesh::salt_headroom`: the number of salt advances left for a tile's slot.
+- `replace_ops` fuzz target.
+- Long-route planner (`route` feature):
+  - Sector (`DNSS`) and super-sector (`DNSR`) records move to version 3; regenerate them from
+    the source tiles. Older versions are rejected with `InvalidSnapshot(WrongVersion)`.
+  - Stitched exits and super-sector sector lists carry a 64-bit summary content id. Records
+    from different bakes leave a super-sector stale, including records whose exits land in a
+    re-baked super-sector, or make `RouteIndex::build_exact` fail instead of combining them.
+    Decoders reject exits that name two content ids for one sector.
+  - Inserting every summary of a partial re-bake leaves fresh records in any order. Summary
+    versions are computed once instead of on every check.
+  - Inserting and decoding records charge their work against `Limits::max_work`. Decoders also
+    reject duplicate or skipped super-region members, portals off their side, self-loop exits
+    and costs the region arcs do not connect.
+  - `SectorSummary::build` charges its transition cost table before allocating it.
+  - `Navigator` charges node-pool setup, finalization and string pulling. It retries a
+    single-sector window with the whole pool before failing, rejects pools smaller than the
+    largest sector, and binds the atlas to the whole filter. It clears every request when
+    `update` sees an invalidating edit, and fails only the affected requests when `sync` finds
+    an unloaded tile. Label costs stay finite at huge coordinates. Finished coarse searches'
+    label arrays are recycled instead of freed inside an update slice, where the allocator
+    could return heap memory to the system at several times the slice's cost.
+  - Unstitched indexes are documented as hints.
+  - New fuzz targets `sector_summary` and `super_record`.
+- Arrival policies: shared point goals can use mesh-checked goal slots and optional park or
+  remove policies in both crowd managers, so agents do not crowd one destination. Existing
+  arrival behavior remains the default.
 
 ### Changed
 
-- CrowdWorld writes `DCRW` version 4 or later for arrival policies or external traversal.
-  It reads the legacy version 2 and 3 layouts. `to_bytes` records the navmesh change epoch
-  of the last step so a restored world replans exactly where the original would.
+- `CrowdWorld` writes `DCRW` version 4 or later when arrival policies or external traversal
+  are used. It still reads the version 2 and 3 layouts. `to_bytes` records the navmesh change
+  epoch of the last step, so a restored world replans exactly where the original would.
 - Tile bytes: trailing bytes that are not an exact 12-byte reference-layout trailer are
-  ignored again, as before layouts existed; a trailer with an unknown version gives
-  `TileDataError::WrongVersion`, and a trailer naming the default layout no longer
-  changes the tile's content hash.
-- `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
-  `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
-- `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning
-  `Replaced`: swaps the tile at a prepared tile's column and layer all or nothing. Equal
-  content (same SHA-256) changes nothing: no salt advance, no epoch change, runtime flags
-  and areas kept. Other content takes the same slot with one salt advance. A refusal
-  leaves the resident tile with its salt, refs and runtime state.
-- Opt-in ref layouts for 64-bit refs: `RefLayout`, `NavMesh::with_layout`,
-  `NavMesh::ref_layout` and `prepare_tile_with_layout`. `RefLayout::WIDE_SALT` (22 salt,
-  28 tile, 14 polygon bits) allows 4,194,302 salt advances per slot instead of 65,534, with
-  at most 16,384 polygons per tile. The default layout and its refs are unchanged.
-- `NavMesh::salt_headroom`: salt advances left for a tile's slot.
-- Residency records version 4 and unload-state footers version 3 name an explicit ref
-  layout. Navmeshes with the default layout still write versions 3 and 2, byte for byte as
-  before.
-- `replace_ops` fuzz target.
-- `TileInstaller` installs through `prepare_tile` and `replace_tile`. Pushing the bytes of
-  the resident tile again keeps its refs and runtime flags; a refused tile no longer comes
-  back under a new salt with its flags reset. The layer comes from the tile header instead
-  of assuming layer 0 (removals still remove layer 0), and bytes whose header names
-  another column than the entry's key are refused. Installation now also computes the
-  tile's SHA-256 identity.
-- `TileCache` rebuilds replace the resident tile in place: a refused rebuild keeps the
-  resident tile instead of losing it. Identical bytes still advance the salt by default,
-  as upstream does, so tile-cache parity is unchanged; the new
-  `TileCache::set_keep_identical_tiles(true)` makes them keep the tile's refs, salt and
-  runtime flags.
+  ignored again, as before layouts existed. A trailer with an unknown version gives
+  `TileDataError::WrongVersion`. A trailer that names the default layout no longer changes the
+  tile's content hash.
+- `Crowd::update`'s per-agent phase arithmetic moved into functions shared with `CrowdWorld`.
+  The order of operations is unchanged, so trajectories are unchanged.
+- Residency records version 4 and unload-state footers version 3 name an explicit ref layout.
+  A navmesh with the default layout still writes versions 3 and 2, byte for byte as before.
+- `TileInstaller` installs through `prepare_tile` and `replace_tile`.
+  - Pushing the bytes of the resident tile again keeps its refs and runtime flags.
+  - A refused tile no longer comes back under a new salt with its flags reset.
+  - The layer comes from the tile header instead of being assumed to be layer 0. Removals still
+    remove layer 0.
+  - Bytes whose header names a different column than the entry's key are refused.
+  - Installation now also computes the tile's SHA-256 identity.
+- `TileCache` rebuilds replace the resident tile in place, so a refused rebuild keeps the
+  resident tile instead of losing it. As in upstream, identical bytes still advance the salt by
+  default, so tile-cache parity is unchanged. `TileCache::set_keep_identical_tiles(true)` makes
+  identical bytes keep the tile's refs, salt and runtime flags.
 
 ### Fixed
 
-- Long routes (`route` feature): sector (`DNSS`) and super-sector (`DNSR`) records
-  move to version 3; regenerate them from the source tiles. Older versions are
-  rejected with `InvalidSnapshot(WrongVersion)`. Stitched exits and super-sector
-  sector lists carry a 64-bit summary content id, so records of different bakes
-  leave a super-sector stale, including records whose exits land in a re-baked
-  super-sector, or fail `RouteIndex::build_exact` instead of combining; decoders
-  reject exits naming two content ids for one sector. Inserting every summary
-  of a partial re-bake leaves fresh records in any order, and summary versions
-  are computed once instead of on every check.
-  Inserting and decoding records charge their work against `Limits::max_work`;
-  decoders also reject duplicate or skipped super-region members, portals off
-  their side, self-loop exits and costs the region arcs do not connect.
-  `SectorSummary::build` charges its transition cost table before allocating it.
-  `Navigator` charges node-pool setup, finalization and string pulling, retries
-  a single-sector window with the whole pool before failing, rejects pools
-  smaller than the largest sector, binds the atlas to the whole filter, clears
-  every request when `update` sees an invalidating edit, fails only the affected
-  requests when `sync` finds an unloaded tile, and keeps label costs finite at
-  huge coordinates, and recycles finished coarse searches' label arrays instead
-  of freeing them inside an update slice, where the allocator could return heap
-  memory to the system at several times the slice's cost. Unstitched indexes
-  are documented as hints. New fuzz targets
-  `sector_summary` and `super_record`.
-- Shared point goals can use mesh-checked goal slots and optional park or remove
-  arrival policies in both crowd managers, preventing congestion at one destination.
-  Existing arrival behavior remains the default.
-- Persisted nondefault ref layouts now tag bare tile state (DNMS version 2)
-  and exported tile bytes (NRFL version 1 trailer). All restore paths check
-  provenance before mutation, including colliding numeric refs and bare restore
-  of unload state. Untagged legacy files mean default layout; default output is
-  unchanged. Old default files load; new readers reject unknown layouts.
-- Tile-cache processors cannot retarget a rebuild to another tile or layer.
-- Layer-header decoding and cache rebuild use checked or infallible conversions
-  instead of unwraps.
-- Document prepared content identity, including nondefault layout provenance,
-  and make the replacement property model retain those installed bytes.
+- Persisted nondefault ref layouts now tag bare tile state (DNMS version 2) and exported tile
+  bytes (NRFL version 1 trailer). Every restore path checks the tag before changing anything,
+  including colliding numeric refs and bare restore of unload state. Untagged legacy files mean
+  the default layout; default output is unchanged. Old default files load; new readers reject
+  unknown layouts.
+- Tile-cache processors can no longer retarget a rebuild to another tile or layer.
+- Layer-header decoding and cache rebuild use checked or infallible conversions instead of
+  unwraps.
+- Document prepared content identity, including nondefault layout provenance, and make the
+  replacement property model retain the installed bytes.
 
 ## [0.2.2] - 2026-11-06
 
@@ -504,7 +504,11 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.6...v0.2.0
 [0.1.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.1.2...v0.1.3

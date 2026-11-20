@@ -204,15 +204,15 @@ up to 2^24 agents behind generational handles, a world-wide sorted-cell neighbou
 grid, steps charged per active agent to a `Budget` before they run, and `'DCRW'`
 snapshots. `CrowdWorld::default_agent_params()` selects ORCA; explicitly supplied
 agent parameters are preserved. With `parallel`, its per-agent phases run on the current rayon pool and
-give the same result for every thread count. Each agent gets the trajectory `Crowd`
-gives with `UpstreamFixes::NEAREST_NEIGHBOURS`, bit for bit.
+give the same result for every thread count. Each agent follows the same trajectory as in
+`Crowd` with `UpstreamFixes::NEAREST_NEIGHBOURS`, bit for bit.
 
 For many agents with one destination, `crowd::field::GoalField` (not in
-recastnavigation) floods costs from the goal over a region's polygons once, with
+recastnavigation) computes path costs from the goal over a region's polygons once, with
 Detour's cost model, and steers each agent through a short funnel along it.
-Builds are budgeted and resumable, a tile change in the region starts a budgeted rebuild
-while earlier values are served as stale, and `GoalFieldCache` shares fields by goal, filter and region under
-a byte cap.
+Builds are budgeted and resumable. A tile change in the region starts a budgeted rebuild,
+and earlier values are served as stale until it finishes. `GoalFieldCache` shares fields by
+goal, filter and region under a byte cap.
 
 ## Dynamic obstacles
 
