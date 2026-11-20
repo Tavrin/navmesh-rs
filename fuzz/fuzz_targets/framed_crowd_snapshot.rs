@@ -3,7 +3,7 @@
 //! bound to a lift.
 //!
 //! Properties: the reader never panics; an accepted record is saved back byte for byte, except
-//! that a stored mesh-epoch ahead of the live mesh rebinds to it; the restored crowd steps under
+//! that a stored mesh-epoch of zero (absent) or ahead of the live mesh rebinds to it; the restored crowd steps under
 //! a budget without panicking.
 use libfuzzer_sys::fuzz_target;
 use navmesh_fuzz::persisted::{self, LIMITS};

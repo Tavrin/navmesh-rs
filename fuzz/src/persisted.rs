@@ -36,9 +36,10 @@ pub fn repaired(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
-/// Whether `saved` is `input` with only mesh-epoch words lowered. A crowd snapshot restored
-/// onto a mesh whose epoch is behind the stored one rebinds that word to the live epoch, so
-/// the re-encoding differs from the input in exactly those little-endian `u64` words.
+/// Whether `saved` is `input` with only mesh-epoch words rebound. A crowd snapshot restored
+/// onto a mesh whose epoch is behind the stored one, or whose stored epoch is zero (absent),
+/// rebinds that word to the live epoch, so the re-encoding differs from the input in exactly
+/// those little-endian `u64` words: lowered, or raised from zero.
 pub fn rebinds_only_epochs(saved: &[u8], input: &[u8]) -> bool {
     if saved.len() != input.len() {
         return false;
@@ -50,9 +51,9 @@ pub fn rebinds_only_epochs(saved: &[u8], input: &[u8]) -> bool {
             i += 1;
             continue;
         }
-        let Some(at) = (i.saturating_sub(7)..=i)
-            .find(|&t| t + 8 <= saved.len() && word(saved, t) < word(input, t))
-        else {
+        let Some(at) = (i.saturating_sub(7)..=i).find(|&t| {
+            t + 8 <= saved.len() && (word(input, t) == 0 || word(saved, t) < word(input, t))
+        }) else {
             return false;
         };
         i = at + 8;
@@ -522,4 +523,33 @@ thread_local! {
 /// Runs `f` on a two-frame profile world and a valid `NPFM` record bound to it.
 pub fn with_framed_profiles<R>(f: impl FnOnce(&FrameSet, &[u8]) -> R) -> R {
     FRAMED_PROFILES.with(|x| f(&x.frames, &x.bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rebinds_only_epochs;
+
+    fn record(epoch: u64, tail: u8) -> Vec<u8> {
+        let mut b = vec![9; 5];
+        b.extend_from_slice(&epoch.to_le_bytes());
+        b.push(tail);
+        b
+    }
+
+    #[test]
+    fn epoch_words_rebind_down_or_from_zero_only() {
+        assert!(rebinds_only_epochs(&record(3, 1), &record(7, 1)), "lowered");
+        assert!(
+            rebinds_only_epochs(&record(3, 1), &record(0, 1)),
+            "absent, bound to live"
+        );
+        assert!(
+            !rebinds_only_epochs(&record(7, 1), &record(3, 1)),
+            "raised from a nonzero epoch"
+        );
+        assert!(
+            !rebinds_only_epochs(&record(3, 2), &record(0, 1)),
+            "a byte outside the word"
+        );
+    }
 }
