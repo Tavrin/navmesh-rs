@@ -1068,7 +1068,6 @@ fn crowd_world_snapshots_are_bound_to_profile_and_replay_with_restored_refs() {
 }
 
 #[cfg(all(target_os = "linux", feature = "parallel"))]
-#[allow(dead_code)]
 mod common;
 
 #[cfg(all(target_os = "linux", feature = "parallel"))]
