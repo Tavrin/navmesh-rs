@@ -617,3 +617,15 @@ runs (the reported inputs replayed in about 0.1 seconds).
 | `framed_profile_crowd` | coverage flat | 601 | 478,266 | 4,427 |
 
 The final runs wrote no artifact files.
+
+## 0.2.4 release run, 2026-11-20
+
+Same toolchain and rule as the 0.2.3 run. The two targets that cover the changed code ran on the
+release candidate, starting from their 0.2.3 corpora.
+
+| Target | Stop reason | CPU seconds | Executions | Coverage |
+|---|---|---:|---:|---:|
+| `dndy_record` | coverage flat | 600.1 | 4,000,875 | 710 |
+| `replace_ops` | coverage flat | 600.8 | 58,345 | 2,679 |
+
+No crashes.
