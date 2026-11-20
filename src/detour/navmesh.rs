@@ -13,7 +13,11 @@ use crate::common::floorf;
 use crate::{Error, Limits, TileDataError};
 use alloc::boxed::Box;
 
+mod links;
+#[cfg(feature = "dynamic")]
+mod modifiers;
 mod replace;
+pub use links::{Landing, LinkId, LinkReport, LinkSpec};
 pub(crate) mod stream;
 pub use replace::Replaced;
 pub use stream::{
@@ -65,6 +69,8 @@ struct Slot {
     /// Content hash of the resident tile when it is known without hashing again
     /// (tiles committed from a [`PreparedTile`]).
     hash: Option<[u8; 32]>,
+    #[cfg(feature = "dynamic")]
+    state_stamp: u64,
 }
 
 /// A never-allocated slot (read through [`SlotTable`] for pages not allocated yet).
@@ -75,6 +81,8 @@ static EMPTY_SLOT: Slot = Slot {
     used: false,
     parked: None,
     hash: None,
+    #[cfg(feature = "dynamic")]
+    state_stamp: 0,
 };
 
 /// Slots per page of a keyed navmesh (pages are allocated on first use, so a large
@@ -207,8 +215,11 @@ pub struct NavMesh {
     occupied: Option<[i32; 4]>,
     /// Whether off-mesh connections resolve their far endpoint in any tile.
     global_off_mesh: bool,
+    runtime_links: links::RuntimeLinks,
     /// Streaming state: slot policy, unloaded tiles, known columns, epoch.
     stream: stream::StreamState,
+    #[cfg(feature = "dynamic")]
+    modifiers: modifiers::Modifiers,
 }
 
 /// A slot chosen for a tile, before anything changed.
@@ -443,9 +454,15 @@ fn alloc_link(tile: &mut MeshTile) -> u32 {
 }
 
 fn free_link(tile: &mut MeshTile, link: u32) {
+    let ordinary = tile.links.len() - tile.spare_links as usize;
     if let Some(l) = tile.links.get_mut(link as usize) {
-        l.next = tile.links_free_list;
-        tile.links_free_list = link;
+        let free = if link as usize >= ordinary {
+            &mut tile.runtime_links_free_list
+        } else {
+            &mut tile.links_free_list
+        };
+        l.next = *free;
+        *free = link;
     }
 }
 
@@ -535,6 +552,27 @@ pub(crate) fn poly_height(tile: &MeshTile, ip: usize, pos: &[f32]) -> Option<f32
         }
     }
     Some(closest_point_on_detail_edges(tile, ip, pos, false)[1])
+}
+
+// Shared by in-mesh runtime links and cross-frame dock endpoints.
+pub(crate) fn link_landing_candidate(
+    tile: &MeshTile,
+    ip: usize,
+    point: [f32; 3],
+) -> Option<([f32; 3], f64)> {
+    if tile.polys.get(ip)?.poly_type() != super::POLYTYPE_GROUND {
+        return None;
+    }
+    let (snap, _) = closest_point_on_poly_in_tile(tile, ip, &point);
+    let d = snap
+        .into_iter()
+        .zip(point)
+        .map(|(a, b)| {
+            let delta = f64::from(a) - f64::from(b);
+            delta * delta
+        })
+        .sum();
+    Some((snap, d))
 }
 
 /// `dtNavMesh::closestPointOnPoly` on polygon `ip` of `tile`.
@@ -756,7 +794,10 @@ impl NavMesh {
             resident: 0,
             occupied: None,
             global_off_mesh: false,
+            runtime_links: links::RuntimeLinks::default(),
             stream: stream::StreamState::new(policy)?,
+            #[cfg(feature = "dynamic")]
+            modifiers: modifiers::Modifiers::default(),
         })
     }
 
@@ -952,6 +993,17 @@ impl NavMesh {
             .collect()
     }
 
+    fn ground_tiles_at(&self, x: i32, y: i32, max: usize) -> Vec<usize> {
+        self.chain(x, y)
+            .filter(|&i| {
+                self.tile(i).is_some_and(|t| {
+                    t.header.x == x && t.header.y == y && self.link_layer() != Some(t.header.layer)
+                })
+            })
+            .take(max)
+            .collect()
+    }
+
     /// Tile-grid bounds `[min x, min y, max x, max y]` that cover every resident
     /// tile (`None` when the navmesh is empty). The bounds grow as tiles are added
     /// and may stay wider than the resident tiles after removals.
@@ -983,7 +1035,7 @@ impl NavMesh {
         if cells <= self.slots.len() as u64 {
             for y in y0..=y1 {
                 for x in x0..=x1 {
-                    for ti in self.tiles_at(x, y, 32) {
+                    for ti in self.ground_tiles_at(x, y, 32) {
                         if !f(ti) {
                             return;
                         }
@@ -1003,7 +1055,7 @@ impl NavMesh {
         locs.sort_unstable();
         locs.dedup();
         for (y, x) in locs {
-            for ti in self.tiles_at(x, y, 32) {
+            for ti in self.ground_tiles_at(x, y, 32) {
                 if !f(ti) {
                     return;
                 }
@@ -1015,7 +1067,7 @@ impl NavMesh {
         let (dx, dy) = side_offset(side);
         // A neighbour outside the i32 grid does not exist.
         match (x.checked_add(dx), y.checked_add(dy)) {
-            (Some(nx), Some(ny)) => self.tiles_at(nx, ny, 32),
+            (Some(nx), Some(ny)) => self.ground_tiles_at(nx, ny, 32),
             _ => Vec::new(),
         }
     }
@@ -1102,6 +1154,8 @@ impl NavMesh {
     fn poly_mut(&mut self, r: PolyRef) -> Result<&mut Poly, Error> {
         self.tile_and_poly_by_ref(r)?;
         let (_, it, ip) = self.decode_poly_id(r);
+        #[cfg(feature = "dynamic")]
+        self.check_unmanaged(it as usize, ip as usize)?;
         self.slots
             .get_mut(it as usize)
             .and_then(|s| s.tile.as_deref_mut())
@@ -1109,9 +1163,17 @@ impl NavMesh {
             .ok_or(Error::InvalidRef)
     }
 
-    /// Sets a polygon's flags.
+    /// Sets a polygon's flags. A polygon governed by a modifier returns
+    /// [`Error::InvalidParameter`].
     pub fn set_poly_flags(&mut self, r: PolyRef, flags: u16) -> Result<(), Error> {
-        self.poly_mut(r)?.flags = flags;
+        let poly = self.poly_mut(r)?;
+        #[cfg(feature = "dynamic")]
+        let changed = poly.flags != flags;
+        poly.flags = flags;
+        #[cfg(feature = "dynamic")]
+        if changed {
+            self.stamp_state(self.decode_poly_id(r).1 as usize);
+        }
         Ok(())
     }
 
@@ -1120,9 +1182,17 @@ impl NavMesh {
         Ok(self.tile_and_poly_by_ref(r)?.1.flags)
     }
 
-    /// Sets a polygon's area.
+    /// Sets a polygon's area. A polygon governed by a modifier returns
+    /// [`Error::InvalidParameter`].
     pub fn set_poly_area(&mut self, r: PolyRef, area: u8) -> Result<(), Error> {
-        self.poly_mut(r)?.set_area(area);
+        let poly = self.poly_mut(r)?;
+        #[cfg(feature = "dynamic")]
+        let before = poly.area();
+        poly.set_area(area);
+        #[cfg(feature = "dynamic")]
+        if before != poly.area() {
+            self.stamp_state(self.decode_poly_id(r).1 as usize);
+        }
         Ok(())
     }
 
@@ -1195,7 +1265,7 @@ impl NavMesh {
 
     /// Restores polygon flags and areas stored by [`NavMesh::store_tile_state`]
     /// (`dtNavMesh::restoreTileState`). The tile's ref and polygon refs do not
-    /// change.
+    /// change. Governed polygons keep their derived flags and areas.
     ///
     /// The blob is untrusted: it is checked completely before the tile is touched.
     /// Errors, in upstream's order: [`Error::InvalidRef`] for a ref that is not a
@@ -1210,12 +1280,23 @@ impl NavMesh {
         let polys = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?.polys.len();
         let size = stream::check_state(tile, polys, data, self.ref_layout())?;
         let (_, it, _) = self.decode_poly_id(tile);
-        let t = self
+        self.restore_checked_state(it as usize, data, size)
+    }
+
+    fn restore_checked_state(&mut self, ti: usize, data: &[u8], size: usize) -> Result<(), Error> {
+        let tile = self
             .slots
-            .get_mut(it as usize)
+            .get_mut(ti)
             .and_then(|s| s.tile.as_deref_mut())
             .ok_or(Error::InvalidRef)?;
-        stream::apply_state(t, data, size);
+        #[cfg(feature = "dynamic")]
+        {
+            if stream::apply_state(tile, data, size, |ip| self.modifiers.governs(ti, ip)) {
+                self.stamp_state(ti);
+            }
+        }
+        #[cfg(not(feature = "dynamic"))]
+        stream::apply_state(tile, data, size, |_| false);
         Ok(())
     }
 
@@ -1275,6 +1356,7 @@ impl NavMesh {
 
     fn insert_tile(&mut self, mut data: Vec<u8>, place: Placement) -> Result<TileRef, Error> {
         let h = peek_header(&data)?;
+        self.check_ground_layer(h.layer)?;
         if PolyRef::BITS == 32
             && (h.poly_count < 0 || self.poly_bits < ilog2(next_pow2(h.poly_count as u32)))
         {
@@ -1408,6 +1490,10 @@ impl NavMesh {
         internally_linked: bool,
     ) -> TileRef {
         let ti = target.ti;
+        let mut tile = tile;
+        tile.managed_link_tile = self.link_layer() == Some(tile.header.layer);
+        #[cfg(feature = "dynamic")]
+        let stamp = self.modifiers.attach_tile(&mut tile, ti);
         let h = &tile.header;
         let (hx, hy, hl) = (h.x, h.y, h.layer);
 
@@ -1431,6 +1517,10 @@ impl NavMesh {
         s.salt = salt;
         s.parked = None;
         s.tile = Some(Box::new(tile));
+        #[cfg(feature = "dynamic")]
+        {
+            s.state_stamp = stamp;
+        }
         s.hash = hash;
         s.used = true;
         self.stream.bump_epoch();
@@ -1440,6 +1530,9 @@ impl NavMesh {
             Some([x0, y0, x1, y1]) => [x0.min(hx), y0.min(hy), x1.max(hx), y1.max(hy)],
         });
 
+        if self.link_layer() == Some(hl) {
+            return self.tile_ref(ti);
+        }
         let base = self.base_ref(ti);
         let tile = self.tile_mut(ti);
         if internally_linked {
@@ -1456,7 +1549,7 @@ impl NavMesh {
         }
         self.base_off_mesh_links(ti);
         self.connect_ext_off_mesh_links(ti, ti, -1);
-        for j in self.tiles_at(hx, hy, 32) {
+        for j in self.ground_tiles_at(hx, hy, 32) {
             if j == ti {
                 continue;
             }
@@ -1476,6 +1569,7 @@ impl NavMesh {
         if self.global_off_mesh {
             self.rebuild_global_links();
         }
+        self.runtime_ground_changed();
         self.tile_ref(ti)
     }
 
@@ -1486,9 +1580,11 @@ impl NavMesh {
     /// trailer, which must be retained alongside saved refs.
     pub fn remove_tile(&mut self, r: TileRef) -> Result<Vec<u8>, Error> {
         let ti = self.resident_slot(r)?;
+        self.check_ground_layer(self.tile_unchecked(ti as u32).header.layer)?;
         let next = self.next_salt(self.slots[ti].salt)?;
         let tile = self.detach(ti);
         self.release_slot(ti, next);
+        self.runtime_ground_changed();
         Ok(tile.map(|t| t.data).unwrap_or_default())
     }
 
@@ -1540,11 +1636,17 @@ impl NavMesh {
     /// global pairs. The slot's salt, free-list state and reservation are left to
     /// the caller.
     fn detach(&mut self, ti: usize) -> Option<Box<MeshTile>> {
-        let (x, y) = self.tile(ti).map(|t| (t.header.x, t.header.y))?;
+        let (x, y, layer) = self
+            .tile(ti)
+            .map(|t| (t.header.x, t.header.y, t.header.layer))?;
+        let ground = self.link_layer() != Some(layer);
+        if ground {
+            self.clear_runtime_edges();
+        }
         if !self.stream.is_keyed() {
             self.unlink_lookup(ti, x, y);
         }
-        for j in self.tiles_at(x, y, 32) {
+        for j in self.ground_tiles_at(x, y, 32) {
             if j != ti {
                 self.unconnect_links(j, ti);
             }
@@ -1554,13 +1656,17 @@ impl NavMesh {
                 self.unconnect_links(j, ti);
             }
         }
-        if self.global_off_mesh {
+        if self.global_off_mesh && ground {
             self.disconnect_global_pairs(ti);
         }
         let tile = self.slots[ti].tile.take();
+        #[cfg(feature = "dynamic")]
+        if let Some(tile) = tile.as_deref() {
+            self.modifiers.detach_tile(tile, ti);
+        }
         self.slots[ti].hash = None;
         self.resident = self.resident.saturating_sub(1);
-        if self.global_off_mesh {
+        if self.global_off_mesh && ground {
             self.rebuild_global_links();
         }
         if self.resident == 0 {
@@ -1868,7 +1974,7 @@ impl NavMesh {
     /// Rebuild global pairs in lexicographic tile-key order. Prepending links
     /// makes the greatest landing key the snapped endpoint and first link.
     fn rebuild_global_links(&mut self) {
-        let mut resident = self.resident_slots();
+        let mut resident = self.ground_slots();
         resident.sort_unstable_by_key(|&i| {
             let h = &self.tile_unchecked(i as u32).header;
             (h.x, h.y, h.layer)
@@ -1929,7 +2035,7 @@ impl NavMesh {
 
     /// Removes the global links between `ti` and every other tile, in both roles.
     fn disconnect_global_pairs(&mut self, ti: usize) {
-        for j in self.resident_slots() {
+        for j in self.ground_slots() {
             if j != ti {
                 self.disconnect_global_pair(j, ti);
                 self.disconnect_global_pair(ti, j);
@@ -2010,7 +2116,7 @@ impl NavMesh {
         if enabled == self.global_off_mesh {
             return;
         }
-        let resident = self.resident_slots();
+        let resident = self.ground_slots();
         if enabled {
             self.global_off_mesh = true;
             self.rebuild_global_links();
@@ -2095,4 +2201,7 @@ static EMPTY_TILE: MeshTile = MeshTile {
     off_mesh_cons: Vec::new(),
     data: Vec::new(),
     links_free_list: NULL_LINK,
+    runtime_links_free_list: NULL_LINK,
+    spare_links: 0,
+    managed_link_tile: false,
 };

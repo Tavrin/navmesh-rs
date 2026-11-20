@@ -54,6 +54,30 @@ Structural connectivity ignores area and cost filters. Each crowd has its own
 agents and avoidance neighbours. Resize an agent by removing it and admitting
 it to the destination profile.
 
+## Gates, cache zones and platforms
+
+With the `dynamic` feature, each profile mesh owns its own modifier layer.
+Install it with `set_dynamic_layer` and toggle stable IDs with
+`set_modifier_enabled`. To close a gate for several sizes, apply the same
+command to each eligible profile before the next query or crowd tick. The
+selected polygons can differ by profile. The mesh reapplies its layer as
+tiles attach after a catalog update, reload or residency restore. Save the
+[modifier record](DYNAMIC-MODIFIERS.md) separately for each profile and
+register it before restoring the crowd. Catalog hashes describe baked tiles.
+
+Version 1 profile catalogs describe ordinary layer-zero bake output. The
+profile API currently has no bindings for tile-cache zones, generated runtime
+link layers or platform frames. Use separate native meshes for these systems.
+A [tile-cache zone](TILE-CACHE-ZONES.md) for each size requires layers built at
+that size's erosion radius and its own cache and obstacle state. For
+[moving platforms](MOVING-PLATFORMS.md), assemble a separate `FrameSet` and
+`FramedCrowd` per size from the corresponding baked world and platform tiles.
+The framed save stores riders and frame bindings. The application must associate
+that save with the correct size. `NPCW` saves bind a single catalog and mesh.
+Direct mutation of the underlying mesh could bypass catalog validation. Adding
+catalog support requires binding the additional layers, cache rebuild identities
+or frame meshes and migrating the affected saves.
+
 ## On-disk bindings
 
 All integer fields are little-endian. Version 1 supports ordinary baked DNAV
@@ -61,6 +85,8 @@ at layer zero. The catalog header has magic `NPCG`, version (u32), map ID
 (16 bytes), revision (u64), profile ID (u32), a SHA-256 descriptor digest and
 entry count (u64). The descriptor covers the effective bake settings, original
 float bits, full grid, reference width and layout, mesh options and limits.
+It also binds nonzero spare link reservations. A zero reservation uses the
+same descriptor as a catalog created before the option was introduced.
 Each entry contains x and z (i32), a presence byte, two SHA-256 hashes (raw and
 prepared) and polygon count (u32). Empty entries have a zero payload. Entries
 are strictly ordered by z, then x. The catalog identity is the SHA-256 of the
@@ -78,5 +104,15 @@ check integrity. Obtain persisted records from the application's save store.
 On restore, open an empty mesh, restore its residency, then commit the required
 tiles. Saved polygon refs are rebound to the new mesh instance. Restore the
 crowd world after loading its required tiles. An active crowd search must
-still match its mesh when saved. Its epoch is rebound to the restored mesh. Unknown catalog or wrapper versions
-return `ProfileError::UnsupportedVersion`.
+still match its mesh when saved. The embedded `DCRW` uses zero in the existing
+search epoch field, and restore rebinds it to the restored mesh's epoch.
+
+Both the profile `NPCW` and framed `DCFR` wrappers use the ordinary `DCRW`
+reader and writer. The original base layout (version 1) loads with default
+arrival and traversal settings. The extended layout (version 3) adds the
+runtime-link epoch and the agents' arrival and external traversal state.
+The reader also accepts the two historical version 2 layouts, each with
+one of those extensions. Unknown inner versions return
+`Error::InvalidSnapshot(SnapshotError::WrongVersion)`, through
+`ProfileError::Navigation` for a profile restore. Unknown catalog or profile
+wrapper versions return `ProfileError::UnsupportedVersion`.

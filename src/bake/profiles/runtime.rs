@@ -12,6 +12,8 @@ use crate::detour::{
     self, NavMesh, NavMeshQuery, PolyRef, PreparedTile, QueryFilter, RefState, ResidencyRecord,
     Status, TileRef,
 };
+#[cfg(feature = "dynamic")]
+use crate::dynamic::{DynamicLayer, ModifierId};
 use crate::{Budget, Budgeted, Error};
 
 /// A polygon reference tied to the instance that issued it.
@@ -174,6 +176,28 @@ impl ProfileMeshes {
         self.mesh_mut(id)?.restore_residency(bytes)
     }
 
+    /// Installs or clears the modifier layer in the selected profile.
+    #[cfg(feature = "dynamic")]
+    pub fn set_dynamic_layer(
+        &mut self,
+        id: ProfileId,
+        layer: Option<DynamicLayer>,
+    ) -> Result<(), ProfileError> {
+        self.mesh_mut(id)?.set_dynamic_layer(layer);
+        Ok(())
+    }
+
+    /// Toggles a modifier in the selected profile and reports whether it changed.
+    #[cfg(feature = "dynamic")]
+    pub fn set_modifier_enabled(
+        &mut self,
+        id: ProfileId,
+        modifier: ModifierId,
+        enabled: bool,
+    ) -> Result<bool, ProfileError> {
+        self.mesh_mut(id)?.set_modifier_enabled(modifier, enabled)
+    }
+
     /// Binds a query to the selected profile.
     pub fn query(&self, id: ProfileId, max_nodes: usize) -> Result<ProfileQuery<'_>, ProfileError> {
         self.get(id)?.query(max_nodes)
@@ -208,6 +232,29 @@ impl ProfileMesh {
     /// The mesh's structural epoch.
     pub fn epoch(&self) -> u64 {
         self.nav.epoch()
+    }
+
+    /// This profile's modifier specifications and enabled bits, for saving separately.
+    #[cfg(feature = "dynamic")]
+    pub fn dynamic_layer(&self) -> Option<&DynamicLayer> {
+        self.nav.dynamic_layer()
+    }
+
+    /// Applies this profile's modifier layer to resident and future tiles.
+    /// Passing `None` restores governed polygons to their baked state.
+    #[cfg(feature = "dynamic")]
+    pub fn set_dynamic_layer(&mut self, layer: Option<DynamicLayer>) {
+        self.nav.set_dynamic_layer(layer);
+    }
+
+    /// Toggles a modifier in this profile and reports whether it changed.
+    #[cfg(feature = "dynamic")]
+    pub fn set_modifier_enabled(
+        &mut self,
+        modifier: ModifierId,
+        enabled: bool,
+    ) -> Result<bool, ProfileError> {
+        Ok(self.nav.set_modifier_enabled(modifier, enabled)?)
     }
 
     /// Whether the column has a known missing tile.

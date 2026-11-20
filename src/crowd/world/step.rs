@@ -2,6 +2,7 @@
 //! data-parallel with the `parallel` feature.
 use super::*;
 use crate::crowd::phases::{self, AgentSlots, AgentsView, AvoidScratch};
+use alloc::collections::BTreeMap;
 
 /// The arrays other agents' phases read; no phase writes them.
 struct View<'a> {
@@ -11,6 +12,7 @@ struct View<'a> {
     radius: &'a [f32],
     height: &'a [f32],
     max_speed: &'a [f32],
+    parked: &'a [bool],
 }
 impl<'a> View<'a> {
     fn of(
@@ -20,6 +22,7 @@ impl<'a> View<'a> {
         radius: &'a [f32],
         height: &'a [f32],
         max_speed: &'a [f32],
+        parked: &'a [bool],
     ) -> Self {
         Self {
             pos,
@@ -28,10 +31,14 @@ impl<'a> View<'a> {
             radius,
             height,
             max_speed,
+            parked,
         }
     }
 }
 impl AgentsView for View<'_> {
+    fn parked(&self, j: usize) -> bool {
+        self.parked.get(j).copied().unwrap_or(false)
+    }
     fn npos(&self, j: usize) -> V3 {
         self.pos[j]
     }
@@ -99,6 +106,7 @@ struct Ctx<'n> {
     nav: &'n NavMesh,
     limits: Limits,
     fixes: UpstreamFixes,
+    dock_circle_capacity: usize,
 }
 impl<'n> Ctx<'n> {
     fn worker(&self) -> Result<Worker<'n>, Error> {
@@ -109,7 +117,7 @@ impl<'n> Ctx<'n> {
             max_bytes: usize::MAX,
             ..self.limits
         });
-        let mut avoid = ObstacleAvoidanceQuery::new_in(&mut ws, 6, 8)?;
+        let mut avoid = ObstacleAvoidanceQuery::new_in(&mut ws, 6 + self.dock_circle_capacity, 8)?;
         avoid.set_fixes(self.fixes);
         Ok(Worker {
             ws,
@@ -199,6 +207,16 @@ impl CrowdWorld {
         nav: &NavMesh,
         budget: &mut Budget,
     ) -> Result<Budgeted<StepReport>, Error> {
+        self.step_with_docks(nav, budget, &BTreeMap::new(), &BTreeMap::new())
+    }
+
+    pub(in crate::crowd) fn step_with_docks(
+        &mut self,
+        nav: &NavMesh,
+        budget: &mut Budget,
+        local_targets: &BTreeMap<usize, platforms::LocalTarget>,
+        dock_obstacles: &BTreeMap<usize, Vec<OrcaAgent>>,
+    ) -> Result<Budgeted<StepReport>, Error> {
         let dt = self.params.fixed_dt;
         self.active.clear();
         self.active
@@ -232,6 +250,7 @@ impl CrowdWorld {
             nav,
             limits: self.limits,
             fixes: self.fixes,
+            dock_circle_capacity: dock_obstacles.values().map(Vec::len).max().unwrap_or(0),
         };
         let Self {
             params,
@@ -250,16 +269,34 @@ impl CrowdWorld {
             owner,
             grid,
             active,
+            link_epoch,
             ..
         } = self;
         let (filters, presets) = (&*filters, &*presets);
         let (owner, heavy_of) = (&owner[..], &heavy_of[..]);
 
+        let any_parked = heavy.iter().any(CrowdAgent::parked);
+        let mut parked = ws.vec(if any_parked { pos.len() } else { 0 }, false)?;
+        for (a, &i) in heavy.iter().zip(owner.iter()) {
+            if i != NONE && any_parked {
+                parked[i as usize] = a.parked();
+            }
+        }
         // Serial phases, in agent-index order.
         let mut q = NavMeshQuery::new(nav, 512)?;
+        let epoch = nav.runtime_links_changed_at();
+        let links_changed = epoch != *link_epoch;
         for &i in active.iter() {
-            phases::check_path(&mut heavy[heavy_of[i] as usize], &q, filters, extents, dt)?;
+            phases::check_path(
+                &mut heavy[heavy_of[i] as usize],
+                &q,
+                filters,
+                extents,
+                dt,
+                links_changed,
+            )?;
         }
+        *link_epoch = epoch;
         let mut slots = Slots {
             heavy: &mut heavy[..],
             heavy_of,
@@ -283,7 +320,7 @@ impl CrowdWorld {
 
         // Walls and neighbours, corners and visibility, off-mesh triggers: each
         // writes only its own agent and reads positions no phase here changes.
-        let view = View::of(pos, vel, dvel, radius, height, max_speed);
+        let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
         let grid = &*grid;
         tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
             if a.state == AgentState::Walking {
@@ -305,7 +342,14 @@ impl CrowdWorld {
                     Ok(())
                 })?;
             }
-            phases::find_corners(a, &mut w.q, filters)?;
+            phases::find_corners(
+                a,
+                &mut w.q,
+                filters,
+                local_targets
+                    .get(&i)
+                    .and_then(platforms::LocalTarget::precise_point),
+            )?;
             phases::trigger_offmesh(a, &w.q);
             Ok(0)
         })?);
@@ -323,12 +367,16 @@ impl CrowdWorld {
         // Avoidance reads neighbours' positions, velocities and desired velocities
         // from the arrays, so integrating each agent right after it is the same as
         // integrating after all of them.
-        let view = View::of(pos, vel, dvel, radius, height, max_speed);
-        tally = tally.add(ctx.run(heavy, owner, |w, _, a| {
+        let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
+        tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
             let mut s = AvoidScratch {
                 query: &mut w.avoid,
                 orca: &mut w.orca,
                 orca_neighbours: &mut w.orca_neighbours,
+                dock_opening: local_targets
+                    .get(&i)
+                    .and_then(platforms::LocalTarget::opening),
+                dock_obstacles: dock_obstacles.get(&i).map_or(&[], Vec::as_slice),
             };
             let mut samples = 0;
             if let Some((v, k)) = phases::avoid(&mut w.ws, a, &view, dt, presets, &mut s)? {
@@ -343,7 +391,7 @@ impl CrowdWorld {
         // Four Jacobi collision iterations; the last one's application is fused
         // with the agent-local tail of the step.
         for iteration in 0..4 {
-            let view = View::of(pos, vel, dvel, radius, height, max_speed);
+            let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
             tally = tally.add(ctx.run(heavy, owner, |_, i, a| {
                 if let Some(d) = phases::collision_displacement(i, a, &view) {
                     a.disp = d;
@@ -374,6 +422,20 @@ impl CrowdWorld {
         report.measured_work = tally.work;
         report.velocity_samples = tally.samples;
         report.path_queue_depth = pathq.pending() as u32;
+        for k in 0..self.active.len() {
+            let i = self.active[k];
+            let s = self.heavy_of[i] as usize;
+            if !matches!(local_targets.get(&i), Some(platforms::LocalTarget::Dock(_)))
+                && arrival::finish_arrival(&mut self.heavy[s])
+            {
+                if let Some(h) = self.handle_at(i as u32) {
+                    self.remove_agent(h)?;
+                }
+            } else {
+                self.vel[i] = self.heavy[s].vel;
+                self.dvel[i] = self.heavy[s].dvel;
+            }
+        }
         Ok(Budgeted::Complete(report))
     }
 }

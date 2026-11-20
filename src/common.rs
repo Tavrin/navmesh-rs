@@ -39,6 +39,15 @@ pub enum Error {
     TileSlotOccupied,
     /// The navmesh has no free tile slot (or the requested slot is in use).
     NoFreeTile,
+    /// A ground tile has no reserved link capacity for the requested connection.
+    NoLinkCapacity {
+        /// Tile column x.
+        x: i32,
+        /// Tile column y.
+        y: i32,
+        /// Ground tile layer.
+        layer: i32,
+    },
     /// Advancing a tile slot salt would reuse an old reference generation.
     SaltExhausted,
     /// Ear clipping was incomplete in strict mode (not in recastnavigation).
@@ -53,7 +62,7 @@ pub enum Error {
     /// A tile lies outside a keyed navmesh's grid (not in recastnavigation).
     TileOutsideGrid,
     /// A resumable or sliced search was continued after a tile it had touched was
-    /// unloaded or removed (not in recastnavigation); restart the search.
+    /// unloaded or removed, or after a runtime link edit. Restart the search.
     MeshChanged,
     /// The call was stopped by its [`CancelToken`] (not in recastnavigation).
     Cancelled,
@@ -140,6 +149,12 @@ impl fmt::Display for Error {
             Error::TileSlotOccupied => f.write_str("tile location already occupied"),
             Error::SaltExhausted => f.write_str("tile slot salt exhausted"),
             Error::NoFreeTile => f.write_str("no free tile slot"),
+            Error::NoLinkCapacity { x, y, layer } => {
+                write!(
+                    f,
+                    "no reserved runtime link capacity in tile ({x}, {y}, {layer})"
+                )
+            }
             Error::PartialTriangulation {
                 failed_contours,
                 missing_triangles,

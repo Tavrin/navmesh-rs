@@ -315,6 +315,16 @@ pub fn create_nav_mesh_data(p: &NavMeshCreateParams) -> Result<Vec<u8>, Error> {
     create_with_limits(p, &Limits::UNLIMITED)
 }
 
+/// Builds tile bytes with an additional pool for runtime off-mesh connections.
+/// Each connection consumes one reserved slot in its departure tile, plus
+/// one in its arrival tile if it is bidirectional.
+pub fn create_nav_mesh_data_with_spare_links(
+    p: &NavMeshCreateParams,
+    spare_links_per_tile: u32,
+) -> Result<Vec<u8>, Error> {
+    create_with_spare_links(p, &Limits::UNLIMITED, spare_links_per_tile)
+}
+
 /// Imports world-space float vertices without quantizing them (not in recastnavigation).
 /// `verts` must contain exactly `vert_count * 3` finite coordinates within the
 /// finite ordered tile bounds. `params.verts` is ignored; all other parameters
@@ -396,7 +406,7 @@ pub fn create_nav_mesh_data_f32(p: &NavMeshCreateParams, verts: &[f32]) -> Resul
         }
     }
     let data =
-        create_with_workspace_impl(p, &Limits::UNLIMITED, &mut Workspace::new(), Some(verts))?;
+        create_with_workspace_impl(p, &Limits::UNLIMITED, &mut Workspace::new(), Some(verts), 0)?;
     // Validate all serialized indices, detail sections and connection fields too.
     super::MeshTile::parse(data).map(|tile| tile.data)
 }
@@ -406,15 +416,15 @@ pub(crate) fn create_with_limits(
     p: &NavMeshCreateParams,
     limits: &Limits,
 ) -> Result<Vec<u8>, Error> {
-    create_with_workspace(p, limits, &mut Workspace::new())
+    create_with_spare_links(p, limits, 0)
 }
 
-fn create_with_workspace(
+pub(crate) fn create_with_spare_links(
     p: &NavMeshCreateParams,
     limits: &Limits,
-    ws: &mut Workspace,
+    spare_links_per_tile: u32,
 ) -> Result<Vec<u8>, Error> {
-    create_with_workspace_impl(p, limits, ws, None)
+    create_with_workspace_impl(p, limits, &mut Workspace::new(), None, spare_links_per_tile)
 }
 
 fn create_with_workspace_impl(
@@ -422,6 +432,7 @@ fn create_with_workspace_impl(
     limits: &Limits,
     ws: &mut Workspace,
     world: Option<&[f32]>,
+    spare_links_per_tile: u32,
 ) -> Result<Vec<u8>, Error> {
     if p.nvp as usize > VERTS_PER_POLYGON || p.nvp < 3 {
         return Err(Error::InvalidParameter("nvp"));
@@ -548,7 +559,10 @@ fn create_with_workspace_impl(
     if has_detail {
         detail_tri_count = p.detail_tri_count.max(0) as usize;
     }
-    let max_link_count = edge_count + portal_count * 2 + off_link_count * 2;
+    let max_link_count = (edge_count + portal_count * 2 + off_link_count * 2)
+        .checked_add(spare_links_per_tile as usize)
+        .filter(|&n| n <= i32::MAX as usize && n <= usize::MAX / LINK_SIZE)
+        .ok_or(Error::SizeOverflow)?;
     if tot_vert > 0xffff {
         return Err(Error::FormatLimit("more than 65,535 tile vertices"));
     }
@@ -565,15 +579,19 @@ fn create_with_workspace_impl(
         0
     };
     let off_size = align4(OFF_MESH_CON_SIZE * stored_off);
-    let data_size = HEADER_SIZE
-        + verts_size
-        + polys_size
-        + links_size
-        + dmeshes_size
-        + dverts_size
-        + dtris_size
-        + bv_size
-        + off_size;
+    let data_size = [
+        verts_size,
+        polys_size,
+        links_size,
+        dmeshes_size,
+        dverts_size,
+        dtris_size,
+        bv_size,
+        off_size,
+    ]
+    .into_iter()
+    .try_fold(HEADER_SIZE, usize::checked_add)
+    .ok_or(Error::SizeOverflow)?;
     if data_size > limits.max_tile_bytes
         || tot_poly > limits.max_tile_polys
         || tot_vert > limits.max_tile_verts
@@ -600,7 +618,13 @@ fn create_with_workspace_impl(
     w.b.resize(data_size, 0);
     let verts_at = HEADER_SIZE;
     let polys_at = verts_at + verts_size;
-    let dmeshes_at = polys_at + polys_size + links_size;
+    let links_at = polys_at + polys_size;
+    if spare_links_per_tile != 0 {
+        w.at(links_at)
+            .put(super::tile::SPARE_LINK_MAGIC)
+            .u32(spare_links_per_tile);
+    }
+    let dmeshes_at = links_at + links_size;
     let dverts_at = dmeshes_at + dmeshes_size;
     let dtris_at = dverts_at + dverts_size;
     let bv_at = dtris_at + dtris_size;
@@ -803,6 +827,72 @@ fn create_with_workspace_impl(
     Ok(w.b)
 }
 
+/// Encodes the managed layer with zero ground polygons and two links per connection.
+pub(super) fn encode_link_tile(
+    key: super::TileKey,
+    layer: i32,
+    specs: &[super::LinkSpec],
+    limits: &Limits,
+) -> Result<Vec<u8>, Error> {
+    let n = specs.len();
+    if n == 0 || n > u16::MAX as usize / 2 {
+        return Err(Error::FormatLimit("runtime link tile vertex count"));
+    }
+    let polys_at = HEADER_SIZE + n * 24;
+    let off_at = polys_at + n * (POLY_SIZE + 2 * LINK_SIZE);
+    let size = off_at + n * OFF_MESH_CON_SIZE;
+    if size > limits.max_tile_bytes || size > limits.max_bytes {
+        return Err(Error::LimitExceeded);
+    }
+    let mut w = Writer { b: Vec::new() };
+    w.b.try_reserve_exact(size)
+        .map_err(|_| Error::AllocationFailed)?;
+    w.b.resize(size, 0);
+    w.at(0)
+        .i32(NAVMESH_MAGIC)
+        .i32(NAVMESH_VERSION)
+        .i32(key.x)
+        .i32(key.y)
+        .i32(layer)
+        .u32(0)
+        .i32(n as i32)
+        .i32((2 * n) as i32)
+        .i32((2 * n) as i32)
+        .i32(0)
+        .i32(0)
+        .i32(0)
+        .i32(0)
+        .i32(n as i32);
+    for (i, spec) in specs.iter().enumerate() {
+        let mut v = w.at(HEADER_SIZE + i * 24);
+        for p in spec.start.into_iter().chain(spec.end) {
+            v.f32(p);
+        }
+        let mut p = w.at(polys_at + i * POLY_SIZE);
+        p.u32(0).u16((i * 2) as u16).u16((i * 2 + 1) as u16);
+        for _ in 0..10 {
+            p.u16(0);
+        }
+        p.u16(spec.flags)
+            .u8(2)
+            .u8(spec.area | (POLYTYPE_OFFMESH_CONNECTION << 6));
+        let mut c = w.at(off_at + i * OFF_MESH_CON_SIZE);
+        for p in spec.start.into_iter().chain(spec.end) {
+            c.f32(p);
+        }
+        c.f32(spec.radius)
+            .u16(i as u16)
+            .u8(if spec.bidirectional {
+                OFFMESH_CON_BIDIR
+            } else {
+                0
+            })
+            .u8(0xff)
+            .u32(spec.id.0);
+    }
+    Ok(w.b)
+}
+
 #[cfg(test)]
 mod limit_tests {
     use super::*;
@@ -842,7 +932,7 @@ mod limit_tests {
             }
             let mut ws = Workspace::new();
             assert_eq!(
-                create_with_workspace(&p, &tight, &mut ws),
+                create_with_workspace_impl(&p, &tight, &mut ws, None, 0),
                 Err(Error::LimitExceeded)
             );
             assert_eq!(ws.usage().bytes, 0);

@@ -127,10 +127,25 @@ impl PathCorridor {
         out: &mut Vec<StraightPathPoint>,
         max: usize,
     ) -> Result<(), Error> {
+        self.find_corners_for_target(q, out, max, None)
+    }
+
+    pub(super) fn find_corners_for_target(
+        &self,
+        q: &NavMeshQuery<'_>,
+        out: &mut Vec<StraightPathPoint>,
+        max: usize,
+        precise_target: Option<V3>,
+    ) -> Result<(), Error> {
         q.find_straight_path(&self.pos, &self.target, &self.path, out, max, 0)?;
+        let keep_end = precise_target == Some(self.target);
         while out.first().is_some_and(|p| {
-            p.flags & STRAIGHTPATH_OFFMESH_CONNECTION == 0
-                && vdist_2d_sqr(&p.pos, &self.pos) <= sqr(0.01)
+            let distance_squared = vdist_2d_sqr(&p.pos, &self.pos);
+            // A dock seam or framed goal can require motion past the 1 cm cutoff.
+            if keep_end && p.flags & STRAIGHTPATH_END != 0 && distance_squared > 0. {
+                return false;
+            }
+            p.flags & STRAIGHTPATH_OFFMESH_CONNECTION == 0 && distance_squared <= sqr(0.01)
         }) {
             out.remove(0);
         }

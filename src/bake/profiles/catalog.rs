@@ -369,6 +369,7 @@ fn descriptor(spec: ProfileBakeSpec, options: ProfileMeshOptions, include_size: 
         strict_triangulation,
         fixes,
         links,
+        spare_links_per_tile,
     } = spec.config;
     let Config {
         width: _,
@@ -505,6 +506,10 @@ fn descriptor(spec: ProfileBakeSpec, options: ProfileMeshOptions, include_size: 
                 bytes.extend(value.to_le_bytes());
             }
         }
+    }
+    // Preserve descriptors made before the optional reservation was added.
+    if spare_links_per_tile != 0 {
+        bytes.extend(spare_links_per_tile.to_le_bytes());
     }
     content_hash(&bytes)
 }

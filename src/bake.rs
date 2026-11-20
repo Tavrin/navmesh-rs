@@ -46,6 +46,8 @@ pub use install::{TileInstaller, install_cost};
 mod report;
 pub use report::{BakeReport, FilterCounts, TileReport};
 
+#[cfg(feature = "tilecache")]
+pub use job::tile_cache_layers;
 pub use job::{BakeJob, JobOptions, TileOutput};
 pub use manifest::{
     BAKE_REVISION, BakeManifest, DirtyTiles, GridLayout, MANIFEST_VERSION, ManifestDelta,
@@ -156,6 +158,8 @@ pub struct BakeConfig {
     pub fixes: UpstreamFixes,
     /// Optional boundary traversal extraction; disabled by default.
     pub links: Option<LinkExtraction>,
+    /// Ground-polygon slots reserved in each nonempty tile for runtime links.
+    pub spare_links_per_tile: u32,
 }
 
 impl Default for BakeConfig {
@@ -190,6 +194,7 @@ impl Default for BakeConfig {
             strict_triangulation: false,
             fixes: UpstreamFixes::NONE,
             links: None,
+            spare_links_per_tile: 0,
         }
     }
 }

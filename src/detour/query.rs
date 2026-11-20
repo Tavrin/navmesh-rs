@@ -17,6 +17,9 @@ use super::{
 use crate::budget::spend_one;
 use crate::{Budget, Budgeted, Error, UpstreamFixes};
 
+/// A landing polygon and the point on it, if one was found within the search radius.
+type LinkLanding = Option<(PolyRef, [f32; 3])>;
+
 pub(crate) const H_SCALE: f32 = 0.999;
 
 #[inline]
@@ -153,6 +156,9 @@ pub(crate) struct QueryData {
 /// Whether a tile that a search's node pool touched was unloaded or removed since
 /// `epoch` (see [`NavMesh::changed_since`]).
 pub(crate) fn pool_changed(nav: &NavMesh, epoch: u64, pool: &NodePool) -> bool {
+    if nav.runtime_links_changed_at() > epoch {
+        return true;
+    }
     if nav.epoch() == epoch {
         return false;
     }
@@ -215,6 +221,36 @@ impl<'a> NavMeshQuery<'a> {
     /// The navmesh this query reads.
     pub fn nav(&self) -> &'a NavMesh {
         self.nav
+    }
+
+    #[inline]
+    pub(crate) fn passes_filter<F: QueryFilter + ?Sized>(
+        &self,
+        (r, tile, poly): Tp<'_>,
+        filter: &F,
+    ) -> bool {
+        if !filter.pass_filter(r, tile, poly) {
+            return false;
+        }
+        if !tile.managed_link_tile {
+            return true;
+        }
+
+        // Only enter a managed link if both of its ground endpoints pass the
+        // same filter. This also keeps blocked links out of partial paths.
+        let mut next = poly.first_link;
+        if next == NULL_LINK {
+            return false;
+        }
+        while next != NULL_LINK {
+            let edge = tile.links[next as usize];
+            let (r, tile, poly) = self.tp(edge.r#ref);
+            if !filter.pass_filter(r, tile, poly) {
+                return false;
+            }
+            next = edge.next;
+        }
+        true
     }
 
     #[inline]
@@ -451,7 +487,7 @@ impl<'a> NavMeshQuery<'a> {
                     continue;
                 }
                 let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
+                if !self.passes_filter(nei, filter) {
                     continue;
                 }
                 let Some((va, vb)) = self.portal_points_tp(best, nei) else {
@@ -699,6 +735,39 @@ impl<'a> NavMeshQuery<'a> {
         let (r, exhausted) = budget
             .scoped(|b| self.find_nearest_poly_impl(center, half_extents, filter, &mut Some(b)));
         Ok(Budgeted::of(r?, exhausted))
+    }
+
+    pub(crate) fn find_link_landing(
+        &self,
+        point: [f32; 3],
+        radius: f32,
+        filter: &DefaultFilter,
+        budget: &mut Budget,
+    ) -> Result<Budgeted<LinkLanding>, Error> {
+        let mut best = f64::INFINITY;
+        let mut result = None;
+        let radius2 = f64::from(radius) * f64::from(radius);
+        let (scan, exhausted) = budget.scoped(|b| {
+            self.query_polygons_until(
+                &point,
+                &[radius; 3],
+                filter,
+                &mut |tile, ip, poly| {
+                    if let Some((snap, distance)) =
+                        super::navmesh::link_landing_candidate(tile, ip, point)
+                        && distance <= radius2
+                        && distance < best
+                    {
+                        best = distance;
+                        result = Some((poly, snap));
+                    }
+                    true
+                },
+                &mut Some(b),
+            )
+        });
+        scan?;
+        Ok(Budgeted::of(result, exhausted))
     }
 
     fn find_nearest_poly_impl<F: QueryFilter + ?Sized>(
@@ -953,7 +1022,7 @@ impl<'a> NavMeshQuery<'a> {
                     continue;
                 }
                 let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
+                if !self.passes_filter(nei, filter) {
                     continue;
                 }
                 let cross_side = if link.side != 0xff { link.side >> 1 } else { 0 };
@@ -1256,7 +1325,7 @@ impl<'a> NavMeshQuery<'a> {
                     continue;
                 }
                 let nei = self.tp(nref);
-                if !filter.pass_filter(nref, nei.1, nei.2) {
+                if !self.passes_filter(nei, filter) {
                     continue;
                 }
                 let cross_side =

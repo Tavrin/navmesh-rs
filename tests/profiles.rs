@@ -396,6 +396,82 @@ fn nearest(mesh: &ProfileMesh, xyz: [f32; 3]) -> ProfilePoint {
         .unwrap()
 }
 
+#[cfg(feature = "dynamic")]
+#[test]
+fn profile_gate_is_local_and_survives_streaming_and_residency_restore() {
+    use navmesh_rs::Limits;
+    use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
+
+    let mut scene = Scene::default();
+    scene.floor([0., 0., 28., 28.], 0.);
+    let input = Input::new(&scene.verts, &scene.tris);
+    let make = |id, radius| {
+        let spec = spec(id, config(radius), &input);
+        let (tiles, _) = profile_tiles(&input, spec, REV);
+        let mesh =
+            ProfileMesh::new(catalog(&tiles, spec, ProfileMeshOptions::new(4, 2048))).unwrap();
+        (mesh, tiles)
+    };
+    let (mut small, tiles) = make(SMALL, 2);
+    let (mut large, large_tiles) = make(LARGE, 4);
+    let installed = install(&mut small, &tiles);
+    install(&mut large, &large_tiles);
+
+    let center = [14., 0., 14.];
+    let original = nearest(&small, center).polygon;
+    let peer = nearest(&large, center).polygon;
+    let gate = ModifierId(1);
+    let mut layer = DynamicLayer::new(2, Limits::UNLIMITED).unwrap();
+    layer
+        .upsert(ModifierSpec::new(
+            gate,
+            Selector::Prism {
+                verts_xz: vec![[0., 0.], [28., 0.], [28., 28.], [0., 28.]],
+                ymin: -1.,
+                ymax: 1.,
+                area: None,
+            },
+            Effect::ClearFlags(u16::MAX),
+        ))
+        .unwrap();
+    layer.set_enabled(gate, false).unwrap();
+    small.set_dynamic_layer(Some(layer));
+    let epoch = small.epoch();
+    let peer_epoch = large.epoch();
+    let residency = small.save_residency().unwrap();
+    assert!(small.set_modifier_enabled(gate, true).unwrap());
+    assert_eq!(small.epoch(), epoch);
+    assert_eq!(small.save_residency().unwrap(), residency);
+    let closed = |mesh: &ProfileMesh| {
+        mesh.query(32)
+            .unwrap()
+            .find_nearest_poly(&center, &[1.; 3], &DefaultFilter::default())
+            .unwrap()
+            .is_none()
+    };
+    assert!(closed(&small));
+    small.unload(&installed[0]).unwrap();
+    install(&mut small, &tiles);
+    assert!(closed(&small));
+    assert_eq!(small.ref_state(&original).unwrap(), RefState::Valid);
+
+    let state = small.dynamic_layer().unwrap().to_bytes();
+    let mut restored = ProfileMesh::new(small.catalog().clone()).unwrap();
+    restored.restore_residency(&residency).unwrap();
+    restored.set_dynamic_layer(Some(
+        DynamicLayer::from_bytes(&state, Limits::UNLIMITED).unwrap(),
+    ));
+    install(&mut restored, &tiles);
+    assert!(closed(&restored));
+    assert!(restored.set_modifier_enabled(gate, false).unwrap());
+    assert_eq!(
+        nearest(&restored, center).polygon.numeric(),
+        original.numeric()
+    );
+    assert_eq!(large.epoch(), peer_epoch);
+    assert_eq!(nearest(&large, center).polygon, peer);
+}
+
 #[test]
 fn routes_and_directed_links_are_profile_local() {
     let scene = Scene::fixture();
@@ -639,6 +715,25 @@ fn catalog_and_residency_reject_equal_payloads_from_other_bindings() {
 }
 
 #[test]
+fn catalog_binds_spare_link_reservations() {
+    let mut scene = Scene::default();
+    scene.floor([0., 0., 28., 28.], 0.);
+    let input = Input::new(&scene.verts, &scene.tris);
+    let original = config(2);
+    let first = spec(SMALL, original, &input);
+    let mut reserved = original;
+    reserved.spare_links_per_tile = 2;
+    let second = spec(SMALL, reserved, &input);
+    let options = ProfileMeshOptions::new(4, 2048);
+    let (tiles, _) = profile_tiles(&input, first, REV);
+    let old = catalog(&tiles, first, options);
+    assert!(matches!(
+        ProfileCatalog::from_bytes(&old.to_bytes(), REV, second, options),
+        Err(ProfileError::BindingMismatch)
+    ));
+}
+
+#[test]
 fn parked_slots_can_be_released_for_a_profile_streaming_window() {
     let mut scene = Scene::default();
     scene.floor([0., 0., 62., 30.], 0.);
@@ -868,10 +963,10 @@ fn legacy_crowds_select_profile_for_admission_goals_and_ticks() {
 #[cfg(feature = "crowd-world")]
 #[test]
 fn crowd_world_snapshots_are_bound_to_profile_and_replay_with_restored_refs() {
-    use navmesh_rs::Limits;
     use navmesh_rs::bake::profiles::ProfileCrowdWorld;
-    use navmesh_rs::crowd::AgentParams;
     use navmesh_rs::crowd::world::CrowdWorldParams;
+    use navmesh_rs::crowd::{AgentParams, ArrivalPolicy, OffMeshMode};
+    use navmesh_rs::{Limits, SnapshotError};
 
     let mut scene = Scene::default();
     for stripe in 0..104 {
@@ -897,57 +992,79 @@ fn crowd_world_snapshots_are_bound_to_profile_and_replay_with_restored_refs() {
     params.max_heavy_agents = 2;
     params.max_radius = 0.5;
     params.path_queue.iterations = 1;
-    let mut world = ProfileCrowdWorld::new(&a, &params, Limits::default()).unwrap();
-    let mut p = AgentParams::default();
-    p.radius = 0.5;
-    let agent = world.add_agent(&a, [2., 0., 5.], p).unwrap();
-    assert!(matches!(
-        world.set_goal(&a, &agent, Some(&nearest(&b, [102., 0., 5.]))),
-        Err(ProfileError::BindingMismatch)
-    ));
-    assert!(matches!(
-        world.step(&b, &mut Budget::unlimited()),
-        Err(ProfileError::BindingMismatch)
-    ));
-    world
-        .set_goal(&a, &agent, Some(&nearest(&a, [102., 0., 5.])))
-        .unwrap();
-    let tick = world.step(&a, &mut Budget::unlimited()).unwrap();
-    assert_eq!(tick.value().path_queue_depth, 1);
-    let state = world.save(&a).unwrap();
-    assert!(matches!(
-        ProfileCrowdWorld::restore(&b, &state, Limits::default()),
-        Err(ProfileError::BindingMismatch)
-    ));
-    let mut restored = ProfileMesh::new(a.catalog().clone()).unwrap();
-    restored
-        .restore_residency(&a.save_residency().unwrap())
-        .unwrap();
-    install(&mut restored, &tiles);
-    assert_ne!(a.epoch(), restored.epoch());
-    let mut other = ProfileCrowdWorld::restore(&restored, &state, Limits::default()).unwrap();
-    let other_agent = other.agent_at(agent.index()).unwrap();
-    assert_eq!(other.save(&restored).unwrap(), state);
-    assert!(matches!(
-        other.position(&agent),
-        Err(ProfileError::BindingMismatch)
-    ));
-    for _ in 0..48 {
-        assert_eq!(
-            world.step(&a, &mut Budget::unlimited()).unwrap(),
-            other.step(&restored, &mut Budget::unlimited()).unwrap(),
-        );
-        assert_eq!(
-            world.position(&agent).unwrap().map(f32::to_bits),
-            other.position(&other_agent).unwrap().map(f32::to_bits)
+    for (arrival_policy, off_mesh, version) in [
+        (ArrivalPolicy::Keep, OffMeshMode::Animate, 1u32),
+        (ArrivalPolicy::Park, OffMeshMode::Animate, 3),
+        (ArrivalPolicy::Keep, OffMeshMode::External, 3),
+        (ArrivalPolicy::Park, OffMeshMode::External, 3),
+    ] {
+        let mut world = ProfileCrowdWorld::new(&a, &params, Limits::default()).unwrap();
+        let mut p = AgentParams::default();
+        p.radius = 0.5;
+        p.arrival_policy = arrival_policy;
+        p.off_mesh = off_mesh;
+        let agent = world.add_agent(&a, [2., 0., 5.], p).unwrap();
+        assert!(matches!(
+            world.set_goal(&a, &agent, Some(&nearest(&b, [102., 0., 5.]))),
+            Err(ProfileError::BindingMismatch)
+        ));
+        assert!(matches!(
+            world.step(&b, &mut Budget::unlimited()),
+            Err(ProfileError::BindingMismatch)
+        ));
+        world
+            .set_goal(&a, &agent, Some(&nearest(&a, [102., 0., 5.])))
+            .unwrap();
+        let tick = world.step(&a, &mut Budget::unlimited()).unwrap();
+        assert_eq!(tick.value().path_queue_depth, 1);
+        let state = world.save(&a).unwrap();
+        // The NPCW header and residency digest take 72 bytes.
+        let (prefix, _) = state.split_at(state.len() - 32);
+        assert_eq!(&prefix[72..76], b"DCRW");
+        assert_eq!(&prefix[76..80], &version.to_le_bytes());
+        assert!(matches!(
+            ProfileCrowdWorld::restore(&b, &state, Limits::default()),
+            Err(ProfileError::BindingMismatch)
+        ));
+        let mut restored = ProfileMesh::new(a.catalog().clone()).unwrap();
+        restored
+            .restore_residency(&a.save_residency().unwrap())
+            .unwrap();
+        install(&mut restored, &tiles);
+        assert_ne!(a.epoch(), restored.epoch());
+        let mut unknown = prefix.to_vec();
+        unknown[76..80].copy_from_slice(&u32::MAX.to_le_bytes());
+        unknown.extend(content_hash(&unknown));
+        assert!(matches!(
+            ProfileCrowdWorld::restore(&restored, &unknown, Limits::default()),
+            Err(ProfileError::Navigation(Error::InvalidSnapshot(
+                SnapshotError::WrongVersion
+            )))
+        ));
+        let mut other = ProfileCrowdWorld::restore(&restored, &state, Limits::default()).unwrap();
+        let other_agent = other.agent_at(agent.index()).unwrap();
+        assert_eq!(other.save(&restored).unwrap(), state);
+        assert!(matches!(
+            other.position(&agent),
+            Err(ProfileError::BindingMismatch)
+        ));
+        for _ in 0..48 {
+            assert_eq!(
+                world.step(&a, &mut Budget::unlimited()).unwrap(),
+                other.step(&restored, &mut Budget::unlimited()).unwrap(),
+            );
+            assert_eq!(
+                world.position(&agent).unwrap().map(f32::to_bits),
+                other.position(&other_agent).unwrap().map(f32::to_bits)
+            );
+        }
+        let final_snapshot = world.save(&a).unwrap();
+        assert_eq!(final_snapshot, other.save(&restored).unwrap());
+        println!(
+            "profile replay SHA-256 {:02x?}",
+            content_hash(&final_snapshot)
         );
     }
-    let final_snapshot = world.save(&a).unwrap();
-    assert_eq!(final_snapshot, other.save(&restored).unwrap());
-    println!(
-        "profile replay SHA-256 {:02x?}",
-        content_hash(&final_snapshot)
-    );
 }
 
 #[cfg(all(target_os = "linux", feature = "parallel"))]

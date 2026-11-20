@@ -17,6 +17,7 @@ pub(super) trait AgentsView {
     fn dvel(&self, j: usize) -> V3;
     fn radius(&self, j: usize) -> f32;
     fn max_speed(&self, j: usize) -> f32;
+    fn parked(&self, j: usize) -> bool;
     fn orca(&self, j: usize) -> OrcaAgent {
         let (p, v, d) = (self.npos(j), self.vel(j), self.dvel(j));
         OrcaAgent {
@@ -30,6 +31,9 @@ pub(super) trait AgentsView {
 }
 
 impl AgentsView for [CrowdAgent] {
+    fn parked(&self, j: usize) -> bool {
+        self[j].parked()
+    }
     fn npos(&self, j: usize) -> V3 {
         self[j].npos
     }
@@ -98,10 +102,13 @@ pub(super) fn check_path(
     filters: &[DefaultFilter; 16],
     extents: &V3,
     dt: f32,
+    links_changed: bool,
 ) -> Result<(), Error> {
     if a.state != S::Walking {
+        a.pending_link_replan |= a.anim.active && links_changed;
         return Ok(());
     }
+    let links_changed = links_changed | core::mem::take(&mut a.pending_link_replan);
     a.replan_time += dt;
     let f = &filters[a.params.query_filter_type];
     let mut replan = false;
@@ -127,6 +134,14 @@ pub(super) fn check_path(
     }
     if matches!(a.target_state, T::None | T::Velocity) {
         return Ok(());
+    }
+    if links_changed {
+        // Changes can affect a distant connection or open a shortcut even for
+        // an agent whose current corridor is valid. Start from the surface
+        // position so a previous partial result cannot retain the old route.
+        a.corridor.reset(r, pos)?;
+        a.boundary.reset();
+        replan = true;
     }
     // Streaming (not in recastnavigation): a target whose tile is unloaded
     // is waited for, not dropped.
@@ -200,7 +215,7 @@ pub(super) fn check_path(
     }
     if replan && a.target_state != T::None {
         a.pathq = 0;
-        a.replan = true;
+        a.replan = !links_changed;
         a.target_state = if a.target_ref != 0 {
             T::Requesting
         } else {
@@ -228,7 +243,11 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
-        if !a.active || a.state == S::Invalid || matches!(a.target_state, T::None | T::Velocity) {
+        if !a.active
+            || a.state == S::Invalid
+            || a.pending_off_mesh.is_some()
+            || matches!(a.target_state, T::None | T::Velocity)
+        {
             continue;
         }
         let f = &filters[a.params.query_filter_type];
@@ -324,7 +343,7 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
-        if !a.active || a.target_state != T::WaitingForPath {
+        if !a.active || a.pending_off_mesh.is_some() || a.target_state != T::WaitingForPath {
             continue;
         }
         let status = pathq.status(a.pathq);
@@ -513,12 +532,14 @@ pub(super) fn find_corners(
     a: &mut CrowdAgent,
     q: &mut NavMeshQuery<'_>,
     filters: &[DefaultFilter; 16],
+    precise_target: Option<V3>,
 ) -> Result<(), Error> {
     if a.state != S::Walking || matches!(a.target_state, T::None | T::Velocity) {
         return Ok(());
     }
     let f = &filters[a.params.query_filter_type];
-    a.corridor.find_corners(q, &mut a.corners, 4)?;
+    a.corridor
+        .find_corners_for_target(q, &mut a.corners, 4, precise_target)?;
     if a.params.update_flags & OPTIMIZE_VIS != 0 && !a.corners.is_empty() {
         let next = a.corners[1.min(a.corners.len() - 1)].pos;
         a.corridor
@@ -536,6 +557,10 @@ pub(super) fn trigger_offmesh(a: &mut CrowdAgent, q: &NavMeshQuery<'_>) {
         if c.flags & STRAIGHTPATH_OFFMESH_CONNECTION != 0
             && vdist_2d_sqr(&a.npos, &c.pos) < sqr(a.params.radius * 2.25)
         {
+            if a.params.off_mesh == OffMeshMode::External {
+                a.begin_external_off_mesh(q.nav(), c.r#ref);
+                return;
+            }
             if let Ok((start, end, _)) = a.corridor.move_over_offmesh_connection(c.r#ref, q) {
                 a.anim = Animation {
                     active: true,
@@ -629,6 +654,16 @@ pub(super) struct AvoidScratch<'a> {
     pub(super) query: &'a mut ObstacleAvoidanceQuery,
     pub(super) orca: &'a mut OrcaScratch,
     pub(super) orca_neighbours: &'a mut Vec<OrcaAgent>,
+    pub(super) dock_opening: Option<V3>,
+    #[cfg(feature = "crowd-world")]
+    pub(super) dock_obstacles: &'a [OrcaAgent],
+}
+
+fn is_dock_wall(seg: &[f32; 6], opening: Option<V3>) -> bool {
+    let Some(p) = opening else { return false };
+    let (d, t) = distance_pt_seg_sqr_2d(&p, &seg[..3], &seg[3..]);
+    let y = seg[1] + (seg[4] - seg[1]) * t;
+    d <= 1e-6 && (p[1] - y).abs() <= 0.001
 }
 
 /// The avoidance velocity and the number of velocity samples taken; `None` when the
@@ -655,17 +690,34 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
             s.orca_neighbours.push(others.orca(j));
         }
         let mut walls = [[0.; 4]; 8];
-        for (out, &(_, seg)) in walls.iter_mut().zip(&a.boundary.segments) {
-            *out = [seg[0], seg[2], seg[3], seg[5]];
+        let mut wall_count = 0;
+        for &(_, seg) in &a.boundary.segments {
+            if !is_dock_wall(&seg, s.dock_opening) {
+                walls[wall_count] = [seg[0], seg[2], seg[3], seg[5]];
+                wall_count += 1;
+            }
         }
-        let v = orca::velocity_in(
+        #[cfg(feature = "crowd-world")]
+        let dock_obstacles = s.dock_obstacles;
+        #[cfg(not(feature = "crowd-world"))]
+        let dock_obstacles = &[];
+        let v = orca::velocity_with_responsibility(
             ws,
             &OrcaAgent::crowd(a),
             s.orca_neighbours,
-            &walls[..a.boundary.segments.len()],
+            &walls[..wall_count],
+            dock_obstacles,
             &p,
             dt,
             s.orca,
+            |k| {
+                let other = others.parked(a.neis[k].0);
+                match (a.parked(), other) {
+                    (true, false) => 0.,
+                    (false, true) => 1.,
+                    _ => 0.5,
+                }
+            },
         )?;
         [v[0], 0., v[1]]
     } else if a.params.update_flags & OBSTACLE_AVOIDANCE != 0
@@ -680,8 +732,17 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
                 others.dvel(j),
             )?;
         }
+        #[cfg(feature = "crowd-world")]
+        for b in s.dock_obstacles {
+            s.query.add_moving_obstacle(
+                [b.position[0], a.npos[1], b.position[1]],
+                b.radius,
+                [b.velocity[0], 0., b.velocity[1]],
+            )?;
+        }
         for &(_, seg) in &a.boundary.segments {
-            if tri_area_2d(&a.npos, &seg[..3], &seg[3..]) < 0. {
+            if is_dock_wall(&seg, s.dock_opening) || tri_area_2d(&a.npos, &seg[..3], &seg[3..]) < 0.
+            {
                 continue;
             }
             s.query.add_segment(v3(&seg[..3]), v3(&seg[3..]))?;
