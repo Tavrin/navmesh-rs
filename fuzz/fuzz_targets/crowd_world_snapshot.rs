@@ -35,6 +35,11 @@ fuzz_target!(|data: &[u8]| {
     };
     if let Ok(mut world) = CrowdWorld::from_bytes(&nav, data, limits) {
         let bytes = world.to_bytes();
+        // Versions 2 and 3 are read-only layouts that migrate to version 4.
+        // A stored mesh-epoch ahead of the live mesh rebinds to it.
+        if !matches!(data[4..8], [2 | 3, 0, 0, 0]) {
+            assert!(bytes == data || navmesh_fuzz::persisted::rebinds_only_epochs(&bytes, data));
+        }
         let restored = CrowdWorld::from_bytes(&nav, &bytes, limits).unwrap();
         assert_eq!(world.digest(), restored.digest());
         let _ = world.step(&nav, &mut Budget::new(100_000));

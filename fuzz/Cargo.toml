@@ -206,3 +206,52 @@ test = false
 doc = false
 bench = false
 required-features = ["dynamic"]
+
+[[bin]]
+name = "runtime_links"
+path = "fuzz_targets/runtime_links.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_snapshot"
+path = "fuzz_targets/frame_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framed_crowd_snapshot"
+path = "fuzz_targets/framed_crowd_snapshot.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_catalog"
+path = "fuzz_targets/profile_catalog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_records"
+path = "fuzz_targets/profile_records.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_mixed_crowd"
+path = "fuzz_targets/profile_mixed_crowd.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framed_profile_crowd"
+path = "fuzz_targets/framed_profile_crowd.rs"
+test = false
+doc = false
+bench = false

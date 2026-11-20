@@ -20,6 +20,12 @@
 //! Version 6 uses the version 5 layout with a profile ID before each occupied
 //! agent record and after each queue handle. It requires a mixed profile binding.
 //!
+//! The format is canonical: a reader accepts only the version the restored state
+//! encodes with, a fixes word that includes the always-on nearest-neighbour
+//! correction, so a snapshot of version 1 or 4 to 6 re-encodes to its own bytes on
+//! the mesh it was saved from. The two mesh-epoch fields are the exception: they
+//! rebind to a live mesh that is behind them. Versions 2 and 3 migrate to version 4.
+//!
 //! The profile (`NPCW`) and framed (`DCFR`) records embed the same `DCRW` layouts.
 //! A profile record binds the catalog and slot history, refuses to save while the
 //! mesh has changed since the last step, and writes zero in the sliced-search epoch
@@ -446,6 +452,14 @@ impl CrowdWorld {
     /// `bound` writes zero in the mesh-epoch fields: profile and mixed records
     /// rebuild their mesh, so restore substitutes the reconstructed mesh's epochs.
     fn snapshot_bytes(&self, bound: bool) -> Vec<u8> {
+        let (version, layout) = self.canonical_version(bound);
+        self.write_snapshot(version, layout, bound)
+    }
+
+    /// The version and agent layout `snapshot_bytes` writes for this state. A reader
+    /// accepts a current version only when it is this one, so every accepted
+    /// snapshot re-encodes to its own bytes.
+    fn canonical_version(&self, bound: bool) -> (u32, AgentLayout) {
         let replan = self.replan_limit != replan::DEFAULT_LIMIT
             || self.replan_cursor != 0
             || (!bound && self.replan_epoch != 0)
@@ -478,7 +492,7 @@ impl CrowdWorld {
         } else {
             BASE_VERSION
         };
-        self.write_snapshot(version, layout, bound)
+        (version, layout)
     }
 
     fn write_snapshot(&self, version: u32, layout: AgentLayout, bound: bool) -> Vec<u8> {
@@ -588,7 +602,7 @@ impl CrowdWorld {
         bytes: &[u8],
         limits: Limits,
     ) -> Result<Self, Error> {
-        let mut world = Self::read_snapshot(nav, bytes, limits, None)?;
+        let mut world = Self::read_snapshot(nav, bytes, limits, None, true)?;
         world.bind_replan_epoch(nav, true)?;
         if let Some(query) = world.profile_search(nav)? {
             if query.query.epoch != 0 {
@@ -653,7 +667,7 @@ impl CrowdWorld {
         limits: Limits,
     ) -> Result<Self, Error> {
         let (_, nav) = meshes.first_key_value().ok_or(bad("empty profile set"))?;
-        let mut world = Self::read_snapshot(nav, bytes, limits, Some(meshes))?;
+        let mut world = Self::read_snapshot(nav, bytes, limits, Some(meshes), true)?;
         world.bind_replan_epoch(nav, true)?;
         if has_running_search(&world.pathq) {
             let request = &world.pathq.requests[world.pathq.head % 8];
@@ -675,7 +689,7 @@ impl CrowdWorld {
     /// restored world's allocation as in [`CrowdWorld::new`]. Restore the
     /// navmesh to the state it had at the snapshot's last completed crowd step.
     pub fn from_bytes(nav: &NavMesh, b: &[u8], limits: Limits) -> Result<Self, Error> {
-        let mut world = Self::read_snapshot(nav, b, limits, None)?;
+        let mut world = Self::read_snapshot(nav, b, limits, None, false)?;
         world.bind_replan_epoch(nav, false)?;
         // A running search keeps its saved epoch only when the live mesh has not
         // fallen behind it, so a restored search still sees later edits.
@@ -706,6 +720,7 @@ impl CrowdWorld {
         b: &[u8],
         limits: Limits,
         profiles: Option<&BTreeMap<u32, &NavMesh>>,
+        bound: bool,
     ) -> Result<Self, Error> {
         let mut i = In(b);
         if &i.take::<4>()? != MAGIC {
@@ -751,7 +766,12 @@ impl CrowdWorld {
         w.replan_cursor = replan_cursor;
         // Zero (absent) is resolved by `bind_replan_epoch`.
         w.replan_epoch = replan_epoch;
-        w.set_fixes(UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?);
+        let fixes = UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?;
+        // `set_fixes` always adds this flag, so a record without it is not canonical.
+        if !fixes.contains(UpstreamFixes::NEAREST_NEIGHBOURS) {
+            return Err(bad("fixes"));
+        }
+        w.set_fixes(fixes);
         for k in 0..16 {
             let mut f = DefaultFilter::default();
             for c in &mut f.area_cost {
@@ -934,6 +954,13 @@ impl CrowdWorld {
         }
         if !i.0.is_empty() {
             return Err(Error::InvalidSnapshot(E::TrailingBytes));
+        }
+        // Versions 2 and 3 are read-only layouts that migrate to version 4. Every
+        // other version must be the one the restored state encodes with.
+        if !matches!(version, ARRIVAL_VERSION | LINKS_VERSION)
+            && w.canonical_version(bound).0 != version
+        {
+            return Err(bad("layout version"));
         }
         Ok(w)
     }
@@ -1208,6 +1235,52 @@ mod tests {
             assert!(matches!(
                 CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED),
                 Err(Error::InvalidSnapshot(E::WrongVersion))
+            ));
+        }
+    }
+    fn empty_nav() -> NavMesh {
+        NavMesh::new(&NavMeshParams {
+            orig: [0.; 3],
+            tile_width: 10.,
+            tile_height: 10.,
+            max_tiles: 4,
+            max_polys: 32,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_a_fixes_word_the_writer_never_produces() {
+        let nav = empty_nav();
+        let mut w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+        w.set_fixes(UpstreamFixes::ALL);
+        let bytes = w.to_bytes();
+        let back = CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED).unwrap();
+        assert_eq!(back.to_bytes(), bytes);
+        // Version 1 header: magic, version, 24 bytes of parameters, their hash, then the fixes.
+        let at = 8 + 24 + 8;
+        assert_eq!(bytes[at..at + 4], UpstreamFixes::ALL.bits().to_le_bytes());
+        let mut bad_bytes = bytes;
+        bad_bytes[at..at + 4].copy_from_slice(&UpstreamFixes::NONE.bits().to_le_bytes());
+        assert!(matches!(
+            CrowdWorld::from_bytes(&nav, &bad_bytes, Limits::UNLIMITED),
+            Err(Error::InvalidSnapshot(E::InvalidValue("fixes")))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_current_version_the_state_does_not_encode_with() {
+        let nav = empty_nav();
+        let w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+        let wide = AgentLayout {
+            arrival: true,
+            links: true,
+        };
+        for version in [EXTENDED_VERSION, REPLAN_VERSION] {
+            let bytes = w.write_snapshot(version, wide, false);
+            assert!(matches!(
+                CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED),
+                Err(Error::InvalidSnapshot(E::InvalidValue("layout version")))
             ));
         }
     }
