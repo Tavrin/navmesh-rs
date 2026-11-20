@@ -392,6 +392,28 @@ impl CrowdWorld {
         let mut ws = Workspace::with_limits(self.limits);
         finite(pos)?;
         p.validate(self.params.max_radius)?;
+        let slots = self.placement_slots()?;
+        ws.charge_bytes::<u8>(512 * 128 + 16384)?;
+        let q = NavMeshQuery::new(nav, 512)?;
+        let (r, nearest, _) = q
+            .find_nearest_poly(&pos, &self.extents, &self.filters[p.query_filter_type])
+            .unwrap_or((0, pos, false));
+        let nearest = if r == 0 { pos } else { nearest };
+        self.insert_placed(&mut ws, slots, r, nearest, p)
+    }
+
+    pub(super) fn add_landed_agent(
+        &mut self,
+        r: PolyRef,
+        pos: V3,
+        p: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        p.validate(self.params.max_radius)?;
+        let mut ws = Workspace::with_limits(self.limits);
+        self.insert_placed(&mut ws, self.placement_slots()?, r, pos, p)
+    }
+
+    fn placement_slots(&self) -> Result<(u32, u32), Error> {
         let index = match self.free.peek() {
             Some(&Reverse(i)) => i,
             None if self.count < self.params.max_agents => self.generation.len() as u32,
@@ -404,18 +426,24 @@ impl CrowdWorld {
             }
             None => return Err(Error::BufferTooSmall),
         };
-        ws.charge_bytes::<u8>(512 * 128 + 16384)?;
-        let q = NavMeshQuery::new(nav, 512)?;
-        let (r, nearest, _) = q
-            .find_nearest_poly(&pos, &self.extents, &self.filters[p.query_filter_type])
-            .unwrap_or((0, pos, false));
-        let nearest = if r == 0 { pos } else { nearest };
+        Ok((index, slot))
+    }
+
+    fn insert_placed(
+        &mut self,
+        ws: &mut Workspace,
+        slots: (u32, u32),
+        r: PolyRef,
+        nearest: V3,
+        p: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        let (index, slot) = slots;
         if index as usize == self.generation.len() {
             self.grow_by_one()?;
             self.free.push(Reverse(index));
         }
         if slot as usize == self.heavy.len() {
-            let entry = CrowdAgent::new_in(&mut ws)?;
+            let entry = CrowdAgent::new_in(ws)?;
             self.heavy
                 .try_reserve(1)
                 .map_err(|_| Error::AllocationFailed)?;

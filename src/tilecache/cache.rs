@@ -3,11 +3,12 @@ use super::{Layer, LayerCompressor, LayerHeader, RawCompressor};
 use super::{builder, layer};
 use crate::common::{cosf, floorf, sinf};
 use crate::detour::{self, NavMesh, NavMeshCreateParams};
-use crate::{Error, Limits, Usage, Workspace};
+use crate::{Budget, Error, Limits, Progress, Usage, Workspace};
 use alloc::vec::Vec;
 const NONE: usize = usize::MAX;
 const MAX_TOUCHED: usize = 8;
 const MAX_REQUESTS: usize = 64;
+pub(crate) const MAX_LAYERS_PER_COLUMN: usize = 32;
 /// Opaque salted compressed-tile handle (always 32 bits).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressedTileRef(u32);
@@ -319,6 +320,7 @@ impl Default for Association {
     }
 }
 /// Incremental tile cache. One `update` rebuilds at most one tile.
+/// Use [`TileCache::update_budgeted`] to drain several layers in one call.
 ///
 /// Calls reset the reported usage. Requests and reverse tile/obstacle indices
 /// avoid a scan of the whole obstacle pool for each rebuilt tile. Errors preserve
@@ -432,6 +434,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
     /// its salt advances, as upstream's remove-then-add does, so refs match
     /// upstream's. On: refs, salt and runtime flags of the tile stay, and an
     /// obstacle that carves nothing costs no salt advance.
+    /// [`Self::update_budgeted`] always preserves equal-content tiles.
     pub fn set_keep_identical_tiles(&mut self, on: bool) {
         self.keep_identical = on;
     }
@@ -527,7 +530,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             }
             i = self.tiles[i].next;
         }
-        if count == 32 {
+        if count == MAX_LAYERS_PER_COLUMN {
             return Err(Error::FormatLimit("layers per tile"));
         }
         self.ws.charge_bytes::<u8>(data.len())?;
@@ -748,7 +751,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
     /// All layers at a coordinate, in upstream's reverse insertion order.
     pub fn tiles_at(&mut self, x: i32, y: i32) -> Result<Vec<CompressedTileRef>, Error> {
         self.ws.begin();
-        let mut out = self.ws.vec_with_capacity(32)?;
+        let mut out = self.ws.vec_with_capacity(MAX_LAYERS_PER_COLUMN)?;
         let mut k = self.buckets[hash(x, y, self.buckets.len() - 1)];
         while k != NONE {
             work(&mut self.ws, 1)?;
@@ -949,6 +952,42 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
         if !dt.is_finite() || dt < 0.0 {
             return Err(Error::InvalidParameter("update dt"));
         }
+        self.update_one(nav, self.keep_identical)?;
+        Ok(!self.has_pending_work())
+    }
+
+    /// Drains obstacle requests and rebuilds cached layers in the same queue
+    /// order as [`Self::update`]. Spend one unit per layer before starting it.
+    /// Dispatching a batch that touches no layers also costs one unit.
+    ///
+    /// Each rebuild is indivisible. The budget bounds the number of rebuilds,
+    /// so calibrate the allowance to the cost of a layer on the target hardware.
+    /// Workspace limits apply cumulatively to this call. On error the failed
+    /// layer remains queued, and any earlier successful rebuilds stay applied.
+    ///
+    /// Equal bytes always preserve the resident tile and refs. New bytes are
+    /// installed atomically with [`NavMesh::replace_tile`], which applies the
+    /// navmesh's registered modifiers when the `dynamic` feature is enabled.
+    pub fn update_budgeted(
+        &mut self,
+        nav: &mut NavMesh,
+        budget: &mut Budget,
+    ) -> Result<Progress, Error> {
+        self.ws.begin();
+        while self.has_pending_work() {
+            if !budget.spend(1) {
+                return Ok(Progress::Exhausted);
+            }
+            self.update_one(nav, true)?;
+        }
+        Ok(Progress::Done)
+    }
+
+    fn has_pending_work(&self) -> bool {
+        self.queue_pos < self.queue.len() || !self.requests.is_empty()
+    }
+
+    fn update_one(&mut self, nav: &mut NavMesh, keep_identical: bool) -> Result<(), Error> {
         if self.queue_pos == self.queue.len() {
             self.queue.clear();
             self.queue_pos = 0;
@@ -960,7 +999,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             // requests are deferred by the existing queue (pending == 0).
             // Reserve slot, pending-list and completion/unlink work before mutation.
             work(&mut self.ws, self.obstacles.len() * 26)?;
-            self.rebuild(t, nav)?;
+            self.rebuild(t, nav, keep_identical)?;
             for i in 0..self.obstacles.len() {
                 let Some(o) = self.obstacles[i].as_mut() else {
                     continue;
@@ -982,7 +1021,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             self.queued[t] = false;
             self.queue_pos += 1;
         }
-        Ok(self.queue_pos == self.queue.len() && self.requests.is_empty())
+        Ok(())
     }
     /// Builds tile data without mutating the navmesh (also useful for serialization).
     pub fn build_tile_data(&mut self, r: CompressedTileRef) -> Result<Option<Vec<u8>>, Error> {
@@ -1060,7 +1099,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
         work(&mut self.ws, bound)?;
         detour::create_nav_mesh_data_with_spare_links(&params, spare).map(Some)
     }
-    fn rebuild(&mut self, i: usize, nav: &mut NavMesh) -> Result<(), Error> {
+    fn rebuild(&mut self, i: usize, nav: &mut NavMesh, keep_identical: bool) -> Result<(), Error> {
         let data = self.build(i)?;
         let h = self.tiles[i]
             .header
@@ -1070,7 +1109,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             // Validated before the resident layer is touched.
             Some(data) => {
                 let t = nav.prepare_for(data)?;
-                if self.keep_identical {
+                if keep_identical {
                     nav.replace_tile(t)?;
                 } else {
                     nav.replace_tile_advancing(t)?;
@@ -1092,7 +1131,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
     ) -> Result<(), Error> {
         self.ws.begin();
         let i = self.tile_index(r)?;
-        self.rebuild(i, nav)
+        self.rebuild(i, nav, self.keep_identical)
     }
     /// Rebuilds layers at a coordinate in upstream order.
     pub fn build_nav_mesh_tiles_at(
@@ -1107,7 +1146,7 @@ impl<C: LayerCompressor, P: MeshProcess> TileCache<C, P> {
             work(&mut self.ws, 1)?;
             let h = self.tiles[k].header.as_ref().unwrap();
             if h.tx == x && h.ty == y {
-                self.rebuild(k, nav)?;
+                self.rebuild(k, nav, self.keep_identical)?;
             }
             k = self.tiles[k].next;
         }

@@ -45,6 +45,8 @@ pub use install::{TileInstaller, install_cost};
 mod report;
 pub use report::{BakeReport, FilterCounts, TileReport};
 
+#[cfg(feature = "tilecache")]
+pub use job::tile_cache_layers;
 pub use job::{BakeJob, JobOptions, TileOutput};
 pub use manifest::{
     BAKE_REVISION, BakeManifest, DirtyTiles, GridLayout, MANIFEST_VERSION, ManifestDelta,
