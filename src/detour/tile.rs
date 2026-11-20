@@ -620,7 +620,9 @@ pub(crate) fn check_bake_tile_limits(data: &[u8], limits: &Limits) -> Result<(),
 }
 
 /// Optional provenance at the end of the canonical tile sections. Untagged
-/// geometry is default-layout when paired with a saved ref.
+/// geometry is default-layout when paired with a saved ref. Trailing bytes that
+/// are not an exact 12-byte `NRFL` trailer are ignored, as the sections-only
+/// format always did; a trailer with an unknown version is a version error.
 pub(crate) fn stored_layout(data: &[u8]) -> Result<Option<super::RefLayout>, Error> {
     let h = peek_header(data)?;
     let at = Sections::of(&h)
@@ -630,13 +632,13 @@ pub(crate) fn stored_layout(data: &[u8]) -> Result<Option<super::RefLayout>, Err
         return Err(Error::InvalidTileData(TileDataError::BadSize));
     }
     let tail = &data[at..];
-    if !tail.is_empty() && tail.len() < 4 && b"NRFL".starts_with(tail) {
-        return Err(Error::RefLayoutMismatch);
-    }
-    if !tail.starts_with(b"NRFL") {
+    if tail.len() != 12 || !tail.starts_with(b"NRFL") {
         return Ok(None);
     }
-    if tail.len() != 12 || tail[4..8] != 1u32.to_le_bytes() || tail[11] != 0 {
+    if tail[4..8] != 1u32.to_le_bytes() {
+        return Err(Error::InvalidTileData(TileDataError::WrongVersion));
+    }
+    if tail[11] != 0 {
         return Err(Error::RefLayoutMismatch);
     }
     Ok(Some(super::RefLayout::new(tail[8], tail[9], tail[10])))
@@ -648,6 +650,15 @@ pub(crate) fn tag_layout(data: &mut Vec<u8>, layout: super::RefLayout) -> Result
     if let Some(stored) = stored_layout(data)? {
         if stored != layout {
             return Err(Error::RefLayoutMismatch);
+        }
+        if stored == super::RefLayout::default() {
+            // A trailer naming the default layout carries no information: drop
+            // it so the content hash is that of the untagged sections.
+            let h = peek_header(data)?;
+            let at = Sections::of(&h)
+                .and_then(|s| s.total())
+                .ok_or(Error::InvalidTileData(TileDataError::BadSize))?;
+            data.truncate(at);
         }
     } else if PolyRef::BITS == 64 && layout != super::RefLayout::default() {
         let h = peek_header(data)?;

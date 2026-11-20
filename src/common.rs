@@ -113,7 +113,7 @@ pub enum TileStateError {
 pub enum TileDataError {
     /// The magic number is not `'DNAV'`.
     WrongMagic,
-    /// The version is not 7.
+    /// The version is not 7, or a reference-layout trailer names an unknown version.
     WrongVersion,
     /// A count in the header is negative or the sections do not fit the buffer.
     BadSize,

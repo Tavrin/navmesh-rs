@@ -29,6 +29,7 @@ pub use external::{OffMeshMode, OffMeshReached};
 pub mod field;
 mod grid;
 mod queue;
+mod replan;
 pub use avoidance::{ObstacleAvoidanceParams, ObstacleAvoidanceQuery};
 pub use boundary::LocalBoundary;
 pub use corridor::PathCorridor;
@@ -259,14 +260,29 @@ pub struct CrowdAgent {
     anim: Animation,
     pending_off_mesh: Option<PendingTraversal>,
     pending_link_replan: bool,
+    pending_stamp_replan: bool,
+    blocked_poly: PolyRef,
 }
 impl CrowdAgent {
     fn parked(&self) -> bool {
-        self.arrived && self.params.arrival_policy == ArrivalPolicy::Park
+        self.held_for_replan()
+            || (self.arrived && self.params.arrival_policy == ArrivalPolicy::Park)
+    }
+    fn walking(&self) -> bool {
+        self.state == AgentState::Walking && !self.held_for_replan()
+    }
+    fn held_for_replan(&self) -> bool {
+        self.pending_stamp_replan
+            || (self.target_state == TargetState::Failed && self.blocked_poly != 0)
     }
     /// Whether the current point request has triggered its arrival policy.
     pub fn arrived(&self) -> bool {
         self.arrived
+    }
+    /// Whether a tile change is waiting for replan budget or the agent's
+    /// current off-mesh traversal to finish.
+    pub fn replan_pending(&self) -> bool {
+        self.pending_stamp_replan
     }
     /// The neighbours kept by the last update (six for sampled mode, the configured
     /// cap for ORCA), nearest first, as
@@ -310,6 +326,8 @@ impl CrowdAgent {
             anim: Animation::default(),
             pending_off_mesh: None,
             pending_link_replan: false,
+            pending_stamp_replan: false,
+            blocked_poly: 0,
         })
     }
     /// Occupies a reset slot at the polygon `r` (zero: no polygon near, invalid).
@@ -335,6 +353,7 @@ impl CrowdAgent {
         waiting: Option<TileKey>,
     ) -> Result<(), Error> {
         self.arrived = false;
+        self.clear_stamp_replan();
         self.target_ref = r;
         self.target_pos = pos;
         self.pathq = 0;
@@ -352,6 +371,7 @@ impl CrowdAgent {
     }
     fn request_velocity(&mut self, vel: V3) {
         self.arrived = false;
+        self.clear_stamp_replan();
         self.target_ref = 0;
         self.target_pos = vel;
         self.pathq = 0;
@@ -360,6 +380,7 @@ impl CrowdAgent {
     }
     fn reset_target(&mut self) {
         self.arrived = false;
+        self.clear_stamp_replan();
         self.target_ref = 0;
         self.target_pos = [0.; 3];
         self.dvel = [0.; 3];
@@ -397,6 +418,12 @@ impl CrowdAgent {
         self.anim = Animation::default();
         self.pending_off_mesh = None;
         self.pending_link_replan = false;
+        self.clear_stamp_replan();
+    }
+
+    fn clear_stamp_replan(&mut self) {
+        self.pending_stamp_replan = false;
+        self.blocked_poly = 0;
     }
 }
 /// Fixed-capacity single-threaded crowd manager.
@@ -411,6 +438,10 @@ pub struct Crowd {
     pathq: PathQueue,
     active: Vec<usize>,
     link_epoch: u64,
+    stamp_revalidation: bool,
+    replan_epoch: u64,
+    replan_limit: u32,
+    replan_cursor: u32,
     velocity_samples: usize,
     fixes: UpstreamFixes,
 }
@@ -446,8 +477,29 @@ impl Crowd {
             active: ws.vec_with_capacity(max_agents)?,
             velocity_samples: 0,
             link_epoch: nav.runtime_links_changed_at(),
+            stamp_revalidation: false,
+            replan_epoch: nav.change_epoch(),
+            replan_limit: replan::DEFAULT_LIMIT,
+            replan_cursor: 0,
             fixes: UpstreamFixes::NONE,
         })
+    }
+    /// Enables same-tick corridor replanning on tile changes. Off by default.
+    pub fn set_stamp_revalidation(&mut self, enabled: bool) {
+        self.stamp_revalidation = enabled;
+        if !enabled {
+            self.replan_cursor = 0;
+            for a in &mut self.agents {
+                a.clear_stamp_replan();
+            }
+        }
+    }
+
+    /// Caps stamp-triggered replans per update. Admission resumes in slot order
+    /// after the last admitted agent when this cap is filled.
+    /// The default limit is 1,024.
+    pub fn set_replan_limit(&mut self, limit: u32) {
+        self.replan_limit = limit;
     }
     /// Selects the upstream defect corrections the crowd applies; the default is
     /// [`UpstreamFixes::NONE`]. The crowd uses [`UpstreamFixes::NEAREST_NEIGHBOURS`],
@@ -650,6 +702,7 @@ fn insert_pos<T>(items: &[T], value: f32, key: impl Fn(&T) -> f32) -> usize {
     }
 }
 mod phases;
+pub mod platforms;
 mod update;
 #[cfg(feature = "crowd-world")]
 pub mod world;

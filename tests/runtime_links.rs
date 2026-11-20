@@ -421,6 +421,88 @@ fn world_replans_and_can_abort_or_restore_a_pending_external_traversal() {
     assert!(w.off_mesh_arrivals().next().is_none());
 }
 
+#[cfg(feature = "crowd-world")]
+#[test]
+fn world_rejects_a_pending_traversal_the_live_mesh_does_not_hold() {
+    use navmesh_rs::Budget;
+    use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams, Goal};
+    use navmesh_rs::crowd::{AgentParams, ArrivalPolicy, OffMeshMode};
+
+    let (mut nav, _, b) = scene(1, 0);
+    nav.add_runtime_link(spec(), true).unwrap();
+    let mut w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+    let mut p = AgentParams::default();
+    p.off_mesh = OffMeshMode::External;
+    p.arrival_policy = ArrivalPolicy::Park;
+    let a = w.add_agent(&nav, START, p).unwrap();
+    w.set_goal(&nav, a, Goal::Point { poly: b, pos: END })
+        .unwrap();
+    nav.set_runtime_link_enabled(ID, false).unwrap();
+    w.step(&nav, &mut Budget::unlimited()).unwrap();
+    nav.set_runtime_link_enabled(ID, true).unwrap();
+    w.step(&nav, &mut Budget::unlimited()).unwrap();
+    assert!(w.off_mesh_arrivals().next().is_some());
+    // The same ground tiles without the runtime link: the pending polygon is gone.
+    let mut bare = NavMesh::new(&params()).unwrap();
+    bare.restore_residency(&nav.residency()).unwrap();
+    bare.add_tile(quad(0, 1, 1)).unwrap();
+    bare.add_tile(quad(3, 0, 1)).unwrap();
+    assert_eq!(
+        CrowdWorld::from_bytes(&bare, &w.to_bytes(), Limits::UNLIMITED).err(),
+        Some(Error::InvalidSnapshot(SnapshotError::InvalidValue(
+            "pending external traversal"
+        )))
+    );
+}
+
+#[cfg(feature = "crowd-world")]
+#[test]
+fn framed_world_restores_pending_traversal_and_arrival_policy() {
+    use navmesh_rs::Budget;
+    use navmesh_rs::crowd::platforms::{FramedCrowd, PlatformAgentId};
+    use navmesh_rs::crowd::world::{CrowdWorld, CrowdWorldParams};
+    use navmesh_rs::crowd::{AgentParams, ArrivalPolicy, OffMeshMode};
+    use navmesh_rs::frames::{FrameId, FramePoint, FramePose, FrameSet};
+
+    let frame = FrameId(1);
+    let rider = PlatformAgentId(2);
+    let (mut mesh, _, _) = scene(1, 0);
+    mesh.add_runtime_link(spec(), true).unwrap();
+    let local = CrowdWorld::new(&mesh, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+    let mut frames = FrameSet::new(NavMesh::new(&params()).unwrap());
+    frames.add_frame(frame, mesh, FramePose::IDENTITY).unwrap();
+    let mut crowd = FramedCrowd::<CrowdWorld>::default();
+    crowd.attach(&frames, frame, local).unwrap();
+    let mut p = AgentParams::default();
+    p.off_mesh = OffMeshMode::External;
+    p.arrival_policy = ArrivalPolicy::Park;
+    p.update_flags = 0;
+    crowd
+        .add_agent(&frames, rider, FramePoint::new(frame, [3., 0., 5.]), p)
+        .unwrap();
+    crowd
+        .set_goal(&frames, rider, Some(FramePoint::new(frame, END)))
+        .unwrap();
+    let (local_handle, reached) = (0..120)
+        .find_map(|_| {
+            crowd.step(&frames, &mut Budget::unlimited()).unwrap();
+            crowd.crowd(frame).unwrap().off_mesh_arrivals().next()
+        })
+        .expect("rider reaches the external link");
+    assert_eq!(reached.link_id, Some(ID));
+    let bytes = crowd.to_bytes(&frames);
+    let mut restored = FramedCrowd::from_bytes(&frames, &bytes, Limits::UNLIMITED).unwrap();
+    assert_eq!(restored.to_bytes(&frames), bytes);
+    assert_eq!(restored.agent(rider).unwrap().0, frame);
+    assert_eq!(
+        restored.crowd(frame).unwrap().off_mesh_arrivals().next(),
+        Some((local_handle, reached)),
+    );
+    restored.complete_off_mesh(&frames, rider, END).unwrap();
+    restored.step(&frames, &mut Budget::unlimited()).unwrap();
+    assert!(restored.agent(rider).unwrap().2.arrived());
+}
+
 #[test]
 #[ignore = "release qualification over 1,000 runtime links"]
 fn a_thousand_links_connect_and_remove_without_ground_salt_advances() {

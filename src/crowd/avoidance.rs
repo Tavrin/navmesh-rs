@@ -106,6 +106,7 @@ pub struct ObstacleAvoidanceQuery {
     circles: Vec<Circle>,
     segments: Vec<Segment>,
     max_circles: usize,
+    moving_start: usize,
     max_segments: usize,
     fixes: UpstreamFixes,
 }
@@ -129,6 +130,7 @@ impl ObstacleAvoidanceQuery {
             circles: ws.vec_with_capacity(max_circles)?,
             segments: ws.vec_with_capacity(max_segments)?,
             max_circles,
+            moving_start: usize::MAX,
             max_segments,
             fixes: UpstreamFixes::NONE,
         })
@@ -137,6 +139,7 @@ impl ObstacleAvoidanceQuery {
     pub fn reset(&mut self) {
         self.circles.clear();
         self.segments.clear();
+        self.moving_start = usize::MAX;
     }
     /// Adds a moving circle, or returns [`Error::BufferTooSmall`] if full.
     pub fn add_circle(&mut self, p: V3, rad: f32, vel: V3, dvel: V3) -> Result<(), Error> {
@@ -157,6 +160,15 @@ impl ObstacleAvoidanceQuery {
         });
         Ok(())
     }
+    // Appended after all reciprocal circles for this query.
+    #[cfg(feature = "crowd-world")]
+    pub(super) fn add_moving_obstacle(&mut self, p: V3, rad: f32, vel: V3) -> Result<(), Error> {
+        let index = self.circles.len();
+        self.add_circle(p, rad, vel, vel)?;
+        self.moving_start = self.moving_start.min(index);
+        Ok(())
+    }
+
     /// Adds a wall, or returns [`Error::BufferTooSmall`] if full.
     pub fn add_segment(&mut self, p: V3, q: V3) -> Result<(), Error> {
         finite(p)?;
@@ -205,8 +217,12 @@ impl ObstacleAvoidanceQuery {
         let mut tmin = p.horiz_time;
         let mut side = 0.;
         let mut nside = 0;
-        for c in &self.circles {
-            let vab = vsub(&vsub(&vscale(&cand, 2.), &vel), &c.vel);
+        for (index, c) in self.circles.iter().enumerate() {
+            let vab = if index < self.moving_start {
+                vsub(&vsub(&vscale(&cand, 2.), &vel), &c.vel)
+            } else {
+                vsub(&cand, &c.vel)
+            };
             side += fclamp(
                 fmin(vdot_2d(&c.dp, &vab) * 0.5 + 0.5, vdot_2d(&c.np, &vab) * 2.),
                 0.,

@@ -1,23 +1,48 @@
 //! The `'DCRW'` snapshot: a little-endian byte image of a [`CrowdWorld`] for
 //! replays and saves (not in recastnavigation).
 //!
-//! Layout, version 1: magic `DCRW`, version, world parameters, fixes, the sixteen
+//! Version 1 (base): magic `DCRW`, version, world parameters, fixes, the sixteen
 //! filters, the eight avoidance presets, the generation of every agent index, then
 //! each agent's full state in index order, then the path queue's eight request
 //! slots. Every float is stored as its bits, so a restored world steps bit for bit
 //! like the original, including the node pool and heap of a sliced path search in progress.
-//! Version 3 adds the runtime-link epoch after the version number. Each agent
-//! starts with the arrival policy, distance and arrived flag, and ends with the
-//! external traversal mode, replan flag and optional pending traversal. The two
-//! legacy version 2 layouts each contain just one of these extensions.
+//! Version 2 (read-only) is the base layout plus the arrival policy, distance and
+//! arrived flag at the start of each agent. Version 3 (read-only) is the base layout
+//! plus the runtime-link epoch after the version number and, at the end of each
+//! agent, the external traversal mode, replan flag and optional pending traversal.
+//! Version 4 (extended) has both extensions.
+//! Version 5 adds the replan limit, cursor and the navmesh change epoch of the last
+//! completed step after the runtime-link epoch, and each agent's deferred-replan bit
+//! and watched obstruction after its agent record. The last-step epoch lets a
+//! restored world replan exactly where the original would after edits that followed
+//! its last step; restore keeps it when it does not exceed the live mesh's epoch
+//! (the live epoch is used when it does, as for a mesh rebuilt from scratch).
+//! Version 6 uses the version 5 layout with a profile ID before each occupied
+//! agent record and after each queue handle. It requires a mixed profile binding.
+//!
+//! The format is canonical: a reader accepts only the version the restored state
+//! encodes with, a fixes word that includes the always-on nearest-neighbour
+//! correction, so a snapshot of version 1 or 4 to 6 re-encodes to its own bytes on
+//! the mesh it was saved from. The two mesh-epoch fields are the exception: they
+//! rebind to a live mesh that is behind them. Versions 2 and 3 migrate to version 4.
+//!
+//! The profile (`NPCW`) and framed (`DCFR`) records embed the same `DCRW` layouts.
+//! A profile record binds the catalog and slot history, refuses to save while the
+//! mesh has changed since the last step, and writes zero in the sliced-search epoch
+//! and last-step epoch fields. Restore validates the refs and substitutes the
+//! reconstructed mesh's epochs. A framed record stores rider bindings and
+//! goals outside its frame-local `DCRW` payloads.
 use super::*;
 use crate::SnapshotError as E;
 use crate::detour::Status;
 
 const MAGIC: &[u8; 4] = b"DCRW";
 const BASE_VERSION: u32 = 1;
-const LEGACY_VERSION: u32 = 2;
-const EXTENDED_VERSION: u32 = 3;
+const ARRIVAL_VERSION: u32 = 2;
+const LINKS_VERSION: u32 = 3;
+const EXTENDED_VERSION: u32 = 4;
+const REPLAN_VERSION: u32 = 5;
+const MIXED_VERSION: u32 = 6;
 
 #[derive(Clone, Copy)]
 struct AgentLayout {
@@ -251,6 +276,7 @@ fn write_agent(o: &mut Out, a: &CrowdAgent, layout: AgentLayout) {
 
 fn read_agent(
     i: &mut In<'_>,
+    nav: &NavMesh,
     a: &mut CrowdAgent,
     agents: usize,
     max_radius: f32,
@@ -386,6 +412,15 @@ fn read_agent(
                 || landing == 0
                 || radius < 0.0
                 || a.npos != start
+                || !matches!(
+                    nav.off_mesh_connection_by_ref(poly),
+                    Some(con) if con.user_id == user_id && con.rad.to_bits() == radius.to_bits()
+                )
+                || nav.runtime_link_id(poly) != link_id
+                || nav
+                    .off_mesh_connection_poly_end_points(departure, poly)
+                    .ok()
+                    != Some((start, end))
             {
                 return Err(bad("pending external traversal"));
             }
@@ -411,7 +446,30 @@ impl CrowdWorld {
     /// The world as `'DCRW'` snapshot bytes (see the format in the module source).
     /// In-progress searches retain their node pool and heap for exact continuation.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let extended = self.link_epoch != 0
+        self.snapshot_bytes(false)
+    }
+
+    /// `bound` writes zero in the mesh-epoch fields: profile and mixed records
+    /// rebuild their mesh, so restore substitutes the reconstructed mesh's epochs.
+    fn snapshot_bytes(&self, bound: bool) -> Vec<u8> {
+        let (version, layout) = self.canonical_version(bound);
+        self.write_snapshot(version, layout, bound)
+    }
+
+    /// The version and agent layout `snapshot_bytes` writes for this state. A reader
+    /// accepts a current version only when it is this one, so every accepted
+    /// snapshot re-encodes to its own bytes.
+    fn canonical_version(&self, bound: bool) -> (u32, AgentLayout) {
+        let replan = self.replan_limit != replan::DEFAULT_LIMIT
+            || self.replan_cursor != 0
+            || (!bound && self.replan_epoch != 0)
+            || self
+                .heavy
+                .iter()
+                .any(|a| a.active && (a.pending_stamp_replan || a.blocked_poly != 0));
+        let extended = self.mixed.is_some()
+            || replan
+            || self.link_epoch != 0
             || self.heavy.iter().any(|a| {
                 a.active
                     && (a.params.off_mesh == OffMeshMode::External
@@ -425,20 +483,29 @@ impl CrowdWorld {
             arrival: extended,
             links: extended,
         };
-        let version = if extended {
+        let version = if self.mixed.is_some() {
+            MIXED_VERSION
+        } else if replan {
+            REPLAN_VERSION
+        } else if extended {
             EXTENDED_VERSION
         } else {
             BASE_VERSION
         };
-        self.write_snapshot(version, layout)
+        (version, layout)
     }
 
-    fn write_snapshot(&self, version: u32, layout: AgentLayout) -> Vec<u8> {
+    fn write_snapshot(&self, version: u32, layout: AgentLayout, bound: bool) -> Vec<u8> {
         let mut o = Out(Vec::new());
         o.bytes(MAGIC);
         o.u32(version);
         if layout.links {
             o.u64(self.link_epoch);
+        }
+        if version >= REPLAN_VERSION {
+            o.u32(self.replan_limit);
+            o.u32(self.replan_cursor);
+            o.u64(if bound { 0 } else { self.replan_epoch });
         }
         let p = &self.params;
         o.u32(p.max_agents);
@@ -479,9 +546,17 @@ impl CrowdWorld {
             o.u32(g);
             o.u8(u8::from(self.heavy_of[i] != NONE));
         }
-        for &s in &self.heavy_of {
+        for (index, &s) in self.heavy_of.iter().enumerate() {
             if s != NONE {
-                write_agent(&mut o, &self.heavy[s as usize], layout);
+                let a = &self.heavy[s as usize];
+                if let Some(mixed) = &self.mixed {
+                    o.u32(mixed.profiles[index]);
+                }
+                write_agent(&mut o, a, layout);
+                if version >= REPLAN_VERSION {
+                    o.u8(u8::from(a.pending_stamp_replan));
+                    o.r(a.blocked_poly);
+                }
             }
         }
         let q = &self.pathq;
@@ -489,6 +564,9 @@ impl CrowdWorld {
         o.u32(q.next);
         for r in &q.requests {
             o.u32(r.handle);
+            if version == MIXED_VERSION {
+                o.u32(if r.handle == 0 { 0 } else { r.profile });
+            }
             o.r(r.start);
             o.r(r.end);
             o.v3(r.start_pos);
@@ -499,35 +577,201 @@ impl CrowdWorld {
             o.len(r.path.len());
             r.path.iter().for_each(|&x| o.r(x));
         }
-        write_search(&mut o, q);
+        write_search(&mut o, q, bound);
         o.0
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn profile_snapshot(&self, nav: &NavMesh) -> Result<Vec<u8>, Error> {
+        // The profile wrapper binds the exact slot history. Its local mesh epochs
+        // are reconstructed when that history is installed in a new instance.
+        if nav.change_epoch() != self.replan_epoch {
+            return Err(Error::MeshChanged);
+        }
+        if let Some(query) = self.profile_search(nav)?
+            && crate::detour::query::pool_changed(nav, query.query.epoch, &query.node_pool)
+        {
+            return Err(Error::MeshChanged);
+        }
+        Ok(self.snapshot_bytes(true))
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn restore_profile_snapshot(
+        nav: &NavMesh,
+        bytes: &[u8],
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let mut world = Self::read_snapshot(nav, bytes, limits, None, true)?;
+        world.bind_replan_epoch(nav, true)?;
+        if let Some(query) = world.profile_search(nav)? {
+            if query.query.epoch != 0 {
+                return Err(bad("profile search epoch"));
+            }
+            let query = world.pathq.query.as_mut().ok_or(bad("queue query"))?;
+            query.query.epoch = nav.epoch();
+        }
+        Ok(world)
+    }
+
+    /// The running search's query when every ref it holds is resident on `nav`.
+    fn profile_search(
+        &self,
+        nav: &NavMesh,
+    ) -> Result<Option<&crate::detour::query::DetachedQuery>, Error> {
+        if !has_running_search(&self.pathq) {
+            return Ok(None);
+        }
+        let query = self.pathq.query.as_ref().ok_or(bad("queue query"))?;
+        if !nav.is_valid_poly_ref(query.query.start_ref)
+            || !nav.is_valid_poly_ref(query.query.end_ref)
+            || query
+                .node_pool
+                .used()
+                .iter()
+                .any(|node| !nav.is_valid_poly_ref(node.id))
+        {
+            return Err(Error::MeshChanged);
+        }
+        Ok(Some(query))
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn mixed_snapshot(
+        &self,
+        meshes: &BTreeMap<u32, &NavMesh>,
+    ) -> Result<Vec<u8>, Error> {
+        let mixed = self.mixed.as_ref().ok_or(bad("profile binding"))?;
+        for (&id, &epoch) in &mixed.epochs {
+            let mesh = meshes.get(&id).ok_or(bad("profile binding"))?;
+            if mesh.change_epoch() != epoch {
+                return Err(Error::MeshChanged);
+            }
+        }
+        if has_running_search(&self.pathq) {
+            let request = &self.pathq.requests[self.pathq.head % 8];
+            let mesh = meshes.get(&request.profile).ok_or(bad("queue profile"))?;
+            if let Some(query) = self.profile_search(mesh)?
+                && crate::detour::query::pool_changed(mesh, query.query.epoch, &query.node_pool)
+            {
+                return Err(Error::MeshChanged);
+            }
+        }
+        Ok(self.snapshot_bytes(true))
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn restore_mixed_snapshot(
+        meshes: &BTreeMap<u32, &NavMesh>,
+        bytes: &[u8],
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let (_, nav) = meshes.first_key_value().ok_or(bad("empty profile set"))?;
+        let mut world = Self::read_snapshot(nav, bytes, limits, Some(meshes), true)?;
+        world.bind_replan_epoch(nav, true)?;
+        if has_running_search(&world.pathq) {
+            let request = &world.pathq.requests[world.pathq.head % 8];
+            let mesh = meshes.get(&request.profile).ok_or(bad("queue profile"))?;
+            if world
+                .profile_search(mesh)?
+                .is_none_or(|q| q.query.epoch != 0)
+            {
+                return Err(bad("profile search epoch"));
+            }
+            let query = world.pathq.query.as_mut().ok_or(bad("queue query"))?;
+            query.query.epoch = mesh.epoch();
+        }
+        Ok(world)
     }
 
     /// Restores a world from untrusted `'DCRW'` bytes for agents on `nav`. Rejects
     /// malformed input with [`Error::InvalidSnapshot`]; `limits` bound the
-    /// restored world's allocation as in [`CrowdWorld::new`].
+    /// restored world's allocation as in [`CrowdWorld::new`]. Restore the
+    /// navmesh to the state it had at the snapshot's last completed crowd step.
     pub fn from_bytes(nav: &NavMesh, b: &[u8], limits: Limits) -> Result<Self, Error> {
+        let mut world = Self::read_snapshot(nav, b, limits, None, false)?;
+        world.bind_replan_epoch(nav, false)?;
+        // A running search keeps its saved epoch only when the live mesh has not
+        // fallen behind it, so a restored search still sees later edits.
+        if let Some(saved) = world.profile_search(nav)?.map(|q| q.query.epoch) {
+            let query = world.pathq.query.as_mut().ok_or(bad("queue query"))?;
+            query.query.epoch = saved.min(nav.epoch());
+        }
+        Ok(world)
+    }
+
+    /// Sets the last-step epoch after a read. A bound (profile or mixed) record
+    /// stores zero and takes the reconstructed mesh's epoch. Otherwise a stored
+    /// epoch ahead of the live mesh, or an absent one, means the mesh has no
+    /// comparable history and is taken to match the last step.
+    fn bind_replan_epoch(&mut self, nav: &NavMesh, bound: bool) -> Result<(), Error> {
+        let live = nav.change_epoch();
+        if bound && self.replan_epoch != 0 {
+            return Err(bad("profile replan epoch"));
+        }
+        if self.replan_epoch == 0 || self.replan_epoch > live {
+            self.replan_epoch = live;
+        }
+        Ok(())
+    }
+
+    fn read_snapshot(
+        nav: &NavMesh,
+        b: &[u8],
+        limits: Limits,
+        profiles: Option<&BTreeMap<u32, &NavMesh>>,
+        bound: bool,
+    ) -> Result<Self, Error> {
         let mut i = In(b);
         if &i.take::<4>()? != MAGIC {
             return Err(Error::InvalidSnapshot(E::WrongMagic));
         }
-        let layout = match i.u32()? {
+        let version = i.u32()?;
+        if (version == MIXED_VERSION) != profiles.is_some() {
+            return Err(Error::InvalidSnapshot(E::WrongVersion));
+        }
+        let layout = match version {
             BASE_VERSION => AgentLayout {
                 arrival: false,
                 links: false,
             },
-            LEGACY_VERSION => legacy_layout(i.0)?,
-            EXTENDED_VERSION => AgentLayout {
+            ARRIVAL_VERSION => AgentLayout {
+                arrival: true,
+                links: false,
+            },
+            LINKS_VERSION => AgentLayout {
+                arrival: false,
+                links: true,
+            },
+            EXTENDED_VERSION | REPLAN_VERSION | MIXED_VERSION => AgentLayout {
                 arrival: true,
                 links: true,
             },
             _ => return Err(Error::InvalidSnapshot(E::WrongVersion)),
         };
         let link_epoch = if layout.links { i.u64()? } else { 0 };
+        let (replan_limit, replan_cursor, replan_epoch) = if version >= REPLAN_VERSION {
+            (i.u32()?, i.u32()?, i.u64()?)
+        } else {
+            (replan::DEFAULT_LIMIT, 0, 0)
+        };
         let p = read_world_params(&mut i)?;
+        if replan_cursor > p.max_agents {
+            return Err(bad("replan cursor"));
+        }
         let mut w = CrowdWorld::new(nav, &p, limits)?;
+        w.mixed = profiles.map(Self::mixed_state);
         w.link_epoch = link_epoch;
-        w.set_fixes(UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?);
+        w.replan_limit = replan_limit;
+        w.replan_cursor = replan_cursor;
+        // Zero (absent) is resolved by `bind_replan_epoch`.
+        w.replan_epoch = replan_epoch;
+        let fixes = UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?;
+        // `set_fixes` always adds this flag, so a record without it is not canonical.
+        if !fixes.contains(UpstreamFixes::NEAREST_NEIGHBOURS) {
+            return Err(bad("fixes"));
+        }
+        w.set_fixes(fixes);
         for k in 0..16 {
             let mut f = DefaultFilter::default();
             for c in &mut f.area_cost {
@@ -591,8 +835,29 @@ impl CrowdWorld {
                 w.free.push(Reverse(k as u32));
                 continue;
             }
+            let mut agent_nav = nav;
+            if let Some(mixed) = &mut w.mixed {
+                let profile = i.u32()?;
+                if !mixed.epochs.contains_key(&profile) {
+                    return Err(bad("agent profile"));
+                }
+                mixed.profiles[k] = profile;
+                if let Some(&mesh) = profiles.and_then(|meshes| meshes.get(&profile)) {
+                    agent_nav = mesh;
+                }
+            }
             let mut a = CrowdAgent::new_in(&mut ws)?;
-            read_agent(&mut i, &mut a, n, p.max_radius, &mut ws, layout)?;
+            read_agent(&mut i, agent_nav, &mut a, n, p.max_radius, &mut ws, layout)?;
+            if version >= REPLAN_VERSION {
+                a.pending_stamp_replan = i.flag("deferred replan")?;
+                a.blocked_poly = i.r()?;
+                if (a.pending_stamp_replan || a.blocked_poly != 0)
+                    && (a.target_ref == 0
+                        || matches!(a.target_state, TargetState::None | TargetState::Velocity))
+                {
+                    return Err(bad("replan target"));
+                }
+            }
             let s = w.heavy.len() as u32;
             w.heavy_of[k] = s;
             w.pos[k] = a.npos;
@@ -621,6 +886,14 @@ impl CrowdWorld {
         let max_path = q.max_path;
         for r in &mut q.requests {
             r.handle = i.u32()?;
+            if let Some(profiles) = profiles {
+                r.profile = i.u32()?;
+                if (r.handle == 0 && r.profile != 0)
+                    || (r.handle != 0 && !profiles.contains_key(&r.profile))
+                {
+                    return Err(bad("queue profile"));
+                }
+            }
             r.start = i.r()?;
             r.end = i.r()?;
             r.start_pos = i.v3("queue request")?;
@@ -659,19 +932,49 @@ impl CrowdWorld {
                 }
             }
         }
+        if q.requests
+            .iter()
+            .any(|r| r.handle != 0 && r.handle == q.next)
+        {
+            return Err(bad("queue handle"));
+        }
         read_search(&mut i, q, running, &mut ws)?;
+        if let Some(mixed) = &w.mixed {
+            for (a, &index) in w.heavy.iter().zip(&w.owner) {
+                if a.target_state == TargetState::WaitingForPath
+                    && let Some(r) = q
+                        .requests
+                        .iter()
+                        .find(|r| r.handle != 0 && r.handle == a.pathq)
+                    && r.profile != mixed.profiles[index as usize]
+                {
+                    return Err(bad("agent queue profile"));
+                }
+            }
+        }
         if !i.0.is_empty() {
             return Err(Error::InvalidSnapshot(E::TrailingBytes));
+        }
+        // Versions 2 and 3 are read-only layouts that migrate to version 4. Every
+        // other version must be the one the restored state encodes with.
+        if !matches!(version, ARRIVAL_VERSION | LINKS_VERSION)
+            && w.canonical_version(bound).0 != version
+        {
+            return Err(bad("layout version"));
         }
         Ok(w)
     }
 }
 
-fn write_search(o: &mut Out, queue: &PathQueue) {
-    let running = queue
+fn has_running_search(queue: &PathQueue) -> bool {
+    queue
         .requests
         .iter()
-        .any(|r| r.handle != 0 && r.status & Status::IN_PROGRESS != 0);
+        .any(|r| r.handle != 0 && r.status & Status::IN_PROGRESS != 0)
+}
+
+fn write_search(o: &mut Out, queue: &PathQueue, bound: bool) {
+    let running = has_running_search(queue);
     o.u8(u8::from(running));
     if !running {
         return;
@@ -704,7 +1007,7 @@ fn write_search(o: &mut Out, queue: &PathQueue) {
     o.v3(d.end_pos);
     o.u32(d.options);
     o.f32(d.raycast_limit_sqr);
-    o.u64(d.epoch);
+    o.u64(if bound { 0 } else { d.epoch });
 }
 
 fn read_search(
@@ -850,27 +1153,6 @@ fn read_world_params(i: &mut In<'_>) -> Result<CrowdWorldParams, Error> {
     Ok(p)
 }
 
-fn legacy_layout(bytes: &[u8]) -> Result<AgentLayout, Error> {
-    // The link layout has an extra u64 before the checksummed parameters.
-    // Identify the layout before allocating the world or reading any agents.
-    let arrival = read_world_params(&mut In(bytes));
-    let links = bytes
-        .get(8..)
-        .is_some_and(|tail| read_world_params(&mut In(tail)).is_ok());
-    match (arrival, links) {
-        (Ok(_), false) => Ok(AgentLayout {
-            arrival: true,
-            links: false,
-        }),
-        (Err(_), true) => Ok(AgentLayout {
-            arrival: false,
-            links: true,
-        }),
-        (Ok(_), true) => Err(bad("ambiguous legacy snapshot layout")),
-        (Err(err), false) => Err(err),
-    }
-}
-
 fn params_hash(p: &CrowdWorldParams) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for word in [
@@ -915,11 +1197,16 @@ mod tests {
 
         for arrival in [true, false] {
             let mut bytes = w.write_snapshot(
-                LEGACY_VERSION,
+                if arrival {
+                    ARRIVAL_VERSION
+                } else {
+                    LINKS_VERSION
+                },
                 AgentLayout {
                     arrival,
                     links: !arrival,
                 },
+                false,
             );
             let mut restored = CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED).unwrap();
             let agent = restored.heavy_mut(h).unwrap();
@@ -934,10 +1221,66 @@ mod tests {
                 assert_eq!(restored.link_epoch, 17);
             }
             assert_eq!(restored.to_bytes()[4..8], EXTENDED_VERSION.to_le_bytes());
+            // Each layout has its own version: the other number is not a guess away.
+            let (own, other) = if arrival {
+                (ARRIVAL_VERSION, LINKS_VERSION)
+            } else {
+                (LINKS_VERSION, ARRIVAL_VERSION)
+            };
+            assert_eq!(bytes[4..8], own.to_le_bytes());
+            let mut swapped = bytes.clone();
+            swapped[4..8].copy_from_slice(&other.to_le_bytes());
+            assert!(CrowdWorld::from_bytes(&nav, &swapped, Limits::UNLIMITED).is_err());
             bytes[4..8].copy_from_slice(&u32::MAX.to_le_bytes());
             assert!(matches!(
                 CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED),
                 Err(Error::InvalidSnapshot(E::WrongVersion))
+            ));
+        }
+    }
+    fn empty_nav() -> NavMesh {
+        NavMesh::new(&NavMeshParams {
+            orig: [0.; 3],
+            tile_width: 10.,
+            tile_height: 10.,
+            max_tiles: 4,
+            max_polys: 32,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn rejects_a_fixes_word_the_writer_never_produces() {
+        let nav = empty_nav();
+        let mut w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+        w.set_fixes(UpstreamFixes::ALL);
+        let bytes = w.to_bytes();
+        let back = CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED).unwrap();
+        assert_eq!(back.to_bytes(), bytes);
+        // Version 1 header: magic, version, 24 bytes of parameters, their hash, then the fixes.
+        let at = 8 + 24 + 8;
+        assert_eq!(bytes[at..at + 4], UpstreamFixes::ALL.bits().to_le_bytes());
+        let mut bad_bytes = bytes;
+        bad_bytes[at..at + 4].copy_from_slice(&UpstreamFixes::NONE.bits().to_le_bytes());
+        assert!(matches!(
+            CrowdWorld::from_bytes(&nav, &bad_bytes, Limits::UNLIMITED),
+            Err(Error::InvalidSnapshot(E::InvalidValue("fixes")))
+        ));
+    }
+
+    #[test]
+    fn rejects_a_current_version_the_state_does_not_encode_with() {
+        let nav = empty_nav();
+        let w = CrowdWorld::new(&nav, &CrowdWorldParams::default(), Limits::UNLIMITED).unwrap();
+        let wide = AgentLayout {
+            arrival: true,
+            links: true,
+        };
+        for version in [EXTENDED_VERSION, REPLAN_VERSION] {
+            let bytes = w.write_snapshot(version, wide, false);
+            assert!(matches!(
+                CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED),
+                Err(Error::InvalidSnapshot(E::InvalidValue("layout version")))
             ));
         }
     }

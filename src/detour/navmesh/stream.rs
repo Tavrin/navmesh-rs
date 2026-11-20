@@ -812,6 +812,13 @@ impl NavMesh {
         })
     }
 
+    #[cfg(feature = "recast")]
+    pub(crate) fn has_parked_tile(&self, key: TileKey, layer: i32) -> bool {
+        self.stream
+            .parked_slot(&self.slots, key.x, key.y, layer)
+            .is_some()
+    }
+
     /// Drops the reservation of an unloaded tile: its refs become
     /// [`RefState::Stale`] and the slot is free again (as after `remove_tile`).
     /// [`Error::InvalidParameter`] when no tile is unloaded at `key, layer`.
@@ -1025,6 +1032,14 @@ const RES_HEADER: usize = 44;
 const RES_ENTRY: usize = 64;
 
 impl ResidencyRecord {
+    #[cfg(feature = "recast")]
+    pub(crate) fn tiles(&self) -> impl Iterator<Item = (TileKey, i32, [u8; 32], u32)> + '_ {
+        self.entries.iter().filter_map(|entry| {
+            let tile = entry.tile?;
+            Some((tile.key, tile.layer, tile.hash, tile.polys))
+        })
+    }
+
     /// Number of slots recorded.
     pub fn len(&self) -> usize {
         self.entries.len()

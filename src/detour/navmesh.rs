@@ -69,6 +69,7 @@ struct Slot {
     /// Content hash of the resident tile when it is known without hashing again
     /// (tiles committed from a [`PreparedTile`]).
     hash: Option<[u8; 32]>,
+    change_stamp: u64,
     #[cfg(feature = "dynamic")]
     state_stamp: u64,
 }
@@ -81,6 +82,7 @@ static EMPTY_SLOT: Slot = Slot {
     used: false,
     parked: None,
     hash: None,
+    change_stamp: 0,
     #[cfg(feature = "dynamic")]
     state_stamp: 0,
 };
@@ -218,6 +220,7 @@ pub struct NavMesh {
     runtime_links: links::RuntimeLinks,
     /// Streaming state: slot policy, unloaded tiles, known columns, epoch.
     stream: stream::StreamState,
+    change_epoch: u64,
     #[cfg(feature = "dynamic")]
     modifiers: modifiers::Modifiers,
 }
@@ -554,6 +557,27 @@ pub(crate) fn poly_height(tile: &MeshTile, ip: usize, pos: &[f32]) -> Option<f32
     Some(closest_point_on_detail_edges(tile, ip, pos, false)[1])
 }
 
+// Shared by in-mesh runtime links and cross-frame dock endpoints.
+pub(crate) fn link_landing_candidate(
+    tile: &MeshTile,
+    ip: usize,
+    point: [f32; 3],
+) -> Option<([f32; 3], f64)> {
+    if tile.polys.get(ip)?.poly_type() != super::POLYTYPE_GROUND {
+        return None;
+    }
+    let (snap, _) = closest_point_on_poly_in_tile(tile, ip, &point);
+    let d = snap
+        .into_iter()
+        .zip(point)
+        .map(|(a, b)| {
+            let delta = f64::from(a) - f64::from(b);
+            delta * delta
+        })
+        .sum();
+    Some((snap, d))
+}
+
 /// `dtNavMesh::closestPointOnPoly` on polygon `ip` of `tile`.
 pub(crate) fn closest_point_on_poly_in_tile(tile: &MeshTile, ip: usize, pos: &[f32]) -> (V3, bool) {
     let mut closest = v3(pos);
@@ -775,6 +799,7 @@ impl NavMesh {
             global_off_mesh: false,
             runtime_links: links::RuntimeLinks::default(),
             stream: stream::StreamState::new(policy)?,
+            change_epoch: 0,
             #[cfg(feature = "dynamic")]
             modifiers: modifiers::Modifiers::default(),
         })
@@ -782,6 +807,46 @@ impl NavMesh {
 
     pub(crate) fn report_identity(&self) -> &Arc<()> {
         &self.identity.0
+    }
+
+    /// Current revision of tile residency, content, effective polygon state
+    /// and runtime link connectivity. Independent of the structural epoch.
+    pub fn change_epoch(&self) -> u64 {
+        self.change_epoch
+    }
+
+    /// Last change revision of a resident tile. Returns `None` for a stale or
+    /// unloaded tile reference.
+    pub fn tile_change_stamp(&self, tile: TileRef) -> Option<u64> {
+        let ti = self.resident_slot(tile).ok()?;
+        Some(self.slots[ti].change_stamp)
+    }
+
+    fn advance_change_epoch(&mut self) -> u64 {
+        self.change_epoch = self.change_epoch.saturating_add(1);
+        self.change_epoch
+    }
+
+    fn stamp_tile_change(&mut self, ti: usize) {
+        let stamp = self.advance_change_epoch();
+        self.slots[ti].change_stamp = stamp;
+    }
+
+    fn stamp_state(&mut self, ti: usize) {
+        #[cfg(feature = "dynamic")]
+        {
+            self.slots[ti].state_stamp = self.modifiers.advance();
+        }
+        self.stamp_tile_change(ti);
+    }
+
+    // A watched corridor can still name a slot after it loses its tile or salt.
+    #[cfg(feature = "crowd")]
+    pub(crate) fn corridor_tile_changed(&self, poly: PolyRef, since: u64) -> bool {
+        let ti = self.decode_poly_id_tile(poly) as usize;
+        self.slots
+            .get(ti)
+            .is_some_and(|slot| slot.change_stamp > since)
     }
 
     /// The limits the tile reader applies.
@@ -1146,10 +1211,8 @@ impl NavMesh {
     /// [`Error::InvalidParameter`].
     pub fn set_poly_flags(&mut self, r: PolyRef, flags: u16) -> Result<(), Error> {
         let poly = self.poly_mut(r)?;
-        #[cfg(feature = "dynamic")]
         let changed = poly.flags != flags;
         poly.flags = flags;
-        #[cfg(feature = "dynamic")]
         if changed {
             self.stamp_state(self.decode_poly_id(r).1 as usize);
         }
@@ -1165,10 +1228,8 @@ impl NavMesh {
     /// [`Error::InvalidParameter`].
     pub fn set_poly_area(&mut self, r: PolyRef, area: u8) -> Result<(), Error> {
         let poly = self.poly_mut(r)?;
-        #[cfg(feature = "dynamic")]
         let before = poly.area();
         poly.set_area(area);
-        #[cfg(feature = "dynamic")]
         if before != poly.area() {
             self.stamp_state(self.decode_poly_id(r).1 as usize);
         }
@@ -1268,14 +1329,19 @@ impl NavMesh {
             .get_mut(ti)
             .and_then(|s| s.tile.as_deref_mut())
             .ok_or(Error::InvalidRef)?;
-        #[cfg(feature = "dynamic")]
-        {
-            if stream::apply_state(tile, data, size, |ip| self.modifiers.governs(ti, ip)) {
-                self.stamp_state(ti);
+        if stream::apply_state(tile, data, size, |ip| {
+            #[cfg(feature = "dynamic")]
+            {
+                self.modifiers.governs(ti, ip)
             }
+            #[cfg(not(feature = "dynamic"))]
+            {
+                let _ = ip;
+                false
+            }
+        }) {
+            self.stamp_state(ti);
         }
-        #[cfg(not(feature = "dynamic"))]
-        stream::apply_state(tile, data, size, |_| false);
         Ok(())
     }
 
@@ -1502,6 +1568,7 @@ impl NavMesh {
         }
         s.hash = hash;
         s.used = true;
+        self.stamp_tile_change(ti);
         self.stream.bump_epoch();
         self.resident += 1;
         self.occupied = Some(match self.occupied {
@@ -1644,6 +1711,7 @@ impl NavMesh {
             self.modifiers.detach_tile(tile, ti);
         }
         self.slots[ti].hash = None;
+        self.stamp_tile_change(ti);
         self.resident = self.resident.saturating_sub(1);
         if self.global_off_mesh && ground {
             self.rebuild_global_links();

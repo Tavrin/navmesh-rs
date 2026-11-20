@@ -51,13 +51,10 @@ step. A path follower outside the crowds can identify a runtime connection
 with `runtime_link_id` and get oriented endpoints with
 `off_mesh_connection_poly_end_points`.
 
-For a future multi-frame dock API, use a stable `LinkId`, two endpoint pairs
-`(frame_id, local_position)`, a radius, direction and an enabled bit. Let a
-frame-graph edge delegate traversal through the same arrival/complete/abort
-contract. The destination ref and completion position belong to the destination
-frame, while abort uses the departure frame. The frame owner will need to
-validate and transfer the agent before completing the hand-off. The current API
-runs within one navmesh coordinate frame and validates a landing in that mesh.
+[Moving platform docks](MOVING-PLATFORMS.md) use the same stable id,
+endpoint radius, availability and direction contract. Their legs and landing
+refs are scoped to separate meshes. The frame owner validates the seam and
+places the agent in the destination simulation after the local crowd step.
 
 Both landing polygons must pass the agent's query filter before a path enters
 a managed link. A gate on a landing can therefore block traversal without
@@ -72,8 +69,10 @@ persisted, `NavMesh::residency()`. Restore residency first, call
 `restore_runtime_links()`, then recommit any remaining ground tiles. Restore
 the crowd snapshot after the mesh. A residency reservation for a generated
 tile must match the rebuilt tile's content hash. Crowd snapshots with external
-traversal state use `DCRW` version 3 and restore pending arrivals along with
-goal arrival policies. Readers also accept legacy version 2 snapshots.
+traversal state use `DCRW` version 4 or later and restore pending arrivals along
+with goal arrival policies; restore checks a pending arrival against the live
+connection (polygon, link id, end points and radius). Readers also accept the
+legacy version 2 and 3 snapshots.
 
 `DNLK` version 1 is a little-endian record. The 20-byte header contains the four
 magic bytes, a `u32` version, an `i32` layer (`-1` for no layer) and a `u64`

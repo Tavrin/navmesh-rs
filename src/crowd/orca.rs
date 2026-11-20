@@ -408,14 +408,15 @@ pub(super) fn velocity_in(
     dt: f32,
     s: &mut OrcaScratch,
 ) -> Result<V2, Error> {
-    velocity_with_responsibility(ws, a, neighbours, walls, params, dt, s, |_| 0.5)
+    velocity_with_responsibility(ws, a, neighbours, walls, &[], params, dt, s, |_| 0.5)
 }
-/// Internal asymmetric split used only for opted-in parked agents.
+/// Solves with nonreciprocal obstacles and a caller-supplied split for neighbours.
 pub(super) fn velocity_with_responsibility(
     ws: &mut Workspace,
     a: &OrcaAgent,
     neighbours: &[OrcaAgent],
     walls: &[[f32; 4]],
+    obstacles: &[OrcaAgent],
     params: &OrcaParams,
     dt: f32,
     s: &mut OrcaScratch,
@@ -447,7 +448,11 @@ pub(super) fn velocity_with_responsibility(
             s.order.insert(at, (i, distance));
         }
     }
-    let count = walls.len().checked_add(cap).ok_or(Error::SizeOverflow)?;
+    let count = walls
+        .len()
+        .checked_add(cap)
+        .and_then(|n| n.checked_add(obstacles.len()))
+        .ok_or(Error::SizeOverflow)?;
     ws.reserve(&mut s.planes, count)?;
     ws.reserve(&mut s.projected, count)?;
     for &wall in walls {
@@ -457,6 +462,12 @@ pub(super) fn velocity_with_responsibility(
         }
         s.planes
             .push(wall_plane(a, wall, params.time_horizon_obstacles, dt));
+    }
+    for b in obstacles {
+        ws.work(1)?;
+        b.validate()?;
+        s.planes
+            .push(agent_plane(a, b, params.time_horizon_obstacles, dt, 1.));
     }
     let static_count = s.planes.len();
     for &(i, _) in &s.order {

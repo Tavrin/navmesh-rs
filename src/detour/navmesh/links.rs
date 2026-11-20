@@ -258,6 +258,7 @@ impl NavMesh {
             .runtime_links
             .entries
             .get(&id)
+            .copied()
             .ok_or(Error::InvalidParameter("unknown runtime link id"))?;
         self.rebuild_link_column(
             entry.key,
@@ -271,6 +272,7 @@ impl NavMesh {
                 .iter(),
         )?;
         self.runtime_links.entries.remove(&id);
+        self.stamp_link_landings(entry.report);
         self.runtime_links.changed_at = self.epoch();
         self.refresh_runtime_links();
         Ok(())
@@ -510,7 +512,10 @@ impl NavMesh {
             let Some(e) = self.runtime_links.entries.get_mut(&id) else {
                 continue;
             };
-            changed |= e.report != report && (e.report.is_traversable() || report.is_traversable());
+            let old = e.report;
+            let connection_changed =
+                old != report && (old.is_traversable() || report.is_traversable());
+            changed |= connection_changed;
             e.report = report;
             let e = *e;
             let key = e.key;
@@ -534,6 +539,11 @@ impl NavMesh {
                 next
             });
             let owner = self.base_ref(ti) | ip as PolyRef;
+            if old != report {
+                self.stamp_tile_change(ti);
+                self.stamp_link_landings(old);
+                self.stamp_link_landings(report);
+            }
             #[cfg(feature = "dynamic")]
             let modified = self.modifiers.governs(ti, ip).then(|| {
                 self.modifiers
@@ -566,6 +576,16 @@ impl NavMesh {
         }
         if changed {
             self.runtime_links.changed_at = self.epoch();
+        }
+    }
+
+    fn stamp_link_landings(&mut self, report: LinkReport) {
+        for landing in [report.start, report.end] {
+            if let Landing::Connected(poly) = landing
+                && self.is_valid_poly_ref(poly)
+            {
+                self.stamp_tile_change(self.decode_poly_id_tile(poly) as usize);
+            }
         }
     }
 
@@ -749,18 +769,9 @@ fn find_runtime_landing(t: &MeshTile, point: [f32; 3], radius: f32) -> Option<(u
     let mut hit = None;
     let mut best = f64::INFINITY;
     query_polygons_in_tile_with(t, &min, &max, &mut |ip| {
-        if t.polys[ip as usize].poly_type() != super::super::POLYTYPE_GROUND {
+        let Some((snap, d)) = link_landing_candidate(t, ip as usize, point) else {
             return true;
-        }
-        let (snap, _) = closest_point_on_poly_in_tile(t, ip as usize, &point);
-        let d: f64 = snap
-            .into_iter()
-            .zip(point)
-            .map(|(a, b)| {
-                let delta = f64::from(a) - f64::from(b);
-                delta * delta
-            })
-            .sum();
+        };
         if d <= f64::from(radius) * f64::from(radius) && d < best {
             best = d;
             hit = Some((ip, snap));

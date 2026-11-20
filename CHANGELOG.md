@@ -8,6 +8,22 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Independent agent-size bake profiles with checked tile halos, versioned
+  catalogs, and profile-bound streaming, queries, connectivity and crowds.
+  See [Agent-size bake profiles](docs/BAKE-PROFILES.md).
+- Shared ORCA and sampled avoidance for agents on different bake profiles in
+  one crowd world, with profile-local routing, replanning, traversal and
+  moving-platform landings. Mixed snapshots preserve agent and queue profile
+  bindings.
+- Moving platform frames with yaw-only poses, runtime docks, cross-frame
+  routes, and stable riders for both crowds. Frame and framed crowd snapshots
+  restore dock availability and riders in transit. See
+  [moving platforms](docs/MOVING-PLATFORMS.md).
+
+- Tile-cache zones for selected columns via `bake::tile_cache_layers`.
+  `TileCache::update_budgeted` rebuilds affected layers in bounded slices,
+  preserving equal-content refs and applying registered modifiers on replacement.
+  See [Tile-cache zones](docs/TILE-CACHE-ZONES.md).
 - Managed runtime off-mesh connections with stable ids, optional reserved ground
   link slots, typed landing reports, game-controlled availability and versioned
   snapshots. Tile replacement and streaming re-resolve the registered links.
@@ -19,6 +35,10 @@ All notable changes to this project are documented in this file. The format foll
   in the versioned `DNDY` format. See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
 - Managed links require both landings to pass the query filter, so closing a
   gate on either landing blocks paths through the link.
+- Tile change stamps cover residency, replacement, modifier edits and runtime
+  link changes. CrowdWorld replans affected corridors in the next step, with
+  an optional per-step cap. Crowd can opt in with `set_stamp_revalidation`.
+  See [crowd replanning](docs/CROWD-REPLANNING.md).
 
 - `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
   agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
@@ -27,8 +47,8 @@ All notable changes to this project are documented in this file. The format foll
   data-parallel on the current rayon pool with the `parallel` feature; digests are
   identical for any thread count. `step` charges `STEP_WORK_PER_AGENT` per active agent
   plus the path queue's node expansions to a `Budget` before simulating and refuses
-  the step, untouched, when it does not fit. Agents match `Crowd` with
-  `UpstreamFixes::NEAREST_NEIGHBOURS` bit for bit. `'DCRW'` snapshots
+  the step, untouched, when it does not fit. With an unchanged navmesh, agents
+  match `Crowd` with `UpstreamFixes::NEAREST_NEIGHBOURS` bit for bit. `'DCRW'` snapshots
   (`to_bytes`/`from_bytes`) restore a world that steps identically on the same navmesh, including
   in-progress sliced searches; malformed bytes give
   `Error::InvalidSnapshot`.
@@ -49,8 +69,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Changed
 
-- CrowdWorld writes `DCRW` version 3 for arrival policies or external traversal.
-  It reads both legacy version 2 layouts and still writes version 1 for default worlds.
+- CrowdWorld writes `DCRW` version 4 or later for arrival policies or external traversal.
+  It reads the legacy version 2 and 3 layouts. `to_bytes` records the navmesh change epoch
+  of the last step so a restored world replans exactly where the original would.
+- Tile bytes: trailing bytes that are not an exact 12-byte reference-layout trailer are
+  ignored again, as before layouts existed; a trailer with an unknown version gives
+  `TileDataError::WrongVersion`, and a trailer naming the default layout no longer
+  changes the tile's content hash.
 - `Crowd::update`'s per-agent phase arithmetic moved into functions shared with
   `CrowdWorld`, with unchanged expression order; trajectories are unchanged.
 - `NavMesh::replace_tile`, `replace_tile_budgeted` and `replace_cost`, returning

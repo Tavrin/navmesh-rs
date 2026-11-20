@@ -1,8 +1,34 @@
 //! Budgeted sliced path queue, translated from DetourPathQueue.cpp; see NOTICE.
 use super::*;
 use crate::detour::query::DetachedQuery;
+
+#[derive(Clone, Copy)]
+pub(super) struct MeshSource<'a> {
+    pub(super) default: &'a NavMesh,
+    #[cfg(feature = "crowd-world")]
+    pub(super) profiles: Option<&'a alloc::collections::BTreeMap<u32, &'a NavMesh>>,
+}
+
+impl<'a> MeshSource<'a> {
+    pub(super) fn single(nav: &'a NavMesh) -> Self {
+        Self {
+            default: nav,
+            #[cfg(feature = "crowd-world")]
+            profiles: None,
+        }
+    }
+
+    pub(super) fn mesh(self, _profile: u32) -> Result<&'a NavMesh, Error> {
+        #[cfg(feature = "crowd-world")]
+        if let Some(profiles) = self.profiles {
+            return profiles.get(&_profile).copied().ok_or(Error::InvalidRef);
+        }
+        Ok(self.default)
+    }
+}
 pub(super) struct Request {
     pub(super) handle: u32,
+    pub(super) profile: u32,
     pub(super) start: PolyRef,
     pub(super) end: PolyRef,
     pub(super) start_pos: V3,
@@ -52,6 +78,7 @@ impl PathQueue {
         for _ in 0..8 {
             requests.push(Request {
                 handle: 0,
+                profile: 0,
                 start: 0,
                 end: 0,
                 start_pos: [0.; 3],
@@ -89,6 +116,18 @@ impl PathQueue {
         end_pos: V3,
         filter: usize,
     ) -> Result<u32, Error> {
+        self.request_on((0, nav), start, end, start_pos, end_pos, filter)
+    }
+
+    pub(super) fn request_on(
+        &mut self,
+        (profile, nav): (u32, &NavMesh),
+        start: PolyRef,
+        end: PolyRef,
+        start_pos: V3,
+        end_pos: V3,
+        filter: usize,
+    ) -> Result<u32, Error> {
         finite(start_pos)?;
         finite(end_pos)?;
         if !nav.is_valid_poly_ref(start) || !nav.is_valid_poly_ref(end) {
@@ -106,6 +145,7 @@ impl PathQueue {
             self.next = 1;
         }
         q.handle = h;
+        q.profile = profile;
         q.start = start;
         q.end = end;
         q.start_pos = start_pos;
@@ -120,6 +160,31 @@ impl PathQueue {
     /// collection).
     pub fn pending(&self) -> usize {
         self.requests.iter().filter(|r| r.handle != 0).count()
+    }
+    pub(super) fn cancel(&mut self, handle: u32) {
+        if handle != 0
+            && let Some(r) = self.requests.iter_mut().find(|r| r.handle == handle)
+        {
+            r.handle = 0;
+            r.status = 0;
+        }
+    }
+
+    // Only the current slot can have a sliced search in progress.
+    pub(super) fn revalidate_search(&mut self, profile: u32, nav: &NavMesh, since: u64) {
+        let r = &mut self.requests[self.head % 8];
+        if r.profile == profile
+            && r.status & Status::IN_PROGRESS != 0
+            && (nav.corridor_tile_changed(r.end, since)
+                || self.query.as_ref().is_some_and(|q| {
+                    q.node_pool
+                        .used()
+                        .iter()
+                        .any(|node| nav.corridor_tile_changed(node.id, since))
+                }))
+        {
+            r.status = 0;
+        }
     }
     /// Upstream status bits of a request; an unknown handle reports failure.
     pub fn status(&self, handle: u32) -> u32 {
@@ -167,18 +232,18 @@ impl PathQueue {
         filters: &[DefaultFilter; 16],
     ) -> Result<(), Error> {
         ws.begin();
-        self.update_in(ws, nav, max_iters, filters)
+        self.update_in(ws, MeshSource::single(nav), max_iters, filters)
     }
-    pub(crate) fn update_in(
+    pub(super) fn update_in(
         &mut self,
         ws: &mut Workspace,
-        nav: &NavMesh,
+        meshes: MeshSource<'_>,
         max_iters: usize,
         filters: &[DefaultFilter; 16],
     ) -> Result<(), Error> {
         ws.work(max_iters as u64)?;
         let state = self.query.take().ok_or(Error::Failed)?;
-        let mut query = state.attach(nav);
+        let mut query = state.attach(meshes.default);
         let mut iters = max_iters;
         for _ in 0..8 {
             let q = &mut self.requests[self.head % 8];
@@ -195,6 +260,7 @@ impl PathQueue {
                 self.head = self.head.wrapping_add(1);
                 continue;
             }
+            query.nav = meshes.mesh(q.profile)?;
             let f = &filters[q.filter];
             if q.status == 0 {
                 q.status = query

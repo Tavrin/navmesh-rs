@@ -4,8 +4,9 @@
 //!
 //! [`CrowdWorld`] runs the same per-agent phase arithmetic as [`Crowd`] in the same
 //! phase order. Every agent simulated in full gets the result [`Crowd`] gives with
-//! [`UpstreamFixes::NEAREST_NEIGHBOURS`] for the same inputs, bit for bit, as long as
-//! agents are added in the same order (both take the lowest free index).
+//! [`UpstreamFixes::NEAREST_NEIGHBOURS`] for the same inputs on an unchanged
+//! navmesh, bit for bit, when agents are added in the same order (both take
+//! the lowest free index).
 //!
 //! Hot per-agent fields (position, velocities, dimensions, generation) live in
 //! arrays indexed by agent index; corridor, walls, corners and neighbours live in a
@@ -14,15 +15,15 @@
 //! arrays, which a phase never writes; each agent writes only its own pool entry,
 //! and the arrays are refreshed between phases. With the `parallel` feature these
 //! phases run on the current rayon pool, and the result does not depend on the
-//! number of threads. Path checks, path requests, the path queue and the one
-//! topology optimisation per step stay serial, in agent-index order.
+//! number of threads. Stamp revalidation, path requests, the path queue and the
+//! one topology optimisation per step stay serial.
 //!
 //! Each [`CrowdWorld::step`] charges its work to a [`Budget`] before simulating, by
 //! active agent rather than by capacity: [`STEP_WORK_PER_AGENT`] units per simulated
 //! agent plus the path queue's node expansions. A step is never partly applied
 //! because of the budget.
 use super::*;
-use alloc::collections::BinaryHeap;
+use alloc::collections::{BTreeMap, BinaryHeap};
 use core::cmp::Reverse;
 
 mod grid;
@@ -167,6 +168,8 @@ pub struct StepReport {
     pub path_queue_depth: u32,
     /// Velocities sampled by sampled-mode avoidance.
     pub velocity_samples: u64,
+    /// Stamp-triggered replans admitted this step, including failed searches.
+    pub replans: u32,
 }
 
 /// Read access to one agent.
@@ -226,6 +229,7 @@ pub struct CrowdWorld {
     filters: [DefaultFilter; 16],
     presets: [ObstacleAvoidanceParams; 8],
     pathq: PathQueue,
+    mixed: Option<MixedState>,
     // Per agent index.
     generation: Vec<u32>,
     heavy_of: Vec<u32>,
@@ -245,6 +249,16 @@ pub struct CrowdWorld {
     grid: CellGrid,
     active: Vec<usize>,
     link_epoch: u64,
+    replan_epoch: u64,
+    replan_limit: u32,
+    replan_cursor: u32,
+}
+
+struct MixedState {
+    /// Last completed revalidation epoch per profile.
+    epochs: BTreeMap<u32, u64>,
+    /// Profile by global agent index. Free indices are ignored.
+    profiles: Vec<u32>,
 }
 
 impl CrowdWorld {
@@ -271,6 +285,7 @@ impl CrowdWorld {
             filters: core::array::from_fn(|_| DefaultFilter::default()),
             presets: [ObstacleAvoidanceParams::default(); 8],
             pathq,
+            mixed: None,
             generation: Vec::new(),
             heavy_of: Vec::new(),
             pos: Vec::new(),
@@ -287,7 +302,83 @@ impl CrowdWorld {
             grid: CellGrid::new(r * 3.),
             active: Vec::new(),
             link_epoch: nav.runtime_links_changed_at(),
+            replan_epoch: nav.change_epoch(),
+            replan_limit: replan::DEFAULT_LIMIT,
+            replan_cursor: 0,
         })
+    }
+    #[cfg(feature = "recast")]
+    pub(crate) fn new_mixed(
+        meshes: &BTreeMap<u32, &NavMesh>,
+        params: &CrowdWorldParams,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let (_, nav) = meshes
+            .first_key_value()
+            .ok_or(Error::InvalidParameter("empty profile set"))?;
+        let mut world = Self::new(nav, params, limits)?;
+        world.mixed = Some(Self::mixed_state(meshes));
+        Ok(world)
+    }
+
+    fn mixed_state(meshes: &BTreeMap<u32, &NavMesh>) -> MixedState {
+        MixedState {
+            epochs: meshes
+                .iter()
+                .map(|(&id, nav)| (id, nav.change_epoch()))
+                .collect(),
+            profiles: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn add_profile_agent(
+        &mut self,
+        profile: u32,
+        nav: &NavMesh,
+        pos: V3,
+        params: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        let handle = self.add_agent(nav, pos, params)?;
+        self.bind_profile(handle, profile);
+        Ok(handle)
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn add_profile_landing(
+        &mut self,
+        profile: u32,
+        poly: PolyRef,
+        pos: V3,
+        params: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        let handle = self.add_landed_agent(poly, pos, params)?;
+        self.bind_profile(handle, profile);
+        Ok(handle)
+    }
+
+    #[cfg(feature = "recast")]
+    fn bind_profile(&mut self, handle: AgentHandle, profile: u32) {
+        if let Some(mixed) = &mut self.mixed {
+            mixed.profiles[handle.index as usize] = profile;
+        }
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn agent_profile(&self, handle: AgentHandle) -> Option<u32> {
+        self.slot_of(handle)?;
+        self.mixed
+            .as_ref()?
+            .profiles
+            .get(handle.index as usize)
+            .copied()
+    }
+
+    /// Caps stamp-triggered replans per step. Admission resumes in handle-index
+    /// order after the last admitted agent when this cap is filled.
+    /// The default limit is 1,024.
+    pub fn set_replan_limit(&mut self, limit: u32) {
+        self.replan_limit = limit;
     }
     /// The configuration the world was created with.
     pub fn params(&self) -> &CrowdWorldParams {
@@ -377,6 +468,28 @@ impl CrowdWorld {
         let mut ws = Workspace::with_limits(self.limits);
         finite(pos)?;
         p.validate(self.params.max_radius)?;
+        let slots = self.placement_slots()?;
+        ws.charge_bytes::<u8>(512 * 128 + 16384)?;
+        let q = NavMeshQuery::new(nav, 512)?;
+        let (r, nearest, _) = q
+            .find_nearest_poly(&pos, &self.extents, &self.filters[p.query_filter_type])
+            .unwrap_or((0, pos, false));
+        let nearest = if r == 0 { pos } else { nearest };
+        self.insert_placed(&mut ws, slots, r, nearest, p)
+    }
+
+    pub(super) fn add_landed_agent(
+        &mut self,
+        r: PolyRef,
+        pos: V3,
+        p: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        p.validate(self.params.max_radius)?;
+        let mut ws = Workspace::with_limits(self.limits);
+        self.insert_placed(&mut ws, self.placement_slots()?, r, pos, p)
+    }
+
+    fn placement_slots(&self) -> Result<(u32, u32), Error> {
         let index = match self.free.peek() {
             Some(&Reverse(i)) => i,
             None if self.count < self.params.max_agents => self.generation.len() as u32,
@@ -389,18 +502,24 @@ impl CrowdWorld {
             }
             None => return Err(Error::BufferTooSmall),
         };
-        ws.charge_bytes::<u8>(512 * 128 + 16384)?;
-        let q = NavMeshQuery::new(nav, 512)?;
-        let (r, nearest, _) = q
-            .find_nearest_poly(&pos, &self.extents, &self.filters[p.query_filter_type])
-            .unwrap_or((0, pos, false));
-        let nearest = if r == 0 { pos } else { nearest };
+        Ok((index, slot))
+    }
+
+    fn insert_placed(
+        &mut self,
+        ws: &mut Workspace,
+        slots: (u32, u32),
+        r: PolyRef,
+        nearest: V3,
+        p: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        let (index, slot) = slots;
         if index as usize == self.generation.len() {
             self.grow_by_one()?;
             self.free.push(Reverse(index));
         }
         if slot as usize == self.heavy.len() {
-            let entry = CrowdAgent::new_in(&mut ws)?;
+            let entry = CrowdAgent::new_in(ws)?;
             self.heavy
                 .try_reserve(1)
                 .map_err(|_| Error::AllocationFailed)?;
@@ -441,6 +560,10 @@ impl CrowdWorld {
         reserve(&mut self.radius)?;
         reserve(&mut self.height)?;
         reserve(&mut self.max_speed)?;
+        if let Some(mixed) = &mut self.mixed {
+            reserve(&mut mixed.profiles)?;
+            mixed.profiles.push(0);
+        }
         self.generation.push(0);
         self.heavy_of.push(NONE);
         self.pos.push([0.; 3]);
@@ -586,6 +709,11 @@ impl CrowdWorld {
             let a = v.agent;
             put(&v.handle.index.to_le_bytes());
             put(&v.handle.generation.to_le_bytes());
+            if let Some(mixed) = &self.mixed
+                && mixed.epochs.len() > 1
+            {
+                put(&mixed.profiles[v.handle.index as usize].to_le_bytes());
+            }
             put(&[a.state as u8, a.target_state as u8]);
             if a.params.arrival_policy != ArrivalPolicy::Keep
                 || a.params.arrival_distance != 0.5

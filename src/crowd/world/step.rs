@@ -2,6 +2,7 @@
 //! data-parallel with the `parallel` feature.
 use super::*;
 use crate::crowd::phases::{self, AgentSlots, AgentsView, AvoidScratch};
+use crate::crowd::queue::MeshSource;
 
 /// The arrays other agents' phases read; no phase writes them.
 struct View<'a> {
@@ -59,10 +60,14 @@ impl AgentsView for View<'_> {
 struct Slots<'a> {
     heavy: &'a mut [CrowdAgent],
     heavy_of: &'a [u32],
+    profiles: Option<&'a [u32]>,
 }
 impl AgentSlots for Slots<'_> {
     fn count(&self) -> usize {
         self.heavy_of.len()
+    }
+    fn profile(&self, i: usize) -> u32 {
+        self.profiles.map_or(0, |profiles| profiles[i])
     }
     fn slot(&self, i: usize) -> Option<&CrowdAgent> {
         match self.heavy_of.get(i) {
@@ -105,6 +110,7 @@ struct Ctx<'n> {
     nav: &'n NavMesh,
     limits: Limits,
     fixes: UpstreamFixes,
+    dock_circle_capacity: usize,
 }
 impl<'n> Ctx<'n> {
     fn worker(&self) -> Result<Worker<'n>, Error> {
@@ -115,7 +121,7 @@ impl<'n> Ctx<'n> {
             max_bytes: usize::MAX,
             ..self.limits
         });
-        let mut avoid = ObstacleAvoidanceQuery::new_in(&mut ws, 6, 8)?;
+        let mut avoid = ObstacleAvoidanceQuery::new_in(&mut ws, 6 + self.dock_circle_capacity, 8)?;
         avoid.set_fixes(self.fixes);
         Ok(Worker {
             ws,
@@ -205,6 +211,52 @@ impl CrowdWorld {
         nav: &NavMesh,
         budget: &mut Budget,
     ) -> Result<Budgeted<StepReport>, Error> {
+        self.step_with_docks(nav, budget, &BTreeMap::new(), &BTreeMap::new())
+    }
+
+    pub(in crate::crowd) fn step_with_docks(
+        &mut self,
+        nav: &NavMesh,
+        budget: &mut Budget,
+        local_targets: &BTreeMap<usize, platforms::LocalTarget>,
+        dock_obstacles: &BTreeMap<usize, Vec<OrcaAgent>>,
+    ) -> Result<Budgeted<StepReport>, Error> {
+        self.step_on_meshes(
+            MeshSource::single(nav),
+            budget,
+            local_targets,
+            dock_obstacles,
+        )
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn step_mixed(
+        &mut self,
+        profiles: &BTreeMap<u32, &NavMesh>,
+        budget: &mut Budget,
+        targets: &BTreeMap<usize, platforms::LocalTarget>,
+        obstacles: &BTreeMap<usize, Vec<OrcaAgent>>,
+    ) -> Result<Budgeted<StepReport>, Error> {
+        let (_, &default) = profiles.first_key_value().ok_or(Error::InvalidRef)?;
+        self.step_on_meshes(
+            MeshSource {
+                default,
+                profiles: Some(profiles),
+            },
+            budget,
+            targets,
+            obstacles,
+        )
+    }
+
+    fn step_on_meshes(
+        &mut self,
+        meshes: MeshSource<'_>,
+        budget: &mut Budget,
+        local_targets: &BTreeMap<usize, platforms::LocalTarget>,
+        dock_obstacles: &BTreeMap<usize, Vec<OrcaAgent>>,
+    ) -> Result<Budgeted<StepReport>, Error> {
+        let nav = meshes.default;
         let dt = self.params.fixed_dt;
         self.active.clear();
         self.active
@@ -238,6 +290,7 @@ impl CrowdWorld {
             nav,
             limits: self.limits,
             fixes: self.fixes,
+            dock_circle_capacity: dock_obstacles.values().map(Vec::len).max().unwrap_or(0),
         };
         let Self {
             params,
@@ -245,6 +298,7 @@ impl CrowdWorld {
             filters,
             presets,
             pathq,
+            mixed,
             heavy_of,
             pos,
             vel,
@@ -257,11 +311,63 @@ impl CrowdWorld {
             grid,
             active,
             link_epoch,
+            replan_epoch,
+            replan_limit,
+            replan_cursor,
             ..
         } = self;
         let (filters, presets) = (&*filters, &*presets);
         let (owner, heavy_of) = (&owner[..], &heavy_of[..]);
 
+        // Resume budgeted revalidation in agent-index order.
+        let mut q = NavMeshQuery::new(nav, 512)?;
+        let mut remaining = *replan_limit;
+        let (profiles, epochs) = match mixed.as_mut() {
+            Some(mixed) => (Some(mixed.profiles.as_slice()), Some(&mut mixed.epochs)),
+            None => (None, None),
+        };
+        let profile = |i: usize| profiles.map_or(0, |profiles| profiles[i]);
+        if let Some(epochs) = epochs.as_ref() {
+            for (&id, &since) in &**epochs {
+                let mesh = meshes.mesh(id)?;
+                if mesh.change_epoch() != since {
+                    pathq.revalidate_search(id, mesh, since);
+                }
+            }
+        } else if nav.change_epoch() != *replan_epoch {
+            pathq.revalidate_search(0, nav, *replan_epoch);
+        }
+        for &i in replan::order(active, *replan_cursor) {
+            let id = profile(i);
+            q.nav = meshes.mesh(id)?;
+            let since = if let Some(epochs) = epochs.as_ref() {
+                *epochs.get(&id).ok_or(Error::InvalidRef)?
+            } else {
+                *replan_epoch
+            };
+            let a = &mut heavy[heavy_of[i] as usize];
+            let before = remaining;
+            if replan::revalidate(a, &mut q, pathq, filters, extents, since, &mut remaining)? {
+                vel[i] = a.vel;
+                dvel[i] = a.dvel;
+            } else {
+                phases::check_path(a, &q, filters, extents, dt, false)?;
+            }
+            if before != remaining && remaining == 0 {
+                *replan_cursor = i as u32 + 1;
+            }
+        }
+        report.replans = *replan_limit - remaining;
+        if remaining != 0 {
+            *replan_cursor = 0;
+        }
+        if let Some(epochs) = epochs {
+            for (&id, since) in epochs {
+                *since = meshes.mesh(id)?.change_epoch();
+            }
+        }
+        *replan_epoch = nav.change_epoch();
+        *link_epoch = nav.runtime_links_changed_at();
         let any_parked = heavy.iter().any(CrowdAgent::parked);
         let mut parked = ws.vec(if any_parked { pos.len() } else { 0 }, false)?;
         for (a, &i) in heavy.iter().zip(owner.iter()) {
@@ -269,35 +375,21 @@ impl CrowdWorld {
                 parked[i as usize] = a.parked();
             }
         }
-        // Serial phases, in agent-index order.
-        let mut q = NavMeshQuery::new(nav, 512)?;
-        let epoch = nav.runtime_links_changed_at();
-        let links_changed = epoch != *link_epoch;
-        for &i in active.iter() {
-            phases::check_path(
-                &mut heavy[heavy_of[i] as usize],
-                &q,
-                filters,
-                extents,
-                dt,
-                links_changed,
-            )?;
-        }
-        *link_epoch = epoch;
         let mut slots = Slots {
             heavy: &mut heavy[..],
             heavy_of,
+            profiles,
         };
         phases::move_requests(
             &mut slots,
             pathq,
             filters,
             &mut ws,
-            nav,
+            meshes,
             &mut q,
             params.path_queue.iterations,
         )?;
-        phases::optimize_topology(&mut slots, active, &mut q, filters, dt);
+        phases::optimize_topology(&mut slots, active, &mut q, filters, dt, meshes)?;
         let mut tally = Tally {
             work: ws.usage().work,
             samples: 0,
@@ -310,7 +402,8 @@ impl CrowdWorld {
         let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
         let grid = &*grid;
         tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
-            if a.state == AgentState::Walking {
+            w.q.nav = meshes.mesh(profile(i))?;
+            if a.walking() {
                 phases::update_boundary(a, &mut w.q, &filters[a.params.query_filter_type])?;
                 let range = a.params.collision_query_range;
                 let cap = phases::prepare_neighbours(&mut w.ws, a, n)?;
@@ -329,7 +422,14 @@ impl CrowdWorld {
                     Ok(())
                 })?;
             }
-            phases::find_corners(a, &mut w.q, filters)?;
+            phases::find_corners(
+                a,
+                &mut w.q,
+                filters,
+                local_targets
+                    .get(&i)
+                    .and_then(platforms::LocalTarget::precise_point),
+            )?;
             phases::trigger_offmesh(a, &w.q);
             Ok(0)
         })?);
@@ -348,11 +448,15 @@ impl CrowdWorld {
         // from the arrays, so integrating each agent right after it is the same as
         // integrating after all of them.
         let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
-        tally = tally.add(ctx.run(heavy, owner, |w, _, a| {
+        tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
             let mut s = AvoidScratch {
                 query: &mut w.avoid,
                 orca: &mut w.orca,
                 orca_neighbours: &mut w.orca_neighbours,
+                dock_opening: local_targets
+                    .get(&i)
+                    .and_then(platforms::LocalTarget::opening),
+                dock_obstacles: dock_obstacles.get(&i).map_or(&[], Vec::as_slice),
             };
             let mut samples = 0;
             if let Some((v, k)) = phases::avoid(&mut w.ws, a, &view, dt, presets, &mut s)? {
@@ -383,7 +487,8 @@ impl CrowdWorld {
                 }
             }
         }
-        tally = tally.add(ctx.run(heavy, owner, |w, _, a| {
+        tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
+            w.q.nav = meshes.mesh(profile(i))?;
             phases::apply_displacement(a);
             phases::move_on_mesh(a, &mut w.q, filters)?;
             phases::animate(a, dt);
@@ -401,7 +506,9 @@ impl CrowdWorld {
         for k in 0..self.active.len() {
             let i = self.active[k];
             let s = self.heavy_of[i] as usize;
-            if arrival::finish_arrival(&mut self.heavy[s]) {
+            if !matches!(local_targets.get(&i), Some(platforms::LocalTarget::Dock(_)))
+                && arrival::finish_arrival(&mut self.heavy[s])
+            {
                 if let Some(h) = self.handle_at(i as u32) {
                     self.remove_agent(h)?;
                 }
