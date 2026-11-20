@@ -28,6 +28,10 @@ All notable changes to this project are documented in this file. The format foll
   in the versioned `DNDY` format. See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
 - Managed links require both landings to pass the query filter, so closing a
   gate on either landing blocks paths through the link.
+- Tile change stamps cover residency, replacement, modifier edits and runtime
+  link changes. CrowdWorld replans affected corridors in the next step, with
+  an optional per-step cap. Crowd can opt in with `set_stamp_revalidation`.
+  See [crowd replanning](docs/CROWD-REPLANNING.md).
 
 - `crowd::world::CrowdWorld` (feature `crowd-world`): a crowd store for up to 2^24
   agents with generational `AgentHandle`s, hot per-agent arrays plus a side pool for
@@ -36,8 +40,8 @@ All notable changes to this project are documented in this file. The format foll
   data-parallel on the current rayon pool with the `parallel` feature; digests are
   identical for any thread count. `step` charges `STEP_WORK_PER_AGENT` per active agent
   plus the path queue's node expansions to a `Budget` before simulating and refuses
-  the step, untouched, when it does not fit. Agents match `Crowd` with
-  `UpstreamFixes::NEAREST_NEIGHBOURS` bit for bit. `'DCRW'` snapshots
+  the step, untouched, when it does not fit. With an unchanged navmesh, agents
+  match `Crowd` with `UpstreamFixes::NEAREST_NEIGHBOURS` bit for bit. `'DCRW'` snapshots
   (`to_bytes`/`from_bytes`) restore a world that steps identically on the same navmesh, including
   in-progress sliced searches; malformed bytes give
   `Error::InvalidSnapshot`.

@@ -258,6 +258,7 @@ impl NavMesh {
             .runtime_links
             .entries
             .get(&id)
+            .copied()
             .ok_or(Error::InvalidParameter("unknown runtime link id"))?;
         self.rebuild_link_column(
             entry.key,
@@ -271,6 +272,7 @@ impl NavMesh {
                 .iter(),
         )?;
         self.runtime_links.entries.remove(&id);
+        self.stamp_link_landings(entry.report);
         self.runtime_links.changed_at = self.epoch();
         self.refresh_runtime_links();
         Ok(())
@@ -510,7 +512,10 @@ impl NavMesh {
             let Some(e) = self.runtime_links.entries.get_mut(&id) else {
                 continue;
             };
-            changed |= e.report != report && (e.report.is_traversable() || report.is_traversable());
+            let old = e.report;
+            let connection_changed =
+                old != report && (old.is_traversable() || report.is_traversable());
+            changed |= connection_changed;
             e.report = report;
             let e = *e;
             let key = e.key;
@@ -534,6 +539,11 @@ impl NavMesh {
                 next
             });
             let owner = self.base_ref(ti) | ip as PolyRef;
+            if old != report {
+                self.stamp_tile_change(ti);
+                self.stamp_link_landings(old);
+                self.stamp_link_landings(report);
+            }
             #[cfg(feature = "dynamic")]
             let modified = self.modifiers.governs(ti, ip).then(|| {
                 self.modifiers
@@ -566,6 +576,16 @@ impl NavMesh {
         }
         if changed {
             self.runtime_links.changed_at = self.epoch();
+        }
+    }
+
+    fn stamp_link_landings(&mut self, report: LinkReport) {
+        for landing in [report.start, report.end] {
+            if let Landing::Connected(poly) = landing
+                && self.is_valid_poly_ref(poly)
+            {
+                self.stamp_tile_change(self.decode_poly_id_tile(poly) as usize);
+            }
         }
     }
 

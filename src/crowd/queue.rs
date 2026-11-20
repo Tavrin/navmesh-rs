@@ -121,6 +121,30 @@ impl PathQueue {
     pub fn pending(&self) -> usize {
         self.requests.iter().filter(|r| r.handle != 0).count()
     }
+    pub(super) fn cancel(&mut self, handle: u32) {
+        if handle != 0
+            && let Some(r) = self.requests.iter_mut().find(|r| r.handle == handle)
+        {
+            r.handle = 0;
+            r.status = 0;
+        }
+    }
+
+    // Only the current slot can have a sliced search in progress.
+    pub(super) fn revalidate_search(&mut self, nav: &NavMesh, since: u64) {
+        let r = &mut self.requests[self.head % 8];
+        if r.status & Status::IN_PROGRESS != 0
+            && (nav.corridor_tile_changed(r.end, since)
+                || self.query.as_ref().is_some_and(|q| {
+                    q.node_pool
+                        .used()
+                        .iter()
+                        .any(|node| nav.corridor_tile_changed(node.id, since))
+                }))
+        {
+            r.status = 0;
+        }
+    }
     /// Upstream status bits of a request; an unknown handle reports failure.
     pub fn status(&self, handle: u32) -> u32 {
         if handle == 0 {
