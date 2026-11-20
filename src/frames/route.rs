@@ -136,6 +136,7 @@ impl FrameSet {
         FrameRouting::native(self).dock_landing(id, from, poly, filter)
     }
 
+    #[cfg(feature = "crowd")]
     pub(crate) fn dock_open(
         &self,
         id: LinkId,
@@ -145,6 +146,7 @@ impl FrameSet {
         FrameRouting::native(self).dock_open(id, a, b)
     }
 
+    #[cfg(feature = "crowd")]
     pub(crate) fn cross_dock(
         &self,
         id: LinkId,
