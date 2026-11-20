@@ -1912,7 +1912,7 @@ pub(crate) fn closest_point_on_boundary(tile: &MeshTile, poly: &Poly, pos: &[f32
 
 // A detached query retains sliced-search state while the caller mutates tiles
 // between crowd updates. Attaching borrows the navmesh only for that update.
-#[cfg(feature = "crowd")]
+#[cfg(any(feature = "crowd", feature = "route"))]
 pub(crate) struct DetachedQuery {
     pub(crate) node_pool: NodePool,
     tiny_node_pool: NodePool,
@@ -1920,11 +1920,12 @@ pub(crate) struct DetachedQuery {
     pub(crate) query: QueryData,
     fixes: UpstreamFixes,
 }
-#[cfg(feature = "crowd")]
+#[cfg(any(feature = "crowd", feature = "route"))]
 impl DetachedQuery {
     pub(crate) fn new(nav: &NavMesh, max_nodes: usize) -> Result<Self, Error> {
         Ok(NavMeshQuery::new(nav, max_nodes)?.detach())
     }
+    #[cfg(feature = "crowd")]
     pub(crate) fn set_fixes(&mut self, fixes: UpstreamFixes) {
         self.fixes = fixes;
     }
@@ -1939,7 +1940,7 @@ impl DetachedQuery {
         }
     }
 }
-#[cfg(feature = "crowd")]
+#[cfg(any(feature = "crowd", feature = "route"))]
 impl NavMeshQuery<'_> {
     pub(crate) fn detach(self) -> DetachedQuery {
         DetachedQuery {

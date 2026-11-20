@@ -201,3 +201,5 @@ pub mod connectivity;
 
 #[cfg(feature = "detour")]
 pub mod frames;
+#[cfg(feature = "route")]
+pub mod route;

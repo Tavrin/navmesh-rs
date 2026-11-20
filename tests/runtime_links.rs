@@ -137,7 +137,41 @@ fn closing_a_gate_on_a_runtime_landing_keeps_the_link_out_of_paths() {
     assert_eq!(nav.runtime_link_id(open[1]), Some(ID));
     assert_eq!(open[2], b);
 
+    #[cfg(feature = "route")]
+    let graph = navmesh_rs::route::SectorGraph::from_mesh(
+        &nav,
+        &navmesh_rs::route::SectorParams::new(1, 1),
+        &DefaultFilter::default(),
+        nav.limits(),
+    )
+    .unwrap();
+    #[cfg(feature = "route")]
+    let atlas = navmesh_rs::route::RouteAtlas::new(&graph, &nav, DefaultFilter::default()).unwrap();
+    #[cfg(feature = "route")]
+    let mut navigator = navmesh_rs::route::Navigator::new(&atlas, 64).unwrap();
+    #[cfg(feature = "route")]
+    let request = {
+        use navmesh_rs::route::WindowPoint;
+        let id = navigator
+            .request(
+                &nav,
+                WindowPoint::new(a, points[0]),
+                WindowPoint::new(b, points[1]),
+            )
+            .unwrap();
+        navigator
+            .update(&nav, &mut navmesh_rs::Budget::new(1), 1)
+            .unwrap();
+        id
+    };
     nav.set_modifier_enabled(gate, true).unwrap();
+    #[cfg(feature = "route")]
+    assert_eq!(navigator.sync(&nav), Err(Error::MeshChanged));
+    #[cfg(feature = "route")]
+    assert_eq!(
+        navigator.state(request),
+        Some(navmesh_rs::route::RouteState::Failed(Error::MeshChanged))
+    );
     assert_eq!(path(&nav, [a, b], points), [a]);
     assert!(nav.runtime_link_report(ID).unwrap().enabled);
     nav.set_modifier_enabled(gate, false).unwrap();
@@ -517,4 +551,64 @@ fn a_thousand_links_connect_and_remove_without_ground_salt_advances() {
         assert_eq!(p.first_link, NULL_LINK);
     }
     assert_eq!(nav.runtime_link_reports().count(), 0);
+}
+
+#[cfg(feature = "route")]
+#[test]
+fn stitched_super_records_follow_a_distant_one_way_landing_and_reject_edits() {
+    use navmesh_rs::Budget;
+    use navmesh_rs::route::{
+        Navigator, RouteAtlas, RouteIndex, RouteState, SectorGraph, SectorKey, SectorParams,
+        SuperKey, WindowPoint, profile_hash,
+    };
+    let (mut nav, a, b) = scene(1, 1);
+    nav.add_runtime_link(spec(), true).unwrap();
+    let filter = DefaultFilter::default();
+    let profile = profile_hash(&filter);
+    let params = SectorParams::new(1, 1);
+    let graph = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let k = SuperKey { x: 0, z: 0 };
+    let far = SuperKey { x: 3, z: 0 };
+    let graph_edges = |g: &SectorGraph| {
+        let start = g
+            .super_region(profile, SectorKey { x: 0, z: 0 }, 0)
+            .unwrap();
+        assert!(g.super_edges(profile, k, start).iter().any(|e| e.to == far));
+        assert!(g.super_edges(profile, far, 0).is_empty());
+    };
+    graph_edges(&graph);
+    let mut saved = SectorGraph::new(&params, nav.limits()).unwrap();
+    saved
+        .insert_super(&graph.super_record(profile, k).unwrap().to_bytes())
+        .unwrap();
+    assert!(RouteIndex::build_exact(&saved, profile).is_err());
+    saved
+        .insert_super(&graph.super_record(profile, far).unwrap().to_bytes())
+        .unwrap();
+    RouteIndex::build_exact(&saved, profile).unwrap();
+    graph_edges(&saved);
+    let mut sectors = SectorGraph::new(&params, nav.limits()).unwrap();
+    for x in [3, 0] {
+        sectors
+            .insert_sector(
+                &graph
+                    .sector(profile, SectorKey { x, z: 0 })
+                    .unwrap()
+                    .to_bytes(),
+            )
+            .unwrap();
+    }
+    RouteIndex::build_exact(&sectors, profile).unwrap();
+    graph_edges(&sectors);
+    let atlas = RouteAtlas::new(&graph, &nav, filter).unwrap();
+    let mut navigator = Navigator::new(&atlas, 64).unwrap();
+    let start = WindowPoint::new(a, START);
+    let end = WindowPoint::new(b, END);
+    let id = navigator.request(&nav, end, start).unwrap();
+    navigator
+        .update(&nav, &mut Budget::unlimited(), 128)
+        .unwrap();
+    assert_eq!(navigator.state(id), Some(RouteState::Disconnected));
+    nav.set_runtime_link_enabled(ID, false).unwrap();
+    assert_eq!(navigator.sync(&nav), Err(Error::MeshChanged));
 }

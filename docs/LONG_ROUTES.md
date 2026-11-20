@@ -55,3 +55,56 @@ Reuse matching saved timing cohorts when only these correctness metrics change.
 Sector compression, streaming, hierarchy memory and edit fan-out require a sector
 planner and are outside this flat baseline. Existing corpus parity and determinism
 checks remain independent compatibility gates.
+
+## Directed routes
+
+Enable the optional `route` feature and build a `SectorGraph::from_mesh` after
+installing the complete world, applying modifiers and linking its connections.
+The builder contracts reciprocal polygon links into sector regions and records
+the remaining directed arcs. It resolves both ends of every crossing against
+the installed polygon links, including runtime links and distant landings.
+
+Sector and super-sector records use version 2. Regenerate both from the source
+tiles when upgrading. A sector record includes sorted directed arcs, run-length
+polygon membership and, when stitched, outgoing region addresses. A stitched
+super-sector records directed local arcs and exits addressed by destination
+sector and region. `RouteIndex::build_exact` requires stitched records with
+resolved destinations. Individually collected tile batches produce isolated
+sector summaries whose portal overlap and off-mesh landing estimates can guide
+queries. Bind them against a complete installed world before certifying a route.
+
+Prepare a `RouteAtlas` with the same mesh and filter, then create a `Navigator`.
+Submit two `WindowPoint` endpoints with `request`. Call `update` repeatedly
+with one shared frame budget and the maximum units per scheduler turn. An
+unanswered request gets priority over a continuation. The directed region
+search checks reachability. A short live search in the reciprocal start region
+can publish a prefix toward a coarse crossing. Keep calling `update` while
+the agent walks. The prefix and its endpoint stay available until acknowledged,
+and the continuation starts at that endpoint.
+
+Level-two search considers several concrete crossing positions on a wide
+border. Live refinement spans multiple sectors and a one-sector margin. It
+prices each step between incoming and outgoing portal midpoints using the
+current polygon's area cost. If the node limit is reached, the scheduler
+shortens the window and can fall back to single-sector refinement.
+
+On `RouteState::Segment`, `segment` gives the polygon corridor, `corners` gives
+its string-pulled steering points and `toward` gives the endpoint to acknowledge
+with `advance`. The last acknowledgment sets `Complete`. Call `cancel` to release the request.
+
+If a window or its margin needs a missing sector, the navigator reports
+`Waiting` for that sector after the caller acknowledges the available segment.
+It uses the same window after reload. Call `sync` after residency changes. It compares slot identities
+outside the frame budget, restarts active windows and wakes waiting requests.
+A changed tile generation, modifier revision or runtime-link edit returns
+`MeshChanged`. Rebuild the graph and atlas and resubmit from the current
+position. The current navigator retains the level-two payloads while level-one
+tiles stream. Its mesh binding, scheduler handles and live polygon corridors
+are process-local.
+
+Live refinement allocates node and hash-table pages as it examines links. A
+window reuses these pages when the next search starts. A work unit can include
+corridor finalization. The work
+budget alone gives no wall-clock guarantee. The ignored `route_world` harness
+selects the candidate with `NAV_ROUTE_CANDIDATE=1` and the `parallel,route`
+features. Quality replay and pinned timing use the same seeded pair order.

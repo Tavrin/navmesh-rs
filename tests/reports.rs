@@ -710,3 +710,140 @@ fn snapshots_reject_other_meshes_with_matching_epochs_and_refs() {
         Err(Error::MeshChanged)
     );
 }
+
+#[cfg(feature = "route")]
+#[test]
+fn stitched_routes_match_both_directions_of_a_one_way_link() {
+    use navmesh_rs::route::{
+        Navigator, RouteAtlas, RouteState, SectorGraph, SectorParams, WindowPoint,
+    };
+    let mut nav = offmesh_nav();
+    let base = at(&nav, 0);
+    let a = WindowPoint::new(base, [5., 0., 5.]);
+    let b = WindowPoint::new(base | 1, [25., 0., 5.]);
+    let filter = DefaultFilter::default();
+    let graph =
+        SectorGraph::from_mesh(&nav, &SectorParams::new(1, 1), &filter, nav.limits()).unwrap();
+    let atlas = RouteAtlas::new(&graph, &nav, filter).unwrap();
+    let mut scheduler = Navigator::new(&atlas, 64).unwrap();
+    let forward = scheduler.request(&nav, a, b).unwrap();
+    let reverse = scheduler.request(&nav, b, a).unwrap();
+    let mut path = Vec::new();
+    for _ in 0..128 {
+        scheduler.update(&nav, &mut Budget::new(1), 1).unwrap();
+        if let Some(segment) = scheduler.segment(forward) {
+            for &r in segment {
+                if path.last() != Some(&r) {
+                    path.push(r);
+                }
+            }
+            scheduler.advance(forward).unwrap();
+        }
+    }
+    assert_eq!(path, vec![base, base | 2, base | 1]);
+    assert_eq!(scheduler.state(forward), Some(RouteState::Complete));
+    assert_eq!(scheduler.state(reverse), Some(RouteState::Disconnected));
+    nav.set_poly_flags(base, 0).unwrap();
+    assert_eq!(
+        scheduler.update(&nav, &mut Budget::new(1), 1),
+        Err(Error::MeshChanged)
+    );
+}
+
+#[cfg(feature = "route")]
+#[test]
+fn navigator_stops_at_a_streamed_border_and_resumes_the_same_corridor() {
+    use navmesh_rs::route::{
+        Navigator, RouteAtlas, RouteState, SectorGraph, SectorParams, WindowPoint,
+    };
+    let mut nav = mesh(&[0, 1, 2]);
+    let filter = DefaultFilter::default();
+    let graph =
+        SectorGraph::from_mesh(&nav, &SectorParams::new(1, 1), &filter, nav.limits()).unwrap();
+    let atlas = RouteAtlas::new(&graph, &nav, filter).unwrap();
+    let mut scheduler = Navigator::new(&atlas, 64).unwrap();
+    let a = WindowPoint::new(at(&nav, 0), pos(0));
+    let b = WindowPoint::new(at(&nav, 2), pos(2));
+    let id = scheduler.request(&nav, a, b).unwrap();
+    let tile = at(&nav, 1);
+    let parked = nav.unload_tile(tile).unwrap();
+    scheduler.sync(&nav).unwrap();
+    let mut path = Vec::new();
+    let mut waiting = 0;
+    for _ in 0..32 {
+        scheduler.update(&nav, &mut Budget::new(64), 64).unwrap();
+        match scheduler.state(id).unwrap() {
+            RouteState::Segment => {
+                for &r in scheduler.segment(id).unwrap() {
+                    if path.last() != Some(&r) {
+                        path.push(r);
+                    }
+                }
+                scheduler.advance(id).unwrap();
+            }
+            RouteState::Waiting(k) => {
+                assert_eq!(path, &[a.polygon]);
+                assert_eq!(k.x, 1);
+                assert_eq!(nav.add_tile(parked.bytes.clone()).unwrap(), tile);
+                scheduler.sync(&nav).unwrap();
+                waiting += 1;
+            }
+            RouteState::Complete => break,
+            RouteState::Planning => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(waiting, 1);
+    assert_eq!(path, vec![a.polygon, tile, b.polygon]);
+    assert_eq!(scheduler.state(id), Some(RouteState::Complete));
+}
+
+#[cfg(feature = "route")]
+#[test]
+fn navigator_publishes_an_early_prefix_then_pulls_across_borders() {
+    use navmesh_rs::route::{
+        Navigator, RouteAtlas, RouteState, SectorGraph, SectorParams, WindowPoint,
+    };
+    let nav = mesh(&(0..64).collect::<Vec<_>>());
+    let filter = DefaultFilter::default();
+    let graph =
+        SectorGraph::from_mesh(&nav, &SectorParams::new(1, 64), &filter, nav.limits()).unwrap();
+    let atlas = RouteAtlas::new(&graph, &nav, filter).unwrap();
+    let mut scheduler = Navigator::new(&atlas, 512).unwrap();
+    let start = WindowPoint::new(at(&nav, 0), pos(0));
+    let goal = WindowPoint::new(at(&nav, 63), pos(63));
+    let id = scheduler.request(&nav, start, goal).unwrap();
+    scheduler.update(&nav, &mut Budget::new(16), 16).unwrap();
+    assert_eq!(scheduler.state(id), Some(RouteState::Segment));
+    let at_prefix = scheduler.toward(id).unwrap();
+    assert!(at_prefix.position[0] > start.position[0] && at_prefix.position[0] < goal.position[0]);
+    // Leave the prefix outstanding until its successor is ready.
+    let mut budget = Budget::new(10000);
+    while scheduler.update(&nav, &mut budget, 16).unwrap() {}
+    assert_eq!(scheduler.toward(id).unwrap().position, at_prefix.position);
+    scheduler.advance(id).unwrap();
+    assert_eq!(scheduler.state(id), Some(RouteState::Segment));
+    let mut multi_sector_windows = 0;
+    let mut last = at_prefix;
+    for _ in 0..10000 {
+        scheduler.update(&nav, &mut Budget::new(1), 1).unwrap();
+        match scheduler.state(id).unwrap() {
+            RouteState::Segment => {
+                let segment = scheduler.segment(id).unwrap();
+                assert_eq!(segment.first(), Some(&last.polygon));
+                let corners = scheduler.corners(id).unwrap();
+                assert_eq!(corners.first().unwrap().pos, last.position);
+                assert!(corners.len() <= 2);
+                multi_sector_windows += usize::from(segment.len() > 2);
+                last = scheduler.toward(id).unwrap();
+                scheduler.advance(id).unwrap();
+            }
+            RouteState::Complete => break,
+            RouteState::Planning => {}
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(last.polygon, goal.polygon);
+    assert_eq!(scheduler.state(id), Some(RouteState::Complete));
+    assert!(multi_sector_windows >= 2);
+}
