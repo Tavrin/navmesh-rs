@@ -69,8 +69,10 @@ persisted, `NavMesh::residency()`. Restore residency first, call
 `restore_runtime_links()`, then recommit any remaining ground tiles. Restore
 the crowd snapshot after the mesh. A residency reservation for a generated
 tile must match the rebuilt tile's content hash. Crowd snapshots with external
-traversal state use `DCRW` version 3 and restore pending arrivals along with
-goal arrival policies. Readers also accept legacy version 2 snapshots.
+traversal state use `DCRW` version 4 or later and restore pending arrivals along
+with goal arrival policies; restore checks a pending arrival against the live
+connection (polygon, link id, end points and radius). Readers also accept the
+legacy version 2 and 3 snapshots.
 
 `DNLK` version 1 is a little-endian record. The 20-byte header contains the four
 magic bytes, a `u32` version, an `i32` layer (`-1` for no layer) and a `u64`

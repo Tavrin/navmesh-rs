@@ -254,8 +254,8 @@ fn snapshot_restores_a_world_that_steps_identically() {
     assert_eq!(err(&long), snap(SnapshotError::TrailingBytes));
 }
 
-#[test]
-fn snapshot_preserves_in_progress_path_search() {
+/// A 100-polygon corridor: a search across it needs many slices.
+fn corridor() -> NavMesh {
     let count = 100usize;
     let mut verts = Vec::new();
     for x in 0..=count {
@@ -294,7 +294,12 @@ fn snapshot_preserves_in_progress_path_search() {
         ..Default::default()
     })
     .unwrap();
-    let nav = NavMesh::new_single(data).unwrap().0;
+    NavMesh::new_single(data).unwrap().0
+}
+
+#[test]
+fn snapshot_preserves_in_progress_path_search() {
+    let nav = corridor();
     let mut p = CrowdWorldParams::default();
     p.path_queue.iterations = 1;
     let mut w = CrowdWorld::new(&nav, &p, Limits::UNLIMITED).unwrap();
@@ -326,6 +331,30 @@ fn snapshot_preserves_in_progress_path_search() {
 }
 
 #[test]
+fn restored_search_takes_its_epoch_from_the_live_mesh() {
+    let nav = corridor();
+    let mut p = CrowdWorldParams::default();
+    p.path_queue.iterations = 1;
+    let mut w = CrowdWorld::new(&nav, &p, Limits::UNLIMITED).unwrap();
+    let h = w
+        .add_agent(&nav, [0.5, 0., 1.], AgentParams::default())
+        .unwrap();
+    let goal = [99.5, 0., 1.];
+    let poly = nearest(&nav, goal);
+    w.set_goal(&nav, h, Goal::Point { poly, pos: goal })
+        .unwrap();
+    step(&nav, &mut w);
+    assert_eq!(w.path_queue().pending(), 1);
+    // The search epoch is the last field of a snapshot with a running search.
+    let mut bytes = w.to_bytes();
+    let at = bytes.len() - 8;
+    assert_eq!(bytes[at..], nav.epoch().to_le_bytes());
+    bytes[at..].copy_from_slice(&u64::MAX.to_le_bytes());
+    let restored = CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED).unwrap();
+    assert_eq!(restored.to_bytes()[at..], nav.epoch().to_le_bytes());
+}
+
+#[test]
 fn snapshot_rejects_overflowing_queue_retention() {
     let nav = rooms();
     let mut bytes = world(&nav, 1).to_bytes();
@@ -337,6 +366,22 @@ fn snapshot_rejects_overflowing_queue_retention() {
         CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED),
         Err(Error::InvalidSnapshot(_))
     ));
+}
+
+#[test]
+fn snapshot_rejects_a_next_handle_that_names_a_live_request() {
+    let nav = rooms();
+    let mut bytes = world(&nav, 1).to_bytes();
+    // The first request slot follows the head and next-handle words.
+    let start = bytes.len() - 1 - 8 * 54;
+    let next: [u8; 4] = bytes[start - 4..start].try_into().unwrap();
+    bytes[start..start + 4].copy_from_slice(&next);
+    assert_eq!(
+        CrowdWorld::from_bytes(&nav, &bytes, Limits::UNLIMITED).err(),
+        Some(Error::InvalidSnapshot(SnapshotError::InvalidValue(
+            "queue handle"
+        )))
+    );
 }
 
 #[test]

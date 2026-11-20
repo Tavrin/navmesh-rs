@@ -14,7 +14,7 @@ use navmesh_rs::detour::{
     NavMeshQuery, PolyRef, RefLayout, RefState, Replaced, ResidencyRecord, SlotPolicy, Status,
     TileKey, prepare_tile,
 };
-use navmesh_rs::{Budget, Error, Limits, TileStateError, Workspace};
+use navmesh_rs::{Budget, Error, Limits, TileDataError, TileStateError, Workspace};
 
 /// A 10 x 10 quad at tile `(x, y)` whose four sides are portals; `variant`
 /// changes the polygon flags (the content) but not the geometry.
@@ -1477,9 +1477,11 @@ fn persisted_layout_collision_and_legacy_files() {
         )
         .unwrap();
     for cut in 1..12 {
+        // A cut trailer is no trailer: the tile is untagged, which a mesh with an
+        // explicit layout refuses.
         let short = u.bytes[..u.bytes.len() - cut].to_vec();
         assert_eq!(
-            empty().restore_tile(short, r),
+            mesh(RefLayout::WIDE_SALT).restore_tile(short, r),
             Err(Error::RefLayoutMismatch)
         );
     }
@@ -1490,6 +1492,49 @@ fn persisted_layout_collision_and_legacy_files() {
         empty().restore_tile(unknown, r),
         Err(Error::RefLayoutMismatch)
     );
+}
+
+#[test]
+fn tile_trailers_are_ignored_unless_exact_and_hash_as_untagged() {
+    // Explicit ref layouts, and so layout trailers, exist only with 64-bit refs.
+    if PolyRef::BITS != 64 {
+        return;
+    }
+    let p = params(8);
+    let trailer = |version: u32, l: RefLayout| {
+        let mut t = b"NRFL".to_vec();
+        t.extend_from_slice(&version.to_le_bytes());
+        t.extend_from_slice(&[l.salt_bits, l.tile_bits, l.poly_bits, 0]);
+        t
+    };
+    let default = RefLayout::default();
+    let exact = trailer(1, default);
+    let raw = quad(0, 0, 0);
+    // Bytes after the sections that are not an exact trailer were always ignored.
+    for tail in [&b"N"[..], b"NRF", b"NRFL", &exact[..11], b"tail"] {
+        let mut bytes = raw.clone();
+        bytes.extend_from_slice(tail);
+        let mut nav =
+            NavMesh::with_layout(&p, Limits::UNLIMITED, SlotPolicy::Sequential, default).unwrap();
+        assert!(nav.add_tile(bytes).is_ok(), "tail {tail:?}");
+    }
+    let mut unknown = raw.clone();
+    unknown.extend_from_slice(&trailer(2, default));
+    let mut nav =
+        NavMesh::with_layout(&p, Limits::UNLIMITED, SlotPolicy::Sequential, default).unwrap();
+    assert_eq!(
+        nav.add_tile(unknown),
+        Err(Error::InvalidTileData(TileDataError::WrongVersion))
+    );
+    // A trailer naming the default layout changes neither the bytes nor the hash.
+    let mut tagged = raw.clone();
+    tagged.extend_from_slice(&exact);
+    let hash = |bytes| {
+        prepare_tile(&p, Limits::UNLIMITED, bytes)
+            .unwrap()
+            .content_hash()
+    };
+    assert_eq!(hash(tagged), hash(raw));
 }
 
 #[test]
