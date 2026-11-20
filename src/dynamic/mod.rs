@@ -4,6 +4,7 @@
 //! [`crate::detour::NavMesh::set_dynamic_layer`]. The mesh owns the active layer
 //! and applies it on every tile installation path.
 
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use crate::{Error, Limits};
@@ -31,6 +32,19 @@ pub enum Selector {
         /// Require this baked area if present.
         area: Option<u8>,
     },
+    /// Ground polygons with a detail triangle intersecting a convex prism.
+    ///
+    /// Polygons without detail triangles use a fan of their perimeter vertices.
+    DetailPrism {
+        /// Strictly convex XZ outline in either winding, with 3 to 64 vertices.
+        verts_xz: Vec<[f32; 2]>,
+        /// Inclusive lower Y bound.
+        ymin: f32,
+        /// Inclusive upper Y bound.
+        ymax: f32,
+        /// Require this baked area if present.
+        area: Option<u8>,
+    },
     /// Baked off-mesh connections whose user IDs fall in an inclusive range.
     Links {
         /// First user ID.
@@ -38,6 +52,19 @@ pub enum Selector {
         /// Last user ID.
         user_id_max: u32,
     },
+}
+
+impl Selector {
+    pub(crate) fn is_detail(&self) -> bool {
+        matches!(self, Self::DetailPrism { .. })
+    }
+
+    fn prism_vertices(&self) -> Option<&[[f32; 2]]> {
+        match self {
+            Self::Prism { verts_xz, .. } | Self::DetailPrism { verts_xz, .. } => Some(verts_xz),
+            Self::Links { .. } => None,
+        }
+    }
 }
 
 /// An operation applied in ascending [`ModifierId`] order.
@@ -60,7 +87,7 @@ pub struct SelectionReport {
     pub selected_polygons: usize,
     /// Ground polygons whose bounds intersect the prism but whose centroid
     /// falls outside it. Counts only the requested baked area, if specified.
-    /// This count is zero for link selectors.
+    /// Only centroid prisms report this diagnostic.
     pub bounds_without_centroid: usize,
 }
 
@@ -87,7 +114,8 @@ impl ModifierSpec {
     }
 }
 
-/// Serializable modifier specifications and enabled bits for one navigation mesh.
+/// Serializable modifier specifications, enabled bits and polygon base edits
+/// for one navigation mesh.
 ///
 /// Specifications remain registered when their tiles are unloaded. A newly
 /// registered modifier starts disabled. Replacing its specification preserves
@@ -99,6 +127,16 @@ pub struct DynamicLayer {
     limits: Limits,
     entries: Vec<Entry>,
     specs_size: usize,
+    detail_count: usize,
+    bases: BTreeMap<(BaseTileKey, u32), BaseState>,
+}
+
+pub(crate) type BaseTileKey = (i32, i32, i32, [u8; 32]);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct BaseState {
+    pub(crate) flags: Option<u16>,
+    pub(crate) area: Option<u8>,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +154,8 @@ impl DynamicLayer {
             limits,
             entries: Vec::new(),
             specs_size: 0,
+            detail_count: 0,
+            bases: BTreeMap::new(),
         };
         layer.check_size(layer.snapshot_base_len())?;
         Ok(layer)
@@ -131,6 +171,10 @@ impl DynamicLayer {
         self.entries.iter().map(|entry| &entry.spec)
     }
 
+    pub(crate) fn uses_detail(&self) -> bool {
+        self.detail_count != 0
+    }
+
     /// Registers a spec or replaces the spec of an existing ID.
     pub fn upsert(&mut self, spec: ModifierSpec) -> Result<(), Error> {
         self.validate_spec(&spec)?;
@@ -139,11 +183,12 @@ impl DynamicLayer {
         let new_size = (self.specs_size - old_size)
             .checked_add(spec.encoded_len())
             .ok_or(Error::SizeOverflow)?;
-        self.check_size(
-            self.snapshot_base_len()
-                .checked_add(new_size)
-                .ok_or(Error::SizeOverflow)?,
-        )?;
+        let old_detail = at
+            .ok()
+            .is_some_and(|i| self.entries[i].spec.selector.is_detail());
+        let detail_count =
+            self.detail_count - usize::from(old_detail) + usize::from(spec.selector.is_detail());
+        self.check_size(self.snapshot_len(new_size, self.bases.len(), detail_count != 0)?)?;
         match at {
             Ok(i) => self.entries[i].spec = spec,
             Err(i) => {
@@ -160,6 +205,7 @@ impl DynamicLayer {
             }
         }
         self.specs_size = new_size;
+        self.detail_count = detail_count;
         Ok(())
     }
 
@@ -168,7 +214,9 @@ impl DynamicLayer {
         let Ok(i) = self.position(id) else {
             return false;
         };
-        self.specs_size -= self.entries.remove(i).spec.encoded_len();
+        let spec = self.entries.remove(i).spec;
+        self.specs_size -= spec.encoded_len();
+        self.detail_count -= usize::from(spec.selector.is_detail());
         true
     }
 
@@ -185,6 +233,45 @@ impl DynamicLayer {
             .binary_search_by_key(&id, |entry| entry.spec.id)
     }
 
+    pub(crate) fn has_bases_at(&self, (x, y, layer): (i32, i32, i32)) -> bool {
+        self.bases
+            .range(((x, y, layer, [0; 32]), 0)..=((x, y, layer, [255; 32]), u32::MAX))
+            .next()
+            .is_some()
+    }
+
+    pub(crate) fn base_indices(&self, tile: BaseTileKey) -> impl Iterator<Item = usize> + '_ {
+        self.bases
+            .range((tile, 0)..=(tile, u32::MAX))
+            .map(|(&(_, ip), _)| ip as usize)
+    }
+
+    pub(crate) fn base(&self, tile: BaseTileKey, ip: usize) -> BaseState {
+        self.bases
+            .get(&(tile, ip as u32))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn set_base(
+        &mut self,
+        tile: BaseTileKey,
+        ip: usize,
+        base: BaseState,
+    ) -> Result<bool, Error> {
+        let key = (tile, ip as u32);
+        if base == BaseState::default() {
+            return Ok(self.bases.remove(&key).is_some());
+        }
+        let old = self.bases.get(&key).copied();
+        if old.is_none() {
+            let count = self.bases.len().checked_add(1).ok_or(Error::SizeOverflow)?;
+            self.check_size(self.snapshot_len(self.specs_size, count, false)?)?;
+        }
+        self.bases.insert(key, base);
+        Ok(old != Some(base))
+    }
+
     fn check_size(&self, size: usize) -> Result<(), Error> {
         if size > self.limits.max_bytes {
             return Err(Error::LimitExceeded);
@@ -198,6 +285,12 @@ impl DynamicLayer {
         }
         match &spec.selector {
             Selector::Prism {
+                verts_xz,
+                ymin,
+                ymax,
+                area,
+            }
+            | Selector::DetailPrism {
                 verts_xz,
                 ymin,
                 ymax,

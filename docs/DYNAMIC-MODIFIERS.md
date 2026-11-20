@@ -35,27 +35,45 @@ fn open_gate(nav: &mut NavMesh, gate: ModifierId) -> Result<(), Error> {
 }
 ```
 
-A prism uses the inclusive Y range and the vertex centroid of each ground polygon
-in the tile's original coordinates. Either winding is accepted for a strictly
-convex XZ outline of 3 to 64 vertices. Bake the same prism as an area volume so
-the bake splits polygons at the boundary. Match that baked area in the selector,
-and use `modifier_selection` to count selected polygons and diagnose intersecting
-polygon bounds with centroids outside the prism. `Selector::Links` selects baked
-off-mesh links by their authored user ID.
+Use `Selector::Prism` for centroid selection. It tests the vertex centroid of
+each ground polygon in the tile's original coordinates. Bake the same prism as
+an area volume so the bake splits polygons at the boundary. Match that baked
+area in the selector, and use `modifier_selection` to count selected polygons and
+diagnose intersecting polygon bounds with centroids outside the prism.
 
-The mesh recomputes governed polygons from their baked state, applying enabled
-effects in ascending ID order. A disabled spec still governs its selection.
+Use `Selector::DetailPrism` to select a ground polygon if any of its Detour
+detail triangles intersects the authored volume, including contact at a face,
+edge or vertex. Ground polygons without detail triangles use a fan of their
+perimeter vertices. A prism selects only surfaces that intersect its Y range,
+even when another floor shares the same XZ footprint. Both prism selectors
+accept a strictly convex XZ outline of 3 to 64 vertices in either winding,
+inclusive Y bounds and an optional baked area filter. `Selector::Links` selects
+off-mesh connections by their authored user ID.
+
+The mesh applies enabled effects in ascending ID order over caller base values,
+which start at the polygon's baked flags and area. On a selected polygon,
+`NavMesh::set_poly_flags` sets the base mask and `NavMesh::set_poly_area` sets
+the base area. A disabled spec still selects its polygons. Each flag effect sets
+or clears only the bits in its mask. The last enabled effect on a bit wins.
+Use `ClearFlags(u16::MAX)` for a gate that should block every standard filter,
+and avoid a later modifier that sets the gate's bits. The last enabled area
+effect wins. The getters return effective values and `baked_poly_state` reads
+the original tile.
+
 Replacing a spec preserves its enabled bit. Unregistering a spec removes its
-effect and reapplies overlapping effects. Direct flag and area setters return an
-error for governed polygons. Legacy tile-state restores apply to unmanaged
-polygons, and governed polygons retain the current layer's result.
+effect and reapplies overlapping effects over the same base. Replacing or
+clearing the entire layer replaces or discards its base edits as well. Legacy
+tile-state restores apply to unmanaged polygons. Selected polygons and
+polygons with saved base edits use the current layer's result.
 
 The mesh applies its current layer during add, commit, restore and replacement,
 including install jobs and tile-cache rebuilds. Prepared tiles can be built on
 workers using the existing API. The owner thread selects and applies the
-modifier state as it attaches the tile. An unloaded tile needs no per-tile
-modifier state. Derived flags and areas stay out of baked bytes, content hashes
-and ref layout provenance.
+modifier state as it attaches the tile. Base edits are keyed by tile column,
+layer, content hash and polygon index. They survive unload and reload of the
+same content. Different baked bytes start from their own baked state or saved
+edits for that content. Derived flags and areas stay out of baked bytes, content
+hashes and ref layout provenance.
 
 Toggles update the resident selection immediately, with the same refs, salts
 and structural epoch. The budgeted toggle checks a work unit per selected
@@ -72,9 +90,10 @@ change for a resident tile.
 
 If the application already stores authored specs, save one enabled bit per gate
 against those stable IDs. Re-register the specs and apply the bits before loading
-tiles. To save a standalone modifier layer, use `DynamicLayer::to_bytes` and
-`DynamicLayer::from_bytes`. To preserve tile references across restart, also save
-the navmesh residency record and restore it before committing any tiles.
+tiles. To also save caller base edits or to save a standalone modifier layer,
+use `DynamicLayer::to_bytes` and `DynamicLayer::from_bytes`. To preserve tile
+references across restart, also save the navmesh residency record and restore
+it before committing any tiles.
 
 ### DNDY version 1
 
@@ -93,7 +112,23 @@ All multibyte fields are little-endian. The record contains:
 4. A 32-byte SHA-256 footer over all preceding bytes. `DynamicLayer::digest`
    returns that digest.
 
-The reader validates the version, checksum, specification order, geometry, state
-bits and resource bounds. Unknown versions return
+### DNDY version 2
+
+Version 2 retains the header, bitset and spec layout, with version 2 in the
+header and selector tag 2 for a detail prism. Its payload matches tag 0.
+After the specs and before the SHA-256 footer, version 2 adds a `u32` count
+of base edits and that many 52-byte entries. Each entry contains, in order:
+
+- Three `i32` values for tile X, tile Y and layer.
+- The tile's 32-byte content hash and a `u32` polygon index.
+- A `u16` base flag mask, a `u8` base area (255 for baked area), and a
+  `u8` flag-mask presence byte (0 or 1). An absent flag mask is encoded as
+  zero and uses the baked mask.
+
+Entries are strictly ordered by tile X, tile Y, layer, hash bytes and polygon
+index. Each entry supplies at least one base value. The writer emits version 2
+when the layer has a detail selector or a base edit. Otherwise it emits version
+1. The reader validates checksums, ordering, geometry, state fields and resource
+bounds. Unknown versions return
 `Error::InvalidSnapshot(SnapshotError::WrongVersion)`. Tile and crowd snapshots
 keep their existing formats.

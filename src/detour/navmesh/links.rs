@@ -545,7 +545,7 @@ impl NavMesh {
                 self.stamp_link_landings(report);
             }
             #[cfg(feature = "dynamic")]
-            let modified = self.modifiers.governs(ti, ip).then(|| {
+            let modified = self.modifiers.manages_state(ti, ip).then(|| {
                 self.modifiers
                     .effective_state(self.tile_unchecked(ti as u32), ti, ip)
             });

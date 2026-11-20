@@ -6,9 +6,12 @@ use alloc::vec::Vec;
 use super::{MeshTile, NULL_LINK, NavMesh};
 use crate::detour::{PolyRef, QueryFilter, TileRef};
 use crate::dynamic::{
-    DynamicLayer, Effect, ModifierId, ModifierSpec, SelectionReport, Selector, side,
+    BaseState, BaseTileKey, DynamicLayer, Effect, ModifierId, ModifierSpec, SelectionReport,
+    Selector, side,
 };
 use crate::{Budget, Budgeted, Error};
+
+mod detail;
 
 type Location = (i32, i32, i32, usize);
 type Polygons = BTreeMap<usize, Vec<ModifierId>>;
@@ -18,6 +21,7 @@ pub(super) struct Modifiers {
     layer: Option<DynamicLayer>,
     by_modifier: BTreeMap<ModifierId, BTreeMap<Location, Vec<usize>>>,
     by_tile: BTreeMap<usize, Polygons>,
+    base_tiles: BTreeMap<usize, BaseTileKey>,
     epoch: u64,
 }
 
@@ -42,6 +46,13 @@ fn tile_bounds(tile: &MeshTile) -> Bounds {
     let mut bounds = empty_bounds();
     for i in 0..tile.header.vert_count as usize {
         extend(&mut bounds, tile.baked_vertex(i));
+    }
+    bounds
+}
+
+fn with_detail_bounds(tile: &MeshTile, mut bounds: Bounds) -> Bounds {
+    for v in tile.detail_verts.chunks_exact(3) {
+        extend(&mut bounds, [v[0], v[1], v[2]]);
     }
     bounds
 }
@@ -144,6 +155,21 @@ fn selected(tile: &MeshTile, bounds: Bounds, selector: &Selector) -> Vec<usize> 
                 })
                 .collect()
         }
+        Selector::DetailPrism {
+            verts_xz,
+            ymin,
+            ymax,
+            area,
+        } => {
+            let prism = Prism::new(verts_xz, *ymin, *ymax, *area);
+            if !prism.bounds_overlap(bounds) {
+                return Vec::new();
+            }
+            prism
+                .ground_candidates(tile)
+                .filter_map(|(ip, poly)| detail::overlaps(&prism, tile, ip, poly).then_some(ip))
+                .collect()
+        }
         Selector::Links {
             user_id_min,
             user_id_max,
@@ -164,7 +190,17 @@ impl Modifiers {
             return;
         }
         let bounds = tile_bounds(tile);
+        let detail_bounds = if layer.uses_detail() {
+            with_detail_bounds(tile, bounds)
+        } else {
+            bounds
+        };
         for spec in specs {
+            let bounds = if spec.selector.is_detail() {
+                detail_bounds
+            } else {
+                bounds
+            };
             let polys = selected(tile, bounds, &spec.selector);
             if !polys.is_empty() {
                 Self::index(
@@ -197,6 +233,7 @@ impl Modifiers {
     }
 
     pub(super) fn detach_tile(&mut self, tile: &MeshTile, slot: usize) {
+        self.base_tiles.remove(&slot);
         let Some(polys) = self.by_tile.remove(&slot) else {
             return;
         };
@@ -242,8 +279,63 @@ impl Modifiers {
         !self.poly_ids(slot, ip).is_empty()
     }
 
+    fn base(&self, slot: usize, ip: usize) -> BaseState {
+        self.base_tiles
+            .get(&slot)
+            .zip(self.layer.as_ref())
+            .map_or_else(BaseState::default, |(&key, layer)| layer.base(key, ip))
+    }
+
+    pub(super) fn manages_state(&self, slot: usize, ip: usize) -> bool {
+        self.governs(slot, ip) || self.base(slot, ip) != BaseState::default()
+    }
+
+    fn index_bases(&mut self, tile: &MeshTile, slot: usize, hash: Option<[u8; 32]>) {
+        let (x, y, l, _) = location(tile, slot);
+        if let Some(layer) = &self.layer
+            && layer.has_bases_at((x, y, l))
+        {
+            let key = (
+                x,
+                y,
+                l,
+                hash.unwrap_or_else(|| super::stream::content_hash(&tile.data)),
+            );
+            if layer
+                .base_indices(key)
+                .next()
+                .is_some_and(|ip| ip < tile.polys.len())
+            {
+                self.base_tiles.insert(slot, key);
+            }
+        }
+    }
+
+    fn base_indices(&self, slot: usize, polys: usize) -> impl Iterator<Item = usize> + '_ {
+        self.base_tiles
+            .get(&slot)
+            .zip(self.layer.as_ref())
+            .into_iter()
+            .flat_map(|(&key, layer)| layer.base_indices(key))
+            .take_while(move |&ip| ip < polys)
+    }
+
+    fn affected(&self, slot: usize, polys: usize) -> impl Iterator<Item = usize> + '_ {
+        self.by_tile
+            .get(&slot)
+            .into_iter()
+            .flat_map(|selected| selected.keys().copied())
+            .chain(
+                self.base_indices(slot, polys)
+                    .filter(move |&ip| !self.governs(slot, ip)),
+            )
+    }
+
     pub(super) fn effective_state(&self, tile: &MeshTile, slot: usize, ip: usize) -> (u16, u8) {
-        let (mut flags, mut area) = tile.baked_state(ip);
+        let (baked_flags, baked_area) = tile.baked_state(ip);
+        let base = self.base(slot, ip);
+        let mut flags = base.flags.unwrap_or(baked_flags);
+        let mut area = base.area.unwrap_or(baked_area);
         for id in self.poly_ids(slot, ip) {
             if let Some((spec, true)) = self.layer.as_ref().and_then(|layer| layer.get(*id)) {
                 match spec.effect {
@@ -276,19 +368,19 @@ impl Modifiers {
         changed
     }
 
-    pub(super) fn attach_tile(&mut self, tile: &mut MeshTile, slot: usize) -> u64 {
+    pub(super) fn attach_tile(
+        &mut self,
+        tile: &mut MeshTile,
+        slot: usize,
+        hash: Option<[u8; 32]>,
+    ) -> u64 {
         self.index_tile(tile, location(tile, slot));
-        if self.apply_tile(tile, slot) {
+        self.index_bases(tile, slot, hash);
+        if self.apply(tile, slot, self.affected(slot, tile.polys.len())) {
             self.advance()
         } else {
             0
         }
-    }
-
-    pub(super) fn apply_tile(&self, tile: &mut MeshTile, slot: usize) -> bool {
-        self.by_tile
-            .get(&slot)
-            .is_some_and(|polys| self.apply(tile, slot, polys.keys().copied()))
     }
 
     pub(super) fn advance(&mut self) -> u64 {
@@ -298,44 +390,49 @@ impl Modifiers {
 }
 
 impl NavMesh {
-    /// The world's registered specifications and enabled bits, for saving.
+    /// The world's specifications, enabled bits and caller base edits, for saving.
     pub fn dynamic_layer(&self) -> Option<&DynamicLayer> {
         self.modifiers.layer.as_ref()
     }
 
-    /// Installs the modifier layer and applies it to every resident tile.
-    /// Passing `None` unregisters the layer and restores formerly governed
-    /// polygons to their baked state.
+    /// Installs the modifier layer and applies its base edits and effects to
+    /// every resident tile. Passing `None` restores affected polygons to baked
+    /// state and discards the previous layer, including its base edits.
     pub fn set_dynamic_layer(&mut self, layer: Option<DynamicLayer>) {
-        let old = core::mem::take(&mut self.modifiers.by_tile);
+        let mut dirty: BTreeMap<Location, BTreeSet<usize>> = BTreeMap::new();
+        for ti in self.slots.indices() {
+            if let Some(tile) = self.slots[ti].tile.as_deref() {
+                let mut affected = self.modifiers.affected(ti, tile.polys.len()).peekable();
+                if affected.peek().is_some() {
+                    dirty
+                        .entry(location(tile, ti))
+                        .or_default()
+                        .extend(affected);
+                }
+            }
+        }
         self.modifiers.layer = layer;
+        self.modifiers.by_tile.clear();
         self.modifiers.by_modifier.clear();
-        let mut dirty = BTreeMap::new();
+        self.modifiers.base_tiles.clear();
         for ti in self.slots.indices() {
             if let Some(tile) = self.slots[ti].tile.as_deref() {
                 let loc = location(tile, ti);
                 self.modifiers.index_tile(tile, loc);
-                if old.contains_key(&ti) || self.modifiers.by_tile.contains_key(&ti) {
-                    dirty.insert(loc, ());
+                self.modifiers.index_bases(tile, ti, self.slots[ti].hash);
+                let mut affected = self.modifiers.affected(ti, tile.polys.len()).peekable();
+                if affected.peek().is_some() {
+                    dirty.entry(loc).or_default().extend(affected);
                 }
             }
         }
 
         let stamp = self.modifiers.advance();
         let change = self.advance_change_epoch();
-        for (_, _, _, ti) in dirty.into_keys() {
-            let previous = old.get(&ti).into_iter().flat_map(|p| p.keys().copied());
-            let current = self
-                .modifiers
-                .by_tile
-                .get(&ti)
-                .into_iter()
-                .flat_map(|p| p.keys().copied());
-            let added =
-                current.filter(|ip| old.get(&ti).is_none_or(|polys| !polys.contains_key(ip)));
+        for ((_, _, _, ti), polys) in dirty {
             let slot = &mut self.slots[ti];
             if let Some(tile) = slot.tile.as_deref_mut()
-                && self.modifiers.apply(tile, ti, previous.chain(added))
+                && self.modifiers.apply(tile, ti, polys)
             {
                 slot.state_stamp = stamp;
                 slot.change_stamp = change;
@@ -362,7 +459,11 @@ impl NavMesh {
         {
             for ti in self.slots.indices() {
                 if let Some(tile) = self.slots[ti].tile.as_deref() {
-                    let polys = selected(tile, tile_bounds(tile), &spec.selector);
+                    let mut bounds = tile_bounds(tile);
+                    if spec.selector.is_detail() {
+                        bounds = with_detail_bounds(tile, bounds);
+                    }
+                    let polys = selected(tile, bounds, &spec.selector);
                     if !polys.is_empty() {
                         let loc = location(tile, ti);
                         dirty.entry(loc).or_default().extend(&polys);
@@ -381,8 +482,8 @@ impl NavMesh {
         Ok(())
     }
 
-    /// Unregisters a spec, restores its baked contribution and reapplies any
-    /// remaining overlapping modifiers. Returns whether it was registered.
+    /// Unregisters a spec and reapplies remaining overlapping modifiers over
+    /// the base state. Returns whether the spec was registered.
     pub fn remove_modifier(&mut self, id: ModifierId) -> bool {
         if !self
             .modifiers
@@ -537,14 +638,54 @@ impl NavMesh {
         Ok(tile.baked_state(ip as usize))
     }
 
-    pub(super) fn check_unmanaged(&self, ti: usize, ip: usize) -> Result<(), Error> {
-        if !self.modifiers.governs(ti, ip) {
-            Ok(())
-        } else {
-            Err(Error::InvalidParameter(
-                "polygon state is governed by modifiers",
-            ))
+    pub(super) fn set_modifier_base(
+        &mut self,
+        ti: usize,
+        ip: usize,
+        edit: BaseState,
+    ) -> Result<bool, Error> {
+        if !self.modifiers.manages_state(ti, ip) {
+            return Ok(false);
         }
+        let slot = &mut self.slots[ti];
+        let tile = slot.tile.as_deref_mut().ok_or(Error::InvalidRef)?;
+        let (x, y, l, _) = location(tile, ti);
+        let key = self
+            .modifiers
+            .base_tiles
+            .get(&ti)
+            .copied()
+            .unwrap_or_else(|| {
+                (
+                    x,
+                    y,
+                    l,
+                    slot.hash
+                        .unwrap_or_else(|| super::stream::content_hash(&tile.data)),
+                )
+            });
+        let layer = self
+            .modifiers
+            .layer
+            .as_mut()
+            .ok_or(Error::InvalidParameter("no modifier layer"))?;
+        let mut base = layer.base(key, ip);
+        let (baked_flags, baked_area) = tile.baked_state(ip);
+        if let Some(flags) = edit.flags {
+            base.flags = (flags != baked_flags).then_some(flags);
+        }
+        if let Some(area) = edit.area {
+            base.area = (area != baked_area).then_some(area);
+        }
+        if layer.set_base(key, ip, base)? {
+            self.modifiers.base_tiles.insert(ti, key);
+            if self.modifiers.apply(tile, ti, [ip]) {
+                self.stamp_state(ti);
+            } else {
+                self.modifiers.advance();
+            }
+        }
+        Ok(true)
     }
 
     /// Floods the resident directed links using current polygon flags and areas.

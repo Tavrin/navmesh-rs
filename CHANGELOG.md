@@ -6,6 +6,14 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- `Selector::DetailPrism` selects ground polygons by intersection with their
+  Detour detail triangles. Modifier-managed polygons accept caller base flag
+  and area edits, with enabled effects applied over those values. DNDY snapshots
+  save the selector and base edits and continue to read version 1.
+  See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
+
 ## [0.2.3] - 2026-11-20
 
 ### Added
