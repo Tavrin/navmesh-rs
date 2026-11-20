@@ -10,8 +10,8 @@ use crate::detour::LinkId;
 use crate::frames::{FrameId, FramePoint, FrameSet};
 
 #[cfg(feature = "crowd-world")]
-mod dock_avoidance;
-mod simulation;
+pub(crate) mod dock_avoidance;
+pub(crate) mod simulation;
 #[cfg(feature = "crowd-world")]
 mod snapshot;
 
@@ -26,7 +26,7 @@ struct Rider<H> {
     goal: Option<FramePoint>,
 }
 
-pub(super) enum LocalTarget {
+pub(crate) enum LocalTarget {
     Goal(V3),
     Dock(Option<V3>),
 }

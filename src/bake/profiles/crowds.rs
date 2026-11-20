@@ -13,6 +13,11 @@ use crate::crowd::world::{AgentHandle, CrowdWorld, CrowdWorldParams, Goal, StepR
 #[cfg(feature = "crowd-world")]
 use crate::{Budget, Budgeted, Limits};
 
+#[cfg(feature = "crowd-world")]
+mod mixed;
+#[cfg(feature = "crowd-world")]
+pub use mixed::{FramedMixedProfileCrowdWorld, MixedProfileCrowdWorld};
+
 fn check_envelope(mesh: &ProfileMesh, params: AgentParams) -> Result<(), ProfileError> {
     let config = mesh.catalog.spec.config();
     if params.height > config.walkable_height || params.radius > config.walkable_radius {
@@ -329,6 +334,11 @@ impl ProfileCrowdWorld {
     ) -> Result<Budgeted<StepReport>, ProfileError> {
         mesh.check_owner(&self.owner)?;
         Ok(self.crowd.step(&mesh.nav, budget)?)
+    }
+
+    /// Hashes the current simulation state in agent index order.
+    pub fn digest(&self) -> u64 {
+        self.crowd.digest()
     }
 
     /// Saves this crowd with its catalog binding and matching mesh slot history.

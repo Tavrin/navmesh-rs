@@ -8,10 +8,36 @@ struct Intent<H> {
     dock: Option<DockCrossing>,
 }
 
-struct DockCrossing {
-    id: LinkId,
-    departure: FramePoint,
-    landing: (PolyRef, FramePoint),
+pub(crate) struct DockCrossing {
+    pub(crate) id: LinkId,
+    pub(crate) departure: FramePoint,
+    pub(crate) landing: (PolyRef, FramePoint),
+}
+
+pub(crate) fn first_dock(legs: &[crate::frames::FrameLeg]) -> Option<DockCrossing> {
+    let [leg, next, ..] = legs else { return None };
+    Some(DockCrossing {
+        id: leg.dock?,
+        departure: FramePoint::new(leg.frame, leg.end),
+        landing: (*next.path.first()?, FramePoint::new(next.frame, next.start)),
+    })
+}
+
+pub(crate) fn same_target(a: &CrowdAgent, target: Option<(PolyRef, V3)>) -> bool {
+    match target {
+        Some((poly, pos)) => {
+            a.target_ref == poly
+                && a.target_pos == pos
+                && matches!(
+                    a.target_state,
+                    TargetState::Valid
+                        | TargetState::Requesting
+                        | TargetState::WaitingForQueue
+                        | TargetState::WaitingForPath
+                )
+        }
+        None => a.target_state == TargetState::None,
+    }
 }
 
 impl<C: FrameCrowd> FramedCrowd<C> {
@@ -73,16 +99,7 @@ impl<C: FrameCrowd> FramedCrowd<C> {
                     if let Some(leg) = plan.legs.first() {
                         target = leg.path.last().map(|&poly| (poly, leg.end));
                     }
-                    if let [leg, next, ..] = plan.legs.as_slice()
-                        && let Some(id) = leg.dock
-                        && let Some(&poly) = next.path.first()
-                    {
-                        dock = Some(DockCrossing {
-                            id,
-                            departure: FramePoint::new(leg.frame, leg.end),
-                            landing: (poly, FramePoint::new(next.frame, next.start)),
-                        });
-                    }
+                    dock = first_dock(&plan.legs);
                 }
             }
             intents.push(Intent {
@@ -149,21 +166,7 @@ impl<C: FrameCrowd> FramedCrowd<C> {
             let nav = frames.require_mesh(i.rider.frame)?;
             let crowd = self.require_crowd_mut(i.rider.frame)?;
             let a = crowd.get(i.rider.handle).ok_or(Error::InvalidRef)?;
-            let same = match i.target {
-                Some((poly, pos)) => {
-                    a.target_ref == poly
-                        && a.target_pos == pos
-                        && matches!(
-                            a.target_state,
-                            TargetState::Valid
-                                | TargetState::Requesting
-                                | TargetState::WaitingForQueue
-                                | TargetState::WaitingForPath
-                        )
-                }
-                None => a.target_state == TargetState::None,
-            };
-            if !same {
+            if !same_target(a, i.target) {
                 crowd.target(nav, i.rider.handle, i.target)?;
             }
         }

@@ -58,6 +58,9 @@ impl AgentsView for [CrowdAgent] {
 pub(super) trait AgentSlots {
     /// One past the largest agent index.
     fn count(&self) -> usize;
+    fn profile(&self, _: usize) -> u32 {
+        0
+    }
     fn slot(&self, i: usize) -> Option<&CrowdAgent>;
     fn slot_mut(&mut self, i: usize) -> Option<&mut CrowdAgent>;
 }
@@ -227,19 +230,20 @@ pub(super) fn check_path(
 
 /// Quick searches, path-queue requests in upstream priority order, one queue update
 /// of `max_iters` node expansions, and collection of finished results.
-pub(super) fn move_requests<A: AgentSlots + ?Sized>(
+pub(super) fn move_requests<'n, A: AgentSlots + ?Sized>(
     agents: &mut A,
     pathq: &mut PathQueue,
     filters: &[DefaultFilter; 16],
     ws: &mut Workspace,
-    nav: &NavMesh,
-    q: &mut NavMeshQuery<'_>,
+    meshes: queue::MeshSource<'n>,
+    q: &mut NavMeshQuery<'n>,
     max_iters: usize,
 ) -> Result<(), Error> {
     let replan_time = |agents: &A, i: usize| agents.slot(i).map_or(0., |a| a.replan_time);
     let mut queue = [0usize; 8];
     let mut nqueue = 0;
     for i in 0..agents.count() {
+        let profile = agents.profile(i);
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
@@ -253,6 +257,7 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
         }
         let f = &filters[a.params.query_filter_type];
         if a.target_state == T::Requesting {
+            q.nav = meshes.mesh(profile)?;
             let mut res = Vec::new();
             let mut pos = a.target_pos;
             let mut waiting = None;
@@ -319,11 +324,12 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
         }
     }
     for &i in &queue[..nqueue] {
+        let profile = agents.profile(i);
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
-        match pathq.request(
-            nav,
+        match pathq.request_on(
+            (profile, meshes.mesh(profile)?),
             a.corridor.last_poly(),
             a.target_ref,
             a.corridor.target,
@@ -339,8 +345,9 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
             Err(e) => return Err(e),
         }
     }
-    pathq.update_in(ws, nav, max_iters, filters)?;
+    pathq.update_in(ws, meshes, max_iters, filters)?;
     for i in 0..agents.count() {
+        let profile = agents.profile(i);
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
@@ -361,6 +368,7 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
             };
             a.replan_time = 0.;
         } else if status & Status::SUCCESS != 0 {
+            q.nav = meshes.mesh(profile)?;
             let mut res = Vec::new();
             let status = pathq.take_result(a.pathq, &mut res)?;
             a.partial = status.0 & Status::PARTIAL_RESULT != 0;
@@ -412,13 +420,14 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
 
 /// Advances topology timers and optimises the corridor of the one agent that waited
 /// longest (ties: lowest index), as upstream does once per tick.
-pub(super) fn optimize_topology<A: AgentSlots + ?Sized>(
+pub(super) fn optimize_topology<'n, A: AgentSlots + ?Sized>(
     agents: &mut A,
     active: &[usize],
-    q: &mut NavMeshQuery<'_>,
+    q: &mut NavMeshQuery<'n>,
     filters: &[DefaultFilter; 16],
     dt: f32,
-) {
+    meshes: queue::MeshSource<'n>,
+) -> Result<(), Error> {
     let mut opt: Option<usize> = None;
     let mut best = 0.;
     for &i in active {
@@ -438,12 +447,15 @@ pub(super) fn optimize_topology<A: AgentSlots + ?Sized>(
             best = time;
         }
     }
-    if let Some(a) = opt.and_then(|i| agents.slot_mut(i)) {
+    if let Some(i) = opt {
+        q.nav = meshes.mesh(agents.profile(i))?;
+        let a = agents.slot_mut(i).ok_or(Error::InvalidRef)?;
         let _ = a
             .corridor
             .optimize_topology(q, &filters[a.params.query_filter_type]);
         a.topology_time = 0.;
     }
+    Ok(())
 }
 
 /// Refreshes the local walls when the agent moved a quarter of its query range or

@@ -131,7 +131,14 @@ impl FrameSet {
     }
 }
 
-fn binding(nav: &NavMesh) -> [u8; 32] {
+fn binding(frame: &FrameNav) -> [u8; 32] {
+    // The `Profiles` arm exists only with `recast` and `crowd-world`; without them this match has one arm.
+    #[allow(clippy::infallible_destructuring_match)]
+    let nav = match frame {
+        FrameNav::Native(nav) => nav,
+        #[cfg(all(feature = "recast", feature = "crowd-world"))]
+        FrameNav::Profiles(meshes) => return meshes.frame_binding(),
+    };
     let mut data = nav.residency().to_bytes();
     let params = nav.params();
     for v in params

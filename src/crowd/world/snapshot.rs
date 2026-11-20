@@ -15,7 +15,8 @@
 //! legacy version 2 layouts each contain just one of these extensions.
 //! Version 4 adds the replan limit and cursor after the runtime-link epoch and each
 //! agent's deferred-replan bit and watched obstruction after its agent record.
-//!
+//! Version 5 uses the version 4 layout with a profile ID before each occupied
+//! agent record and after each queue handle. It requires a mixed profile binding.
 //!
 //! The profile (`NPCW`) and framed (`DCFR`) records embed the same `DCRW` layouts.
 //! A profile record binds the catalog and slot history and writes zero in the
@@ -31,6 +32,7 @@ const BASE_VERSION: u32 = 1;
 const LEGACY_VERSION: u32 = 2;
 const EXTENDED_VERSION: u32 = 3;
 const REPLAN_VERSION: u32 = 4;
+const MIXED_VERSION: u32 = 5;
 
 #[derive(Clone, Copy)]
 struct AgentLayout {
@@ -434,7 +436,8 @@ impl CrowdWorld {
                 .heavy
                 .iter()
                 .any(|a| a.active && (a.pending_stamp_replan || a.blocked_poly != 0));
-        let extended = replan
+        let extended = self.mixed.is_some()
+            || replan
             || self.link_epoch != 0
             || self.heavy.iter().any(|a| {
                 a.active
@@ -449,7 +452,9 @@ impl CrowdWorld {
             arrival: extended,
             links: extended,
         };
-        let version = if replan {
+        let version = if self.mixed.is_some() {
+            MIXED_VERSION
+        } else if replan {
             REPLAN_VERSION
         } else if extended {
             EXTENDED_VERSION
@@ -471,7 +476,7 @@ impl CrowdWorld {
         if layout.links {
             o.u64(self.link_epoch);
         }
-        if version == REPLAN_VERSION {
+        if version >= REPLAN_VERSION {
             o.u32(self.replan_limit);
             o.u32(self.replan_cursor);
         }
@@ -514,11 +519,14 @@ impl CrowdWorld {
             o.u32(g);
             o.u8(u8::from(self.heavy_of[i] != NONE));
         }
-        for &s in &self.heavy_of {
+        for (index, &s) in self.heavy_of.iter().enumerate() {
             if s != NONE {
                 let a = &self.heavy[s as usize];
+                if let Some(mixed) = &self.mixed {
+                    o.u32(mixed.profiles[index]);
+                }
                 write_agent(&mut o, a, layout);
-                if version == REPLAN_VERSION {
+                if version >= REPLAN_VERSION {
                     o.u8(u8::from(a.pending_stamp_replan));
                     o.r(a.blocked_poly);
                 }
@@ -529,6 +537,9 @@ impl CrowdWorld {
         o.u32(q.next);
         for r in &q.requests {
             o.u32(r.handle);
+            if version == MIXED_VERSION {
+                o.u32(if r.handle == 0 { 0 } else { r.profile });
+            }
             o.r(r.start);
             o.r(r.end);
             o.v3(r.start_pos);
@@ -594,30 +605,89 @@ impl CrowdWorld {
         Ok(Some(query))
     }
 
+    #[cfg(feature = "recast")]
+    pub(crate) fn mixed_snapshot(
+        &self,
+        meshes: &BTreeMap<u32, &NavMesh>,
+    ) -> Result<Vec<u8>, Error> {
+        let mixed = self.mixed.as_ref().ok_or(bad("profile binding"))?;
+        for (&id, &epoch) in &mixed.epochs {
+            let mesh = meshes.get(&id).ok_or(bad("profile binding"))?;
+            if mesh.change_epoch() != epoch {
+                return Err(Error::MeshChanged);
+            }
+        }
+        if has_running_search(&self.pathq) {
+            let request = &self.pathq.requests[self.pathq.head % 8];
+            let mesh = meshes.get(&request.profile).ok_or(bad("queue profile"))?;
+            if let Some(query) = self.profile_search(mesh)?
+                && crate::detour::query::pool_changed(mesh, query.query.epoch, &query.node_pool)
+            {
+                return Err(Error::MeshChanged);
+            }
+        }
+        Ok(self.snapshot_bytes(Some(0)))
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn restore_mixed_snapshot(
+        meshes: &BTreeMap<u32, &NavMesh>,
+        bytes: &[u8],
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let (_, nav) = meshes.first_key_value().ok_or(bad("empty profile set"))?;
+        let mut world = Self::read_snapshot(nav, bytes, limits, Some(meshes))?;
+        if has_running_search(&world.pathq) {
+            let request = &world.pathq.requests[world.pathq.head % 8];
+            let mesh = meshes.get(&request.profile).ok_or(bad("queue profile"))?;
+            if world
+                .profile_search(mesh)?
+                .is_none_or(|q| q.query.epoch != 0)
+            {
+                return Err(bad("profile search epoch"));
+            }
+            let query = world.pathq.query.as_mut().ok_or(bad("queue query"))?;
+            query.query.epoch = mesh.epoch();
+        }
+        Ok(world)
+    }
+
     /// Restores a world from untrusted `'DCRW'` bytes for agents on `nav`. Rejects
     /// malformed input with [`Error::InvalidSnapshot`]; `limits` bound the
     /// restored world's allocation as in [`CrowdWorld::new`]. Restore the
     /// navmesh to the state it had at the snapshot's last completed crowd step.
     pub fn from_bytes(nav: &NavMesh, b: &[u8], limits: Limits) -> Result<Self, Error> {
+        Self::read_snapshot(nav, b, limits, None)
+    }
+
+    fn read_snapshot(
+        nav: &NavMesh,
+        b: &[u8],
+        limits: Limits,
+        profiles: Option<&BTreeMap<u32, &NavMesh>>,
+    ) -> Result<Self, Error> {
         let mut i = In(b);
         if &i.take::<4>()? != MAGIC {
             return Err(Error::InvalidSnapshot(E::WrongMagic));
         }
         let version = i.u32()?;
+        if (version == MIXED_VERSION) != profiles.is_some() {
+            return Err(Error::InvalidSnapshot(E::WrongVersion));
+        }
         let layout = match version {
             BASE_VERSION => AgentLayout {
                 arrival: false,
                 links: false,
             },
             LEGACY_VERSION => legacy_layout(i.0)?,
-            EXTENDED_VERSION | REPLAN_VERSION => AgentLayout {
+            EXTENDED_VERSION | REPLAN_VERSION | MIXED_VERSION => AgentLayout {
                 arrival: true,
                 links: true,
             },
             _ => return Err(Error::InvalidSnapshot(E::WrongVersion)),
         };
         let link_epoch = if layout.links { i.u64()? } else { 0 };
-        let (replan_limit, replan_cursor) = if version == REPLAN_VERSION {
+        let (replan_limit, replan_cursor) = if version >= REPLAN_VERSION {
             (i.u32()?, i.u32()?)
         } else {
             (replan::DEFAULT_LIMIT, 0)
@@ -627,6 +697,7 @@ impl CrowdWorld {
             return Err(bad("replan cursor"));
         }
         let mut w = CrowdWorld::new(nav, &p, limits)?;
+        w.mixed = profiles.map(Self::mixed_state);
         w.link_epoch = link_epoch;
         w.replan_limit = replan_limit;
         w.replan_cursor = replan_cursor;
@@ -694,9 +765,16 @@ impl CrowdWorld {
                 w.free.push(Reverse(k as u32));
                 continue;
             }
+            if let Some(mixed) = &mut w.mixed {
+                let profile = i.u32()?;
+                if !mixed.epochs.contains_key(&profile) {
+                    return Err(bad("agent profile"));
+                }
+                mixed.profiles[k] = profile;
+            }
             let mut a = CrowdAgent::new_in(&mut ws)?;
             read_agent(&mut i, &mut a, n, p.max_radius, &mut ws, layout)?;
-            if version == REPLAN_VERSION {
+            if version >= REPLAN_VERSION {
                 a.pending_stamp_replan = i.flag("deferred replan")?;
                 a.blocked_poly = i.r()?;
                 if (a.pending_stamp_replan || a.blocked_poly != 0)
@@ -734,6 +812,14 @@ impl CrowdWorld {
         let max_path = q.max_path;
         for r in &mut q.requests {
             r.handle = i.u32()?;
+            if let Some(profiles) = profiles {
+                r.profile = i.u32()?;
+                if (r.handle == 0 && r.profile != 0)
+                    || (r.handle != 0 && !profiles.contains_key(&r.profile))
+                {
+                    return Err(bad("queue profile"));
+                }
+            }
             r.start = i.r()?;
             r.end = i.r()?;
             r.start_pos = i.v3("queue request")?;
@@ -773,6 +859,19 @@ impl CrowdWorld {
             }
         }
         read_search(&mut i, q, running, &mut ws)?;
+        if let Some(mixed) = &w.mixed {
+            for (a, &index) in w.heavy.iter().zip(&w.owner) {
+                if a.target_state == TargetState::WaitingForPath
+                    && let Some(r) = q
+                        .requests
+                        .iter()
+                        .find(|r| r.handle != 0 && r.handle == a.pathq)
+                    && r.profile != mixed.profiles[index as usize]
+                {
+                    return Err(bad("agent queue profile"));
+                }
+            }
+        }
         if !i.0.is_empty() {
             return Err(Error::InvalidSnapshot(E::TrailingBytes));
         }

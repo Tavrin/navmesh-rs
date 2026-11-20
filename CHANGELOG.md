@@ -11,6 +11,10 @@ All notable changes to this project are documented in this file. The format foll
 - Independent agent-size bake profiles with checked tile halos, versioned
   catalogs, and profile-bound streaming, queries, connectivity and crowds.
   See [Agent-size bake profiles](docs/BAKE-PROFILES.md).
+- Shared ORCA and sampled avoidance for agents on different bake profiles in
+  one crowd world, with profile-local routing, replanning, traversal and
+  moving-platform landings. Mixed snapshots preserve agent and queue profile
+  bindings.
 - Moving platform frames with yaw-only poses, runtime docks, cross-frame
   routes, and stable riders for both crowds. Frame and framed crowd snapshots
   restore dock availability and riders in transit. See

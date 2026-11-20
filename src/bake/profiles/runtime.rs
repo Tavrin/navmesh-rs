@@ -132,6 +132,19 @@ impl ProfileMeshes {
         Ok(())
     }
 
+    #[cfg(feature = "crowd-world")]
+    pub(crate) fn frame_binding(&self) -> [u8; 32] {
+        let mut data = Vec::new();
+        data.extend(b"profile frame");
+        for (id, mesh) in &self.meshes {
+            data.extend(id.0.to_le_bytes());
+            data.extend(mesh.catalog.digest);
+            data.extend(detour::content_hash(&mesh.nav.residency().to_bytes()));
+            data.extend(detour::content_hash(&mesh.nav.runtime_links_to_bytes()));
+        }
+        detour::content_hash(&data)
+    }
+
     /// Selects the mesh for this profile.
     pub fn get(&self, id: ProfileId) -> Result<&ProfileMesh, ProfileError> {
         self.meshes.get(&id).ok_or(ProfileError::UnknownProfile(id))
@@ -206,7 +219,7 @@ impl ProfileMeshes {
 
 /// One profile's independently streamed navigation mesh.
 pub struct ProfileMesh {
-    pub(super) nav: NavMesh,
+    pub(crate) nav: NavMesh,
     pub(super) catalog: ProfileCatalog,
 }
 

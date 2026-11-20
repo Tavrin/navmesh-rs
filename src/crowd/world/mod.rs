@@ -23,7 +23,7 @@
 //! agent plus the path queue's node expansions. A step is never partly applied
 //! because of the budget.
 use super::*;
-use alloc::collections::BinaryHeap;
+use alloc::collections::{BTreeMap, BinaryHeap};
 use core::cmp::Reverse;
 
 mod grid;
@@ -229,6 +229,7 @@ pub struct CrowdWorld {
     filters: [DefaultFilter; 16],
     presets: [ObstacleAvoidanceParams; 8],
     pathq: PathQueue,
+    mixed: Option<MixedState>,
     // Per agent index.
     generation: Vec<u32>,
     heavy_of: Vec<u32>,
@@ -251,6 +252,13 @@ pub struct CrowdWorld {
     replan_epoch: u64,
     replan_limit: u32,
     replan_cursor: u32,
+}
+
+struct MixedState {
+    /// Last completed revalidation epoch per profile.
+    epochs: BTreeMap<u32, u64>,
+    /// Profile by global agent index. Free indices are ignored.
+    profiles: Vec<u32>,
 }
 
 impl CrowdWorld {
@@ -277,6 +285,7 @@ impl CrowdWorld {
             filters: core::array::from_fn(|_| DefaultFilter::default()),
             presets: [ObstacleAvoidanceParams::default(); 8],
             pathq,
+            mixed: None,
             generation: Vec::new(),
             heavy_of: Vec::new(),
             pos: Vec::new(),
@@ -298,6 +307,73 @@ impl CrowdWorld {
             replan_cursor: 0,
         })
     }
+    #[cfg(feature = "recast")]
+    pub(crate) fn new_mixed(
+        meshes: &BTreeMap<u32, &NavMesh>,
+        params: &CrowdWorldParams,
+        limits: Limits,
+    ) -> Result<Self, Error> {
+        let (_, nav) = meshes
+            .first_key_value()
+            .ok_or(Error::InvalidParameter("empty profile set"))?;
+        let mut world = Self::new(nav, params, limits)?;
+        world.mixed = Some(Self::mixed_state(meshes));
+        Ok(world)
+    }
+
+    fn mixed_state(meshes: &BTreeMap<u32, &NavMesh>) -> MixedState {
+        MixedState {
+            epochs: meshes
+                .iter()
+                .map(|(&id, nav)| (id, nav.change_epoch()))
+                .collect(),
+            profiles: Vec::new(),
+        }
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn add_profile_agent(
+        &mut self,
+        profile: u32,
+        nav: &NavMesh,
+        pos: V3,
+        params: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        let handle = self.add_agent(nav, pos, params)?;
+        self.bind_profile(handle, profile);
+        Ok(handle)
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn add_profile_landing(
+        &mut self,
+        profile: u32,
+        poly: PolyRef,
+        pos: V3,
+        params: AgentParams,
+    ) -> Result<AgentHandle, Error> {
+        let handle = self.add_landed_agent(poly, pos, params)?;
+        self.bind_profile(handle, profile);
+        Ok(handle)
+    }
+
+    #[cfg(feature = "recast")]
+    fn bind_profile(&mut self, handle: AgentHandle, profile: u32) {
+        if let Some(mixed) = &mut self.mixed {
+            mixed.profiles[handle.index as usize] = profile;
+        }
+    }
+
+    #[cfg(feature = "recast")]
+    pub(crate) fn agent_profile(&self, handle: AgentHandle) -> Option<u32> {
+        self.slot_of(handle)?;
+        self.mixed
+            .as_ref()?
+            .profiles
+            .get(handle.index as usize)
+            .copied()
+    }
+
     /// Caps stamp-triggered replans per step. Admission resumes in handle-index
     /// order after the last admitted agent when this cap is filled.
     /// The default limit is 1,024.
@@ -484,6 +560,10 @@ impl CrowdWorld {
         reserve(&mut self.radius)?;
         reserve(&mut self.height)?;
         reserve(&mut self.max_speed)?;
+        if let Some(mixed) = &mut self.mixed {
+            reserve(&mut mixed.profiles)?;
+            mixed.profiles.push(0);
+        }
         self.generation.push(0);
         self.heavy_of.push(NONE);
         self.pos.push([0.; 3]);
@@ -629,6 +709,11 @@ impl CrowdWorld {
             let a = v.agent;
             put(&v.handle.index.to_le_bytes());
             put(&v.handle.generation.to_le_bytes());
+            if let Some(mixed) = &self.mixed
+                && mixed.epochs.len() > 1
+            {
+                put(&mixed.profiles[v.handle.index as usize].to_le_bytes());
+            }
             put(&[a.state as u8, a.target_state as u8]);
             if a.params.arrival_policy != ArrivalPolicy::Keep
                 || a.params.arrival_distance != 0.5
