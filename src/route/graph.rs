@@ -1,7 +1,7 @@
 //! Level-3 super-sector records (`'DNSR'`) and the resident [`SectorGraph`].
 
 use super::stitched::Crossing;
-use super::summary::SectorSummary;
+use super::summary::{SectorSummary, unique_destination_contents};
 use super::wire::{Reader, Writer, check_bytes, ordered};
 use super::{SectorKey, SectorParams, SuperKey, opposite_side, runs_meet};
 use crate::{Budget, Error, Limits, SnapshotError};
@@ -15,15 +15,17 @@ pub const SUPER_MAGIC: [u8; 4] = *b"DNSR";
 pub const SUPER_VERSION: u16 = 3;
 
 const HEADER: usize = 44;
-const SECTOR: usize = 16;
+const SECTOR: usize = 20;
 const REGION: usize = 36;
 const MEMBER: usize = 4;
 const PORTAL: usize = 36;
 const OFFMESH: usize = 28;
-const EXIT: usize = 16;
+const EXIT: usize = 20;
 
 /// Level-3 edges of one record, per super-region.
 type EdgeSet = Vec<Vec<SuperEdge>>;
+/// A record's level-3 edges and whether an exit lands in another bake's sector.
+type Linked = (EdgeSet, bool);
 
 fn charge(budget: &mut Budget, n: u64) -> Result<(), Error> {
     if budget.spend(n) {
@@ -95,14 +97,14 @@ pub struct SuperOffMesh {
 /// super x `i32`, z `i32`, sectors per super `u16`, tiles per sector `u16`, profile
 /// `u32`, climb `f32`, sector and region counts (`u16` each), member, portal and
 /// off-mesh counts (`u32` each); then sectors (x `i32`, z `i32`, version `u32`,
-/// content id `u32`),
+/// content id `u64`),
 /// regions (first member `u32`, member count `u32`, crossing bound `f32`, bbox 6 x
 /// `f32`), members (sector `u16`, region `u16`), portals (side `u8`, split `u8`,
 /// region `u16`, sector `u16`, padding `u16`, pos 3 x `f32`, extent 2 x `f32`, y range
 /// 2 x `f32`) and off-mesh entries (region `u16`, flags `u8`, padding `u8`, start 3 x
 /// `f32`, far 3 x `f32`). The final arrays are directed local region pairs
 /// (two `u16`) and remote exits (source region `u16`, destination sector x
-/// and z `i32`, destination region `u16`, destination sector content id `u32`),
+/// and z `i32`, destination region `u16`, destination sector content id `u64`),
 /// each prefixed by a `u32` count.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SuperRecord {
@@ -112,22 +114,21 @@ pub struct SuperRecord {
     profile: u32,
     climb: f32,
     sectors: Vec<(SectorKey, u32)>,
-    contents: Vec<u32>,
+    contents: Vec<u64>,
     regions: Vec<SuperRegion>,
     portals: Vec<SuperPortal>,
     offmesh: Vec<SuperOffMesh>,
     arcs: Vec<(u16, u16)>,
     bound: bool,
-    exits: Vec<(u16, SectorKey, u16, u32)>,
+    exits: Vec<(u16, SectorKey, u16, u64)>,
 }
 
 impl SectorSummary {
     /// Fingerprint of this profile's complete encoded summary, including directed
-    /// exits, effective membership and transition costs. Computed outside searches.
+    /// exits, effective membership and transition costs. Computed once when the
+    /// summary is built, decoded or stitched, so reading it is free.
     pub fn version(&self) -> u32 {
-        self.to_bytes().into_iter().fold(0x811c_9dc5u32, |h, b| {
-            (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
-        })
+        self.version
     }
 }
 
@@ -217,7 +218,7 @@ impl SuperRecord {
         let mut transitions = Vec::new();
         let mut exits = Vec::new();
         let mut consistent = true;
-        let contents: Vec<u32> = list.iter().map(|s| s.content_id()).collect();
+        let contents: Vec<u64> = list.iter().map(|s| s.content_id()).collect();
         if bound {
             for (i, s) in list.iter().enumerate() {
                 let out = s.exits.as_deref().unwrap_or_default();
@@ -423,7 +424,7 @@ impl SuperRecord {
         self.bound
     }
     /// Remote exit destinations: sector, region and the sector's content id.
-    pub(super) fn destinations(&self) -> impl Iterator<Item = (SectorKey, u16, u32)> + '_ {
+    pub(super) fn destinations(&self) -> impl Iterator<Item = (SectorKey, u16, u64)> + '_ {
         self.exits.iter().map(|&(_, k, r, c)| (k, r, c))
     }
     /// Super-sectors the stitched exits land in (with repeats).
@@ -432,7 +433,7 @@ impl SuperRecord {
     }
     /// [`SectorSummary::content_id`] of each sector in [`sectors`](Self::sectors), in
     /// the same order.
-    pub fn sector_content_ids(&self) -> &[u32] {
+    pub fn sector_content_ids(&self) -> &[u64] {
         &self.contents
     }
     /// Directed arcs between regions of this record.
@@ -505,7 +506,7 @@ impl SuperRecord {
             w.i32(k.x);
             w.i32(k.z);
             w.u32(*v);
-            w.u32(*c);
+            w.u64(*c);
         }
         let mut first = 0u32;
         for r in &self.regions {
@@ -549,7 +550,7 @@ impl SuperRecord {
             w.i32(k.x);
             w.i32(k.z);
             w.u16(b);
-            w.u32(c);
+            w.u64(c);
         }
         w.out
     }
@@ -559,7 +560,7 @@ impl SuperRecord {
     /// [`SnapshotError::WrongVersion`](crate::SnapshotError::WrongVersion) for another
     /// record version; [`Error::InvalidInput`] for a malformed record (magic, flags,
     /// padding, length, float, index, ordering or membership errors, a sector region
-    /// listed twice or skipped);
+    /// listed twice or skipped, exits naming two content ids for one sector);
     /// [`Error::LimitExceeded`] above `limits.max_bytes`.
     pub fn from_bytes(data: &[u8], limits: &Limits) -> Result<Self, Error> {
         check_bytes(data.len(), limits)?;
@@ -596,7 +597,7 @@ impl SuperRecord {
                 z: r.i32()?,
             };
             let v = r.u32()?;
-            contents.push(r.u32()?);
+            contents.push(r.u64()?);
             r.require(
                 (x0..x0 + k).contains(&i64::from(s.x)) && (z0..z0 + k).contains(&i64::from(s.z)),
             )?;
@@ -703,11 +704,12 @@ impl SuperRecord {
                     z: r.i32()?,
                 },
                 r.u16()?,
-                r.u32()?,
+                r.u64()?,
             );
             r.require(usize::from(e.0) < nr && exits.last().is_none_or(|p| *p < e))?;
             exits.push(e);
         }
+        unique_destination_contents(&exits)?;
         r.finish()?;
         Ok(SuperRecord {
             key,
@@ -765,8 +767,9 @@ pub struct GraphUpdate {
     pub sectors: u32,
     /// Super-sector records re-derived.
     pub supers: u32,
-    /// Super-sector records marked stale (their sector summaries are not all
-    /// resident, so they wait for a fresh record).
+    /// Super-sector records marked or installed stale (their sector summaries are
+    /// not all resident, or come from different bakes, so they wait for a fresh
+    /// record).
     pub stale: u32,
     /// Super-sectors whose level-3 edges were recomputed.
     pub edge_sets: u32,
@@ -775,7 +778,12 @@ pub struct GraphUpdate {
 #[derive(Clone, Debug)]
 pub(super) struct SuperNode {
     pub(super) record: SuperRecord,
+    /// The record disagrees with the resident summaries of its own super-sector.
     pub(super) stale: bool,
+    /// A stitched exit lands in a sector whose super-sector record lists another
+    /// content id, or does not list it: the destination was re-derived from another
+    /// bake. Recomputed with the record's level-3 edges.
+    pub(super) foreign: bool,
     pub(super) edges: Vec<Vec<SuperEdge>>,
 }
 
@@ -854,10 +862,12 @@ impl SectorGraph {
 
     /// Inserts or replaces a sector summary and updates level 3.
     ///
-    /// The super-sector's record is re-derived only when every other sector it lists
-    /// is resident with the summary version the record lists; otherwise, or when a
-    /// stitched crossing inside the super-sector names a summary from another bake,
-    /// the record is marked stale. The work of the update (derivation and relinking)
+    /// The super-sector's record is re-derived from the resident summaries when every
+    /// other sector it lists is resident; otherwise the record is kept and marked
+    /// stale. A re-derived record whose stitched crossings inside the super-sector
+    /// name a summary from another bake is installed stale: it lists the resident
+    /// versions, so re-inserting the remaining summaries of the new bake ends with
+    /// a fresh record. The work of the update (derivation and relinking)
     /// is charged against the graph's [`Limits::max_work`]. Errors:
     /// [`Error::InvalidInput`] when the summary's sector size differs from the
     /// graph's; [`Error::LimitExceeded`] when the update would exceed the work limit,
@@ -878,13 +888,10 @@ impl SectorGraph {
             None => true,
             Some(node) => {
                 charge(&mut budget, node.record.sectors().len() as u64)?;
-                node.record.sectors().iter().all(|(k, v)| {
-                    *k == key
-                        || self
-                            .sectors
-                            .get(&(profile, *k))
-                            .is_some_and(|resident| resident.version() == *v)
-                })
+                node.record
+                    .sectors()
+                    .iter()
+                    .all(|(k, _)| *k == key || self.sectors.contains_key(&(profile, *k)))
             }
         };
         if complete {
@@ -910,23 +917,19 @@ impl SectorGraph {
             members.push(&s);
             let (record, consistent) =
                 SuperRecord::derive_budgeted(sk, &self.params, &members, &mut budget)?;
-            if consistent || !self.supers.contains_key(&(profile, sk)) {
-                update.edge_sets = self.install(
-                    profile,
-                    SuperNode {
-                        record,
-                        stale: !consistent,
-                        edges: Vec::new(),
-                    },
-                    &mut budget,
-                )?;
-                update.supers = 1;
-            }
-            if !consistent {
-                update.stale = 1;
-            }
-        }
-        if !complete || update.stale == 1 {
+            update.edge_sets = self.install(
+                profile,
+                SuperNode {
+                    record,
+                    stale: !consistent,
+                    foreign: false,
+                    edges: Vec::new(),
+                },
+                &mut budget,
+            )?;
+            update.supers = 1;
+            update.stale = u32::from(!consistent);
+        } else {
             if let Some(node) = self.supers.get_mut(&(profile, sk)) {
                 node.stale = true;
             }
@@ -973,6 +976,7 @@ impl SectorGraph {
             SuperNode {
                 record,
                 stale,
+                foreign: false,
                 edges: Vec::new(),
             },
             &mut budget,
@@ -1019,9 +1023,10 @@ impl SectorGraph {
                         .insert(sk);
                 }
                 let n = sets.len() as u32;
-                for (k, edges) in sets {
+                for (k, (edges, foreign)) in sets {
                     if let Some(node) = self.supers.get_mut(&(profile, k)) {
                         node.edges = edges;
+                        node.foreign = foreign;
                     }
                 }
                 Ok(n)
@@ -1043,7 +1048,7 @@ impl SectorGraph {
         profile: u32,
         sk: SuperKey,
         budget: &mut Budget,
-    ) -> Result<Vec<(SuperKey, EdgeSet)>, Error> {
+    ) -> Result<Vec<(SuperKey, Linked)>, Error> {
         let mut keys = BTreeSet::new();
         for dz in -1..=1 {
             for dx in -1..=1 {
@@ -1066,15 +1071,17 @@ impl SectorGraph {
     }
 
     /// Level-3 edges of one record, charging one unit per arc, exit, region lookup,
-    /// portal pair and off-mesh landing test.
+    /// portal pair and off-mesh landing test. Also returns whether a stitched exit
+    /// lands in a sector whose resident super-sector record lists another content
+    /// id or omits the sector.
     pub(super) fn edges_of(
         &self,
         profile: u32,
         sk: SuperKey,
         budget: &mut Budget,
-    ) -> Result<Vec<Vec<SuperEdge>>, Error> {
+    ) -> Result<Linked, Error> {
         let Some(node) = self.supers.get(&(profile, sk)) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), false));
         };
         let rec = &node.record;
         charge(budget, (rec.regions.len() + rec.arcs.len()) as u64)?;
@@ -1089,18 +1096,29 @@ impl SectorGraph {
             add(a, sk, b);
         }
         if rec.bound {
-            for &(a, k, b, _) in &rec.exits {
+            let mut foreign = false;
+            for &(a, k, b, c) in &rec.exits {
                 let sk = self.params.super_of(k);
-                let regions = self
-                    .supers
-                    .get(&(profile, sk))
-                    .map_or(0, |n| n.record.regions.len());
-                charge(budget, 1 + regions as u64)?;
+                let Some(dest) = self.supers.get(&(profile, sk)) else {
+                    charge(budget, 1)?;
+                    continue;
+                };
+                let dest = &dest.record;
+                charge(budget, 1 + dest.regions.len() as u64)?;
+                let listed = dest
+                    .sectors
+                    .binary_search_by_key(&(k.z, k.x), |(s, _)| (s.z, s.x))
+                    .ok()
+                    .and_then(|i| dest.contents.get(i));
+                if listed != Some(&c) {
+                    foreign = true;
+                    continue;
+                }
                 if let Some(region) = self.super_region(profile, k, b) {
                     add(a, sk, region);
                 }
             }
-            return Ok(Self::sorted(edges));
+            return Ok((Self::sorted(edges), foreign));
         }
         for (side, d) in [(0u8, (1, 0)), (2u8, (0, 1)), (4u8, (-1, 0)), (6u8, (0, -1))] {
             let (Some(x), Some(z)) = (sk.x.checked_add(d.0), sk.z.checked_add(d.1)) else {
@@ -1169,7 +1187,7 @@ impl SectorGraph {
                 }
             }
         }
-        Ok(Self::sorted(edges))
+        Ok((Self::sorted(edges), false))
     }
 
     /// Sorts each region's edges by target and drops repeats (their cost is the
@@ -1215,9 +1233,14 @@ impl SectorGraph {
         self.supers.get(&(profile, key)).map(|n| &n.record)
     }
 
-    /// Whether a super-sector's record waits for a fresh one (`None` when absent).
+    /// Whether a super-sector's record waits for a fresh one (`None` when absent):
+    /// it disagrees with the resident summaries of its super-sector, or one of its
+    /// stitched exits lands in a sector whose super-sector record lists another
+    /// content id (the destination comes from another bake).
     pub fn is_stale(&self, profile: u32, key: SuperKey) -> Option<bool> {
-        self.supers.get(&(profile, key)).map(|n| n.stale)
+        self.supers
+            .get(&(profile, key))
+            .map(|n| n.stale || n.foreign)
     }
 
     /// Level-3 edges leaving super-region `region` of super-sector `key`.

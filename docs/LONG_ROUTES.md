@@ -69,14 +69,19 @@ tiles when upgrading; older versions are rejected with
 `InvalidSnapshot(WrongVersion)`. A sector record includes sorted directed arcs,
 run-length polygon membership and, when stitched, outgoing region addresses. A
 stitched super-sector records directed local arcs and exits addressed by
-destination sector and region. Every stitched exit also carries the content id
-of the destination sector's summary (a fingerprint of its source tiles), and a
-super-sector record lists the content id of each of its sectors. Records from
-different bakes are detected where they are combined: a graph marks a
-super-sector stale when its record and resident summaries disagree on a summary
-version or a crossing names another content id, and `RouteIndex::build_exact`
-rejects exits whose destination record lists another content id. It also
-requires stitched records with resolved destinations.
+destination sector and region. Every stitched exit also carries the 64-bit
+content id of the destination sector's summary (a fingerprint of its source
+tiles), and a super-sector record lists the content id of each of its sectors.
+Decoding rejects a record whose exits name two content ids for one sector.
+Records from different bakes are detected where they are combined: a graph
+marks a super-sector stale while its record and resident summaries disagree on
+a summary version, while a crossing inside it names another content id, and
+while one of its exits lands in a sector whose own super-sector record lists
+another content id. `RouteIndex::build` rejects stale records, and
+`RouteIndex::build_exact` also rejects such exits and requires stitched records
+with resolved destinations. A partial re-bake therefore ends with fresh records
+once every summary of the new bake that names a changed sector is inserted, in
+any order.
 
 Individually collected tile batches produce isolated (unstitched) sector
 summaries. Their connectivity is estimated, not exact: facing portals join where

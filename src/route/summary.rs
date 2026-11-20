@@ -20,11 +20,11 @@ pub const SECTOR_VERSION: u16 = 3;
 pub const UNREACHABLE: u16 = 0xFFFF;
 
 const HEADER: usize = 44;
-const TILE: usize = 16;
+const TILE: usize = 20;
 const REGION: usize = 28;
 const PORTAL: usize = 36;
 const OFFMESH: usize = 32;
-const EXIT: usize = 16;
+const EXIT: usize = 20;
 /// Most transitions (portals plus off-mesh entries) of one sector; the cost table of
 /// a full sector is then 32 MiB.
 const MAX_TRANSITIONS: usize = 4096;
@@ -41,8 +41,8 @@ pub struct SectorTile {
     pub z: i32,
     /// Tile layer.
     pub layer: u8,
-    /// First four bytes (little-endian) of the tile bytes' content hash.
-    pub content_id: u32,
+    /// First eight bytes (little-endian) of the tile bytes' content hash.
+    pub content_id: u64,
 }
 
 /// A component connected by reciprocal polygon links inside a sector.
@@ -106,7 +106,7 @@ pub struct OffMeshEntry {
 /// sector x `i32`, z `i32`, tiles per sector `u16`, layers `u8`, padding `u8`, profile
 /// `u32`, tile, portal, region and off-mesh counts (`u16` each), quantum `f32`, climb
 /// `f32`, polygon count `u32`; then tiles (x `i32`, z `i32`, layer `u8`, 3 padding
-/// bytes, content id `u32`), regions (polygon count `u32`, bbox 6 x `f32`), portals
+/// bytes, content id `u64`), regions (polygon count `u32`, bbox 6 x `f32`), portals
 /// (side `u8`, split `u8`, region `u16`, pos 3 x `f32`, extent 2 x `f32`, y range 2 x
 /// `f32`, tile index `u16`, padding `u16`), off-mesh entries (region `u16`, flags `u8`
 /// with bit 0 = bidirectional, padding `u8`, start 3 x `f32`, far 3 x `f32`, tile index
@@ -114,7 +114,7 @@ pub struct OffMeshEntry {
 /// directed region pairs (two `u16`), polygon membership run starts (tile `u16`,
 /// polygon `u32`, region `u16`, with 65535 marking filtered or past-end), and
 /// stitched exits (from `u16`, sector x and z `i32`, to `u16`, destination
-/// [`content_id`](Self::content_id) `u32`). The final
+/// [`content_id`](Self::content_id) `u64`). The final
 /// `N x N` cost table is ordered by source row, then destination column.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectorSummary {
@@ -134,7 +134,33 @@ pub struct SectorSummary {
     membership: Vec<(u16, u32, u16)>,
     /// Stitched exits: source region, destination sector, destination region and
     /// the destination summary's [`content_id`](Self::content_id).
-    pub(super) exits: Option<Vec<(u16, SectorKey, u16, u32)>>,
+    pub(super) exits: Option<Vec<(u16, SectorKey, u16, u64)>>,
+    /// [`version`](Self::version), cached when the summary is built, decoded or
+    /// stitched (it is a function of the encoded bytes, which never change after).
+    pub(super) version: u32,
+}
+
+/// 32-bit FNV-1a of encoded record bytes (the summary version).
+pub(super) fn fingerprint(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(0x811c_9dc5u32, |h, &b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// Rejects stitched exits that name two content ids for one destination sector:
+/// a writer takes one summary per sector, so such a record mixes bakes.
+pub(super) fn unique_destination_contents(
+    exits: &[(u16, SectorKey, u16, u64)],
+) -> Result<(), Error> {
+    let mut seen: BTreeMap<(i32, i32), u64> = BTreeMap::new();
+    for &(_, k, _, c) in exits {
+        if *seen.entry((k.z, k.x)).or_insert(c) != c {
+            return Err(Error::InvalidInput(
+                "conflicting content ids for one sector",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn charge(budget: &mut Budget, n: u64) -> Result<(), Error> {
@@ -315,7 +341,9 @@ impl SectorSummary {
                 x,
                 z,
                 layer,
-                content_id: u32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]]),
+                content_id: u64::from_le_bytes([
+                    hash[0], hash[1], hash[2], hash[3], hash[4], hash[5], hash[6], hash[7],
+                ]),
             });
             tile_refs.push(t);
             slot_index.insert(slot, i);
@@ -748,6 +776,7 @@ impl SectorSummary {
             .collect();
         Ok(SectorSummary {
             key,
+            version: 0,
             tiles_per_sector: params.tiles_per_sector as u16,
             layers,
             profile,
@@ -762,7 +791,14 @@ impl SectorSummary {
             arcs,
             membership,
             exits: None,
-        })
+        }
+        .with_version())
+    }
+
+    /// Recomputes the cached [`version`](Self::version) after the encoded bytes changed.
+    pub(super) fn with_version(mut self) -> Self {
+        self.version = fingerprint(&self.to_bytes());
+        self
     }
 
     /// Looks up a passable polygon by stable tile coordinates, layer and polygon index.
@@ -809,16 +845,16 @@ impl SectorSummary {
     pub fn tiles(&self) -> &[SectorTile] {
         &self.tiles
     }
-    /// Fingerprint of the bake this summary's region numbering comes from: FNV-1a
-    /// over the sector key, sector size, profile and every source tile's coordinates
+    /// Fingerprint of the bake this summary's region numbering comes from: 64-bit
+    /// FNV-1a over the sector key, sector size, profile and every source tile's coordinates
     /// and content id. Stitched exits into this sector carry it, so records from
     /// different bakes are detected where they are combined. It excludes the
     /// summary's own exits, so it is defined before any sector is stitched.
-    pub fn content_id(&self) -> u32 {
-        let mut h = 0x811c_9dc5u32;
+    pub fn content_id(&self) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
         let mut eat = |bytes: &[u8]| {
             for &b in bytes {
-                h = (h ^ u32::from(b)).wrapping_mul(0x0100_0193);
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
             }
         };
         eat(&self.key.x.to_le_bytes());
@@ -906,7 +942,7 @@ impl SectorSummary {
             w.u8(t.layer);
             w.u8(0);
             w.u16(0);
-            w.u32(t.content_id);
+            w.u64(t.content_id);
         }
         for r in &self.regions {
             w.u32(r.polygon_count);
@@ -949,7 +985,7 @@ impl SectorSummary {
             w.i32(k.x);
             w.i32(k.z);
             w.u16(b);
-            w.u32(c);
+            w.u64(c);
         }
         for &c in &self.costs {
             w.u16(c);
@@ -963,7 +999,8 @@ impl SectorSummary {
     /// record version; [`Error::InvalidInput`] for a wrong magic, flags, padding,
     /// length, non-finite or unordered float, out-of-range index or side, a tile
     /// outside the sector, unsorted tiles, a portal whose tile is not on its side, a
-    /// self-loop exit, an exit into this sector with another content id, a nonzero
+    /// self-loop exit, an exit into this sector with another content id, exits
+    /// naming two content ids for one destination sector, a nonzero
     /// cost diagonal, or a finite cost between transitions the region arcs do not
     /// connect; [`Error::FormatLimit`] for more than 4,096 transitions;
     /// [`Error::LimitExceeded`] above `limits.max_bytes`, or when the connectivity
@@ -1013,7 +1050,7 @@ impl SectorSummary {
                 layer: r.u8()?,
                 content_id: {
                     r.pad(3)?;
-                    r.u32()?
+                    r.u64()?
                 },
             };
             let (tx, tz) = (i64::from(t.x), i64::from(t.z));
@@ -1141,7 +1178,7 @@ impl SectorSummary {
                     z: r.i32()?,
                 },
                 r.u16()?,
-                r.u32()?,
+                r.u64()?,
             );
             r.require(
                 usize::from(e.0) < nr
@@ -1150,6 +1187,7 @@ impl SectorSummary {
             )?;
             exits.push(e);
         }
+        unique_destination_contents(&exits)?;
         let mut costs = Vec::with_capacity(n * n);
         for i in 0..n * n {
             let c = r.u16()?;
@@ -1180,6 +1218,7 @@ impl SectorSummary {
             arcs,
             membership,
             exits,
+            version: fingerprint(data),
         };
         let own = summary.content_id();
         r.require(
@@ -1302,30 +1341,34 @@ mod direction_regression {
     #[test]
     fn super_regions_preserve_one_way_reachability() {
         // Two disjoint floors connected only from the first to the second.
-        let make = |x, offmesh| SectorSummary {
-            key: SectorKey { x, z: 0 },
-            tiles_per_sector: 1,
-            layers: 1,
-            profile: 0,
-            quantum: 1.0,
-            climb: 0.5,
-            polygon_count: 1,
-            tiles: vec![SectorTile {
-                x,
-                z: 0,
-                layer: 0,
-                content_id: 1,
-            }],
-            regions: vec![Region {
+        let make = |x, offmesh| {
+            SectorSummary {
+                key: SectorKey { x, z: 0 },
+                tiles_per_sector: 1,
+                layers: 1,
+                profile: 0,
+                quantum: 1.0,
+                climb: 0.5,
                 polygon_count: 1,
-                bbox: [x as f32, 0.0, 0.0, x as f32 + 0.8, 0.0, 0.8],
-            }],
-            portals: Vec::new(),
-            offmesh,
-            costs: vec![0],
-            arcs: vec![],
-            membership: vec![],
-            exits: None,
+                tiles: vec![SectorTile {
+                    x,
+                    z: 0,
+                    layer: 0,
+                    content_id: 1,
+                }],
+                regions: vec![Region {
+                    polygon_count: 1,
+                    bbox: [x as f32, 0.0, 0.0, x as f32 + 0.8, 0.0, 0.8],
+                }],
+                portals: Vec::new(),
+                offmesh,
+                costs: vec![0],
+                arcs: vec![],
+                membership: vec![],
+                exits: None,
+                version: 0,
+            }
+            .with_version()
         };
         let a = make(
             0,

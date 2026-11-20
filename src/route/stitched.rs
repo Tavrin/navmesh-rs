@@ -99,7 +99,7 @@ impl SectorGraph {
             }
         }
         // Exits name the destination summary's content id (defined before stitching).
-        let contents: BTreeMap<SectorKey, u32> = graph
+        let contents: BTreeMap<SectorKey, u64> = graph
             .sectors
             .iter()
             .map(|((_, key), s)| (*key, s.content_id()))
@@ -117,6 +117,7 @@ impl SectorGraph {
             exits.sort_unstable();
             exits.dedup();
             s.exits = Some(exits);
+            s.version = super::summary::fingerprint(&s.to_bytes());
         }
         let mut groups: BTreeMap<SuperKey, Vec<&SectorSummary>> = BTreeMap::new();
         for ((_, key), s) in &graph.sectors {
@@ -132,14 +133,16 @@ impl SectorGraph {
                 super::graph::SuperNode {
                     record,
                     stale: false,
+                    foreign: false,
                     edges: Vec::new(),
                 },
             );
         }
         for sk in graph.supers.keys().map(|p| p.1).collect::<Vec<_>>() {
-            let edges = graph.edges_of(profile, sk, &mut budget)?;
+            let (edges, foreign) = graph.edges_of(profile, sk, &mut budget)?;
             if let Some(node) = graph.supers.get_mut(&(profile, sk)) {
                 node.edges = edges;
+                node.foreign = foreign;
             }
         }
         graph.rebuild_inbound();
