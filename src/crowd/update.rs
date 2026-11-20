@@ -2,7 +2,6 @@
 //! per-agent arithmetic lives in `phases`, shared with the crowd world.
 use super::phases::{self, AvoidScratch};
 use super::*;
-use AgentState as S;
 
 impl Crowd {
     /// [`Crowd::update`] under a work budget (not in recastnavigation): the workspace's
@@ -75,17 +74,44 @@ impl Crowd {
         );
         let link_epoch = nav.runtime_links_changed_at();
         let links_changed = self.link_epoch != link_epoch;
-        for &i in &self.active {
+        let mut remaining = self.replan_limit;
+        if self.stamp_revalidation && nav.change_epoch() != self.replan_epoch {
+            self.pathq.revalidate_search(nav, self.replan_epoch);
+        }
+        for &i in replan::order(&self.active, self.replan_cursor) {
+            let before = remaining;
+            let handled = self.stamp_revalidation
+                && replan::revalidate(
+                    &mut self.agents[i],
+                    &mut q,
+                    &mut self.pathq,
+                    &self.filters,
+                    &self.extents,
+                    self.replan_epoch,
+                    &mut remaining,
+                )?;
+            if before != remaining && remaining == 0 {
+                self.replan_cursor = i as u32 + 1;
+            }
+            if handled {
+                continue;
+            }
             phases::check_path(
                 &mut self.agents[i],
                 &q,
                 &self.filters,
                 &self.extents,
                 dt,
-                links_changed,
+                !self.stamp_revalidation && links_changed,
             )?;
         }
         self.link_epoch = link_epoch;
+        if self.stamp_revalidation {
+            self.replan_epoch = nav.change_epoch();
+            if remaining != 0 {
+                self.replan_cursor = 0;
+            }
+        }
         phases::move_requests(
             &mut self.agents[..],
             &mut self.pathq,
@@ -128,7 +154,7 @@ impl Crowd {
         };
         for &i in &self.active {
             let a = &mut self.agents[i];
-            if a.state != S::Walking {
+            if !a.walking() {
                 continue;
             }
             phases::update_boundary(a, &mut q, &self.filters[a.params.query_filter_type])?;

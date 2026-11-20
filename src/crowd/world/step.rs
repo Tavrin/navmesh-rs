@@ -257,11 +257,47 @@ impl CrowdWorld {
             grid,
             active,
             link_epoch,
+            replan_epoch,
+            replan_limit,
+            replan_cursor,
             ..
         } = self;
         let (filters, presets) = (&*filters, &*presets);
         let (owner, heavy_of) = (&owner[..], &heavy_of[..]);
 
+        // Resume budgeted revalidation in agent-index order.
+        let mut q = NavMeshQuery::new(nav, 512)?;
+        let mut remaining = *replan_limit;
+        if nav.change_epoch() != *replan_epoch {
+            pathq.revalidate_search(nav, *replan_epoch);
+        }
+        for &i in replan::order(active, *replan_cursor) {
+            let a = &mut heavy[heavy_of[i] as usize];
+            let before = remaining;
+            if replan::revalidate(
+                a,
+                &mut q,
+                pathq,
+                filters,
+                extents,
+                *replan_epoch,
+                &mut remaining,
+            )? {
+                vel[i] = a.vel;
+                dvel[i] = a.dvel;
+            } else {
+                phases::check_path(a, &q, filters, extents, dt, false)?;
+            }
+            if before != remaining && remaining == 0 {
+                *replan_cursor = i as u32 + 1;
+            }
+        }
+        report.replans = *replan_limit - remaining;
+        if remaining != 0 {
+            *replan_cursor = 0;
+        }
+        *replan_epoch = nav.change_epoch();
+        *link_epoch = nav.runtime_links_changed_at();
         let any_parked = heavy.iter().any(CrowdAgent::parked);
         let mut parked = ws.vec(if any_parked { pos.len() } else { 0 }, false)?;
         for (a, &i) in heavy.iter().zip(owner.iter()) {
@@ -269,21 +305,6 @@ impl CrowdWorld {
                 parked[i as usize] = a.parked();
             }
         }
-        // Serial phases, in agent-index order.
-        let mut q = NavMeshQuery::new(nav, 512)?;
-        let epoch = nav.runtime_links_changed_at();
-        let links_changed = epoch != *link_epoch;
-        for &i in active.iter() {
-            phases::check_path(
-                &mut heavy[heavy_of[i] as usize],
-                &q,
-                filters,
-                extents,
-                dt,
-                links_changed,
-            )?;
-        }
-        *link_epoch = epoch;
         let mut slots = Slots {
             heavy: &mut heavy[..],
             heavy_of,
@@ -310,7 +331,7 @@ impl CrowdWorld {
         let view = View::of(pos, vel, dvel, radius, height, max_speed, &parked);
         let grid = &*grid;
         tally = tally.add(ctx.run(heavy, owner, |w, i, a| {
-            if a.state == AgentState::Walking {
+            if a.walking() {
                 phases::update_boundary(a, &mut w.q, &filters[a.params.query_filter_type])?;
                 let range = a.params.collision_query_range;
                 let cap = phases::prepare_neighbours(&mut w.ws, a, n)?;

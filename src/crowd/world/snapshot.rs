@@ -10,6 +10,8 @@
 //! starts with the arrival policy, distance and arrived flag, and ends with the
 //! external traversal mode, replan flag and optional pending traversal. The two
 //! legacy version 2 layouts each contain just one of these extensions.
+//! Version 4 adds the replan limit and cursor after the runtime-link epoch and each
+//! agent's deferred-replan bit and watched obstruction after its agent record.
 use super::*;
 use crate::SnapshotError as E;
 use crate::detour::Status;
@@ -18,6 +20,7 @@ const MAGIC: &[u8; 4] = b"DCRW";
 const BASE_VERSION: u32 = 1;
 const LEGACY_VERSION: u32 = 2;
 const EXTENDED_VERSION: u32 = 3;
+const REPLAN_VERSION: u32 = 4;
 
 #[derive(Clone, Copy)]
 struct AgentLayout {
@@ -411,7 +414,14 @@ impl CrowdWorld {
     /// The world as `'DCRW'` snapshot bytes (see the format in the module source).
     /// In-progress searches retain their node pool and heap for exact continuation.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let extended = self.link_epoch != 0
+        let replan = self.replan_limit != replan::DEFAULT_LIMIT
+            || self.replan_cursor != 0
+            || self
+                .heavy
+                .iter()
+                .any(|a| a.active && (a.pending_stamp_replan || a.blocked_poly != 0));
+        let extended = replan
+            || self.link_epoch != 0
             || self.heavy.iter().any(|a| {
                 a.active
                     && (a.params.off_mesh == OffMeshMode::External
@@ -425,7 +435,9 @@ impl CrowdWorld {
             arrival: extended,
             links: extended,
         };
-        let version = if extended {
+        let version = if replan {
+            REPLAN_VERSION
+        } else if extended {
             EXTENDED_VERSION
         } else {
             BASE_VERSION
@@ -439,6 +451,10 @@ impl CrowdWorld {
         o.u32(version);
         if layout.links {
             o.u64(self.link_epoch);
+        }
+        if version == REPLAN_VERSION {
+            o.u32(self.replan_limit);
+            o.u32(self.replan_cursor);
         }
         let p = &self.params;
         o.u32(p.max_agents);
@@ -481,7 +497,12 @@ impl CrowdWorld {
         }
         for &s in &self.heavy_of {
             if s != NONE {
-                write_agent(&mut o, &self.heavy[s as usize], layout);
+                let a = &self.heavy[s as usize];
+                write_agent(&mut o, a, layout);
+                if version == REPLAN_VERSION {
+                    o.u8(u8::from(a.pending_stamp_replan));
+                    o.r(a.blocked_poly);
+                }
             }
         }
         let q = &self.pathq;
@@ -505,28 +526,40 @@ impl CrowdWorld {
 
     /// Restores a world from untrusted `'DCRW'` bytes for agents on `nav`. Rejects
     /// malformed input with [`Error::InvalidSnapshot`]; `limits` bound the
-    /// restored world's allocation as in [`CrowdWorld::new`].
+    /// restored world's allocation as in [`CrowdWorld::new`]. Restore the
+    /// navmesh to the state it had at the snapshot's last completed crowd step.
     pub fn from_bytes(nav: &NavMesh, b: &[u8], limits: Limits) -> Result<Self, Error> {
         let mut i = In(b);
         if &i.take::<4>()? != MAGIC {
             return Err(Error::InvalidSnapshot(E::WrongMagic));
         }
-        let layout = match i.u32()? {
+        let version = i.u32()?;
+        let layout = match version {
             BASE_VERSION => AgentLayout {
                 arrival: false,
                 links: false,
             },
             LEGACY_VERSION => legacy_layout(i.0)?,
-            EXTENDED_VERSION => AgentLayout {
+            EXTENDED_VERSION | REPLAN_VERSION => AgentLayout {
                 arrival: true,
                 links: true,
             },
             _ => return Err(Error::InvalidSnapshot(E::WrongVersion)),
         };
         let link_epoch = if layout.links { i.u64()? } else { 0 };
+        let (replan_limit, replan_cursor) = if version == REPLAN_VERSION {
+            (i.u32()?, i.u32()?)
+        } else {
+            (replan::DEFAULT_LIMIT, 0)
+        };
         let p = read_world_params(&mut i)?;
+        if replan_cursor > p.max_agents {
+            return Err(bad("replan cursor"));
+        }
         let mut w = CrowdWorld::new(nav, &p, limits)?;
         w.link_epoch = link_epoch;
+        w.replan_limit = replan_limit;
+        w.replan_cursor = replan_cursor;
         w.set_fixes(UpstreamFixes::from_bits(i.u32()?).ok_or(bad("fixes"))?);
         for k in 0..16 {
             let mut f = DefaultFilter::default();
@@ -593,6 +626,16 @@ impl CrowdWorld {
             }
             let mut a = CrowdAgent::new_in(&mut ws)?;
             read_agent(&mut i, &mut a, n, p.max_radius, &mut ws, layout)?;
+            if version == REPLAN_VERSION {
+                a.pending_stamp_replan = i.flag("deferred replan")?;
+                a.blocked_poly = i.r()?;
+                if (a.pending_stamp_replan || a.blocked_poly != 0)
+                    && (a.target_ref == 0
+                        || matches!(a.target_state, TargetState::None | TargetState::Velocity))
+                {
+                    return Err(bad("replan target"));
+                }
+            }
             let s = w.heavy.len() as u32;
             w.heavy_of[k] = s;
             w.pos[k] = a.npos;

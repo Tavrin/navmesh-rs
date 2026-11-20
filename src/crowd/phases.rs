@@ -245,6 +245,7 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
         };
         if !a.active
             || a.state == S::Invalid
+            || a.pending_stamp_replan
             || a.pending_off_mesh.is_some()
             || matches!(a.target_state, T::None | T::Velocity)
         {
@@ -343,7 +344,11 @@ pub(super) fn move_requests<A: AgentSlots + ?Sized>(
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
-        if !a.active || a.pending_off_mesh.is_some() || a.target_state != T::WaitingForPath {
+        if !a.active
+            || a.pending_stamp_replan
+            || a.pending_off_mesh.is_some()
+            || a.target_state != T::WaitingForPath
+        {
             continue;
         }
         let status = pathq.status(a.pathq);
@@ -420,7 +425,7 @@ pub(super) fn optimize_topology<A: AgentSlots + ?Sized>(
         let Some(a) = agents.slot_mut(i) else {
             continue;
         };
-        if a.state != S::Walking
+        if !a.walking()
             || matches!(a.target_state, T::None | T::Velocity)
             || a.params.update_flags & OPTIMIZE_TOPO == 0
         {
@@ -533,7 +538,7 @@ pub(super) fn find_corners(
     q: &mut NavMeshQuery<'_>,
     filters: &[DefaultFilter; 16],
 ) -> Result<(), Error> {
-    if a.state != S::Walking || matches!(a.target_state, T::None | T::Velocity) {
+    if !a.walking() || matches!(a.target_state, T::None | T::Velocity) {
         return Ok(());
     }
     let f = &filters[a.params.query_filter_type];
@@ -548,38 +553,40 @@ pub(super) fn find_corners(
 
 /// Starts the off-mesh animation when the agent reached a connection's start.
 pub(super) fn trigger_offmesh(a: &mut CrowdAgent, q: &NavMeshQuery<'_>) {
-    if a.state != S::Walking || matches!(a.target_state, T::None | T::Velocity) {
+    if !a.walking() || matches!(a.target_state, T::None | T::Velocity) {
         return;
     }
     if let Some(c) = a.corners.last() {
         if c.flags & STRAIGHTPATH_OFFMESH_CONNECTION != 0
             && vdist_2d_sqr(&a.npos, &c.pos) < sqr(a.params.radius * 2.25)
         {
-            if a.params.off_mesh == OffMeshMode::External {
-                a.begin_external_off_mesh(q.nav(), c.r#ref);
-                return;
-            }
-            if let Ok((start, end, _)) = a.corridor.move_over_offmesh_connection(c.r#ref, q) {
-                a.anim = Animation {
-                    active: true,
-                    init: a.npos,
-                    start,
-                    end,
-                    t: 0.,
-                    tmax: (vdist_2d(&start, &end) / a.params.max_speed) * 0.5,
-                };
-                a.state = S::Offmesh;
-                a.corners.clear();
-                a.nneis = 0;
-            }
+            start_offmesh(a, q, c.r#ref);
         }
+    }
+}
+
+pub(super) fn start_offmesh(a: &mut CrowdAgent, q: &NavMeshQuery<'_>, poly: PolyRef) {
+    if a.params.off_mesh == OffMeshMode::External {
+        a.begin_external_off_mesh(q.nav(), poly);
+    } else if let Ok((start, end, _)) = a.corridor.move_over_offmesh_connection(poly, q) {
+        a.anim = Animation {
+            active: true,
+            init: a.npos,
+            start,
+            end,
+            t: 0.,
+            tmax: (vdist_2d(&start, &end) / a.params.max_speed) * 0.5,
+        };
+        a.state = S::Offmesh;
+        a.corners.clear();
+        a.nneis = 0;
     }
 }
 
 /// Desired velocity and speed from corners (or the requested velocity) plus
 /// separation; `None` when the agent does not steer this tick.
 pub(super) fn steer<V: AgentsView + ?Sized>(a: &CrowdAgent, others: &V) -> Option<(V3, f32)> {
-    if a.state != S::Walking || a.target_state == T::None {
+    if !a.walking() || a.target_state == T::None {
         return None;
     }
     let mut dvel = [0.; 3];
@@ -664,7 +671,7 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
     presets: &[ObstacleAvoidanceParams; 8],
     s: &mut AvoidScratch<'_>,
 ) -> Result<Option<(V3, usize)>, Error> {
-    if a.state != S::Walking {
+    if !a.walking() {
         return Ok(None);
     }
     let mut samples = 0;
@@ -736,7 +743,7 @@ pub(super) fn avoid<V: AgentsView + ?Sized>(
 
 /// Acceleration-limited velocity and the integrated position.
 pub(super) fn integrate(a: &mut CrowdAgent, dt: f32) {
-    if a.state != S::Walking {
+    if !a.walking() {
         return;
     }
     let max = a.params.max_acceleration * dt;
@@ -765,7 +772,7 @@ pub(super) fn collision_displacement<V: AgentsView + ?Sized>(
     a: &CrowdAgent,
     others: &V,
 ) -> Option<V3> {
-    if a.state != S::Walking {
+    if !a.walking() {
         return None;
     }
     let mut disp = [0.; 3];
@@ -802,7 +809,7 @@ pub(super) fn collision_displacement<V: AgentsView + ?Sized>(
 
 /// Applies the displacement stored by the last collision iteration.
 pub(super) fn apply_displacement(a: &mut CrowdAgent) {
-    if a.state == S::Walking {
+    if a.walking() {
         a.npos = vadd(&a.npos, &a.disp);
     }
 }
@@ -813,7 +820,7 @@ pub(super) fn move_on_mesh(
     q: &mut NavMeshQuery<'_>,
     filters: &[DefaultFilter; 16],
 ) -> Result<(), Error> {
-    if a.state != S::Walking {
+    if !a.walking() {
         return Ok(());
     }
     // Upstream keeps the corridor position if the local move fails.

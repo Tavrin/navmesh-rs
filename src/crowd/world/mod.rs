@@ -4,8 +4,9 @@
 //!
 //! [`CrowdWorld`] runs the same per-agent phase arithmetic as [`Crowd`] in the same
 //! phase order. Every agent simulated in full gets the result [`Crowd`] gives with
-//! [`UpstreamFixes::NEAREST_NEIGHBOURS`] for the same inputs, bit for bit, as long as
-//! agents are added in the same order (both take the lowest free index).
+//! [`UpstreamFixes::NEAREST_NEIGHBOURS`] for the same inputs on an unchanged
+//! navmesh, bit for bit, when agents are added in the same order (both take
+//! the lowest free index).
 //!
 //! Hot per-agent fields (position, velocities, dimensions, generation) live in
 //! arrays indexed by agent index; corridor, walls, corners and neighbours live in a
@@ -14,8 +15,8 @@
 //! arrays, which a phase never writes; each agent writes only its own pool entry,
 //! and the arrays are refreshed between phases. With the `parallel` feature these
 //! phases run on the current rayon pool, and the result does not depend on the
-//! number of threads. Path checks, path requests, the path queue and the one
-//! topology optimisation per step stay serial, in agent-index order.
+//! number of threads. Stamp revalidation, path requests, the path queue and the
+//! one topology optimisation per step stay serial.
 //!
 //! Each [`CrowdWorld::step`] charges its work to a [`Budget`] before simulating, by
 //! active agent rather than by capacity: [`STEP_WORK_PER_AGENT`] units per simulated
@@ -167,6 +168,8 @@ pub struct StepReport {
     pub path_queue_depth: u32,
     /// Velocities sampled by sampled-mode avoidance.
     pub velocity_samples: u64,
+    /// Stamp-triggered replans admitted this step, including failed searches.
+    pub replans: u32,
 }
 
 /// Read access to one agent.
@@ -245,6 +248,9 @@ pub struct CrowdWorld {
     grid: CellGrid,
     active: Vec<usize>,
     link_epoch: u64,
+    replan_epoch: u64,
+    replan_limit: u32,
+    replan_cursor: u32,
 }
 
 impl CrowdWorld {
@@ -287,7 +293,16 @@ impl CrowdWorld {
             grid: CellGrid::new(r * 3.),
             active: Vec::new(),
             link_epoch: nav.runtime_links_changed_at(),
+            replan_epoch: nav.change_epoch(),
+            replan_limit: replan::DEFAULT_LIMIT,
+            replan_cursor: 0,
         })
+    }
+    /// Caps stamp-triggered replans per step. Admission resumes in handle-index
+    /// order after the last admitted agent when this cap is filled.
+    /// The default limit is 1,024.
+    pub fn set_replan_limit(&mut self, limit: u32) {
+        self.replan_limit = limit;
     }
     /// The configuration the world was created with.
     pub fn params(&self) -> &CrowdWorldParams {
