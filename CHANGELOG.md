@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-20
+
 ### Added
 
 - `Selector::DetailPrism` selects ground polygons by intersection with their
@@ -18,6 +20,11 @@ All notable changes to this project are documented in this file. The format foll
   accept caller flag and area writes subject to modifier ownership. Saving a layer
   with a caller base override or detail selector emits version 2.
   See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
+
+### Fixed
+
+- `cargo clippy --no-default-features --features route,libm` is warning-free.
+  No behaviour change.
 
 ## [0.2.3] - 2026-11-20
 
@@ -517,7 +524,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.0...v0.2.1
