@@ -291,7 +291,7 @@ impl Modifiers {
             .is_some_and(|polys| self.apply(tile, slot, polys.keys().copied()))
     }
 
-    fn advance(&mut self) -> u64 {
+    pub(super) fn advance(&mut self) -> u64 {
         self.epoch = self.epoch.saturating_add(1);
         self.epoch
     }
@@ -322,6 +322,7 @@ impl NavMesh {
         }
 
         let stamp = self.modifiers.advance();
+        let change = self.advance_change_epoch();
         for (_, _, _, ti) in dirty.into_keys() {
             let previous = old.get(&ti).into_iter().flat_map(|p| p.keys().copied());
             let current = self
@@ -337,6 +338,7 @@ impl NavMesh {
                 && self.modifiers.apply(tile, ti, previous.chain(added))
             {
                 slot.state_stamp = stamp;
+                slot.change_stamp = change;
             }
         }
     }
@@ -397,12 +399,14 @@ impl NavMesh {
 
     fn apply_modifier_edit(&mut self, dirty: BTreeMap<Location, Vec<usize>>) {
         let stamp = self.modifiers.advance();
+        let change = self.advance_change_epoch();
         for ((_, _, _, ti), polys) in dirty {
             let slot = &mut self.slots[ti];
             if let Some(tile) = slot.tile.as_deref_mut()
                 && self.modifiers.apply(tile, ti, polys)
             {
                 slot.state_stamp = stamp;
+                slot.change_stamp = change;
             }
         }
     }
@@ -420,12 +424,14 @@ impl NavMesh {
             return Ok(false);
         }
         let stamp = self.modifiers.advance();
+        let change = self.advance_change_epoch();
         for ((_, _, _, ti), polys) in self.modifiers.by_modifier.get(&id).into_iter().flatten() {
             let slot = &mut self.slots[*ti];
             if let Some(tile) = slot.tile.as_deref_mut()
                 && self.modifiers.apply(tile, *ti, polys.iter().copied())
             {
                 slot.state_stamp = stamp;
+                slot.change_stamp = change;
             }
         }
         Ok(true)
@@ -539,10 +545,6 @@ impl NavMesh {
                 "polygon state is governed by modifiers",
             ))
         }
-    }
-
-    pub(super) fn stamp_state(&mut self, ti: usize) {
-        self.slots[ti].state_stamp = self.modifiers.advance();
     }
 
     /// Floods the resident directed links using current polygon flags and areas.

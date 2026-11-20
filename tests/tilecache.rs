@@ -519,23 +519,32 @@ fn rebuilds_replace_in_place_and_identical_bytes_can_keep_refs_and_flags() {
         let first = n.tile_ref(n.tile_index_at(0, 0, 0).unwrap());
         n.set_poly_flags(first, 5).unwrap();
         let (epoch, headroom) = (n.epoch(), n.salt_headroom(key, 0).unwrap());
+        let change = n.change_epoch();
         c.build_nav_mesh_tile(r, &mut n).unwrap();
         let again = n.tile_ref(n.tile_index_at(0, 0, 0).unwrap());
         if keep {
             assert_eq!(again, first);
             assert_eq!((n.poly_flags(first), n.epoch()), (Ok(5), epoch));
+            assert_eq!(n.change_epoch(), change);
         } else {
             // Upstream's behaviour: identical bytes still advance the salt.
             assert_eq!(n.ref_state(first), RefState::Stale);
             assert_eq!(n.salt_headroom(key, 0), Some(headroom - 1));
             assert_ne!(n.poly_flags(again), Ok(5), "flags come from the bytes");
+            assert!(n.tile_change_stamp(again).unwrap() > change);
         }
         // One obstacle added and removed: exactly two more salt advances.
         let headroom = n.salt_headroom(key, 0).unwrap();
+        let change = n.change_epoch();
         let o = c.add_obstacle(cylinder(4.0)).unwrap();
         drain(&mut c, &mut n);
+        let carved = n.tile_ref(n.tile_index_at(0, 0, 0).unwrap());
+        let carved_stamp = n.tile_change_stamp(carved).unwrap();
+        assert!(carved_stamp > change);
         c.remove_obstacle(o).unwrap();
         drain(&mut c, &mut n);
+        let rebuilt = n.tile_ref(n.tile_index_at(0, 0, 0).unwrap());
+        assert!(n.tile_change_stamp(rebuilt).unwrap() > carved_stamp);
         assert_eq!(n.salt_headroom(key, 0), Some(headroom - 2));
         assert_eq!(n.ref_state(again), RefState::Stale);
     }

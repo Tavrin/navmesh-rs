@@ -138,7 +138,7 @@ impl GoalSlots {
 pub(super) fn finish_arrival(a: &mut CrowdAgent) -> bool {
     if a.params.arrival_policy == ArrivalPolicy::Keep
         || a.arrived
-        || a.state != AgentState::Walking
+        || !a.walking()
         || a.target_state != TargetState::Valid
         || a.partial
         || a.corridor.last_poly() != a.target_ref
