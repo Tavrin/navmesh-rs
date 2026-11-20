@@ -6,8 +6,7 @@
 //! Layout: one mode byte (bits 0-1: record kind, 0 to 2), then the record or the patches.
 //!
 //! Properties: no reader panics; an accepted slot history or reference is saved back byte for
-//! byte; an accepted crowd's re-encoding is a fixed point (the input itself may differ because
-//! the embedded crowd reader normalises some accepted values) and steps under a budget.
+//! byte; so is an accepted crowd, which then steps under a budget.
 use libfuzzer_sys::fuzz_target;
 use navmesh_fuzz::persisted::{self, LARGE, LIMITS};
 use navmesh_rs::Budget;
@@ -50,13 +49,7 @@ fuzz_target!(|data: &[u8]| {
                 }
                 _ => {
                     if let Ok(mut world) = ProfileCrowdWorld::restore(installed, &bytes, LIMITS) {
-                        // The embedded crowd reader normalises some accepted values, so the
-                        // re-encoding, not the input, is the fixed point.
-                        let once = world.save(installed).unwrap_or_default();
-                        let Ok(second) = ProfileCrowdWorld::restore(installed, &once, LIMITS) else {
-                            panic!("re-encoded record is rejected");
-                        };
-                        assert_eq!(second.save(installed).ok().as_deref(), Some(&once[..]));
+                        assert_eq!(world.save(installed).ok().as_deref(), Some(&bytes[..]));
                         let _ = world.step(installed, &mut Budget::new(100_000));
                     }
                 }

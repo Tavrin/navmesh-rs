@@ -36,6 +36,30 @@ pub fn repaired(mut bytes: Vec<u8>) -> Vec<u8> {
     bytes
 }
 
+/// Whether `saved` is `input` with only mesh-epoch words lowered. A crowd snapshot restored
+/// onto a mesh whose epoch is behind the stored one rebinds that word to the live epoch, so
+/// the re-encoding differs from the input in exactly those little-endian `u64` words.
+pub fn rebinds_only_epochs(saved: &[u8], input: &[u8]) -> bool {
+    if saved.len() != input.len() {
+        return false;
+    }
+    let word = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap_or([0; 8]));
+    let mut i = 0;
+    while i < saved.len() {
+        if saved[i] == input[i] {
+            i += 1;
+            continue;
+        }
+        let Some(at) = (i.saturating_sub(7)..=i)
+            .find(|&t| t + 8 <= saved.len() && word(saved, t) < word(input, t))
+        else {
+            return false;
+        };
+        i = at + 8;
+    }
+    true
+}
+
 /// Applies byte patches to a valid record. `patches` is one window byte (0: the whole
 /// body, 1: the first 64 bytes, 2: the last 160 bytes) and then 3-byte patches
 /// `[position lo, position hi, value]` inside the window. With `rehash` the last 32
