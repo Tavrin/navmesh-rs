@@ -16,6 +16,10 @@ mod detail;
 // DSTM writes zero padding. Streaming state can use that byte to identify
 // caller values that were not derived from an installed modifier layer.
 pub(super) const DIRECT_BASE_PAD: u8 = 1;
+// A polygon the layer managed when its state was stored: the stored flags and
+// area are effective values, not caller values. A restore ignores them and
+// derives the polygon from the layer it then has, over the saved base.
+pub(super) const MANAGED_PAD: u8 = 2;
 
 type Location = (i32, i32, i32, usize);
 type Polygons = BTreeMap<usize, Vec<ModifierId>>;
@@ -326,6 +330,11 @@ impl Modifiers {
             .get(&slot)
             .zip(self.layer.as_ref())
             .map_or_else(BaseState::default, |(&key, layer)| layer.base(key, ip))
+    }
+
+    /// The padding byte `store_tile_state` writes for polygon `ip` of `slot`.
+    pub(super) fn state_pad(&self, slot: usize, ip: usize) -> u8 {
+        u8::from(self.manages_state(slot, ip)) * MANAGED_PAD
     }
 
     pub(super) fn manages_state(&self, slot: usize, ip: usize) -> bool {

@@ -1,7 +1,7 @@
 #![cfg(feature = "dynamic")]
 
 use navmesh_rs::detour::{
-    DefaultFilter, NavMesh, NavMeshCreateParams, NavMeshParams, create_nav_mesh_data_f32,
+    DefaultFilter, NavMesh, NavMeshCreateParams, NavMeshParams, PolyRef, create_nav_mesh_data_f32,
     prepare_tile,
 };
 use navmesh_rs::dynamic::{DynamicLayer, Effect, ModifierId, ModifierSpec, Selector};
@@ -371,4 +371,161 @@ fn replacing_or_removing_content_reclaims_the_base_edit_budget() {
     assert!(!nav.remove_poly_base_edit(&edit));
     assert_eq!(nav.poly_base_flags(poly), Ok(1));
     assert_eq!(nav.poly_flags(poly), Ok(0));
+}
+
+/// Two identical meshes holding one gated raised tile; `edit` runs on both
+/// (tile ref as argument), then the first mesh saves the tile's state: by
+/// unloading the tile (`unload`) or with `store_tile_state` on the resident
+/// tile. `parked` runs on both while the state is saved, then the first mesh
+/// takes the saved state back (`commit_with_state` or `restore_tile_state`).
+/// The second mesh never saves anything and is the control.
+fn parked_round_trip(
+    unload: bool,
+    edit: impl Fn(&mut NavMesh, PolyRef),
+    parked: impl Fn(&mut NavMesh),
+) -> ((NavMesh, PolyRef), (NavMesh, PolyRef)) {
+    let build = || {
+        let mut nav = mesh();
+        nav.set_dynamic_layer(Some(closed_gate(detail_prism(0.75, 1.25))));
+        let r = nav.add_tile(tile(0, true)).unwrap();
+        (nav, r)
+    };
+    let (mut nav, r) = build();
+    let (mut control, control_r) = build();
+    edit(&mut nav, r);
+    edit(&mut control, control_r);
+    if unload {
+        let unloaded = nav.unload_tile(r).unwrap();
+        parked(&mut nav);
+        parked(&mut control);
+        let prepared = prepare_tile(nav.params(), nav.limits(), unloaded.bytes).unwrap();
+        assert_eq!(nav.commit_with_state(prepared, &unloaded.state), Ok(r));
+    } else {
+        let mut state = vec![0; nav.tile_state_size(r).unwrap()];
+        nav.store_tile_state(r, &mut state).unwrap();
+        parked(&mut nav);
+        parked(&mut control);
+        nav.restore_tile_state(r, &state).unwrap();
+    }
+    ((nav, r), (control, control_r))
+}
+
+fn assert_matches_control(
+    (nav, r): &(NavMesh, PolyRef),
+    (control, control_r): &(NavMesh, PolyRef),
+    flags: u16,
+    area: u8,
+) {
+    assert_eq!(nav.poly_flags(*r), control.poly_flags(*control_r));
+    assert_eq!(nav.poly_area(*r), control.poly_area(*control_r));
+    assert_eq!(nav.poly_base_flags(*r), control.poly_base_flags(*control_r));
+    assert_eq!(nav.poly_base_area(*r), control.poly_base_area(*control_r));
+    assert_eq!(nav.poly_flags(*r), Ok(flags));
+    assert_eq!(nav.poly_area(*r), Ok(area));
+}
+
+#[test]
+fn gate_opened_while_unloaded_reloads_open() {
+    for unload in [true, false] {
+        let (a, b) = parked_round_trip(
+            unload,
+            |_, _| {},
+            |nav| {
+                nav.set_modifier_enabled(GATE, false).unwrap();
+            },
+        );
+        assert_matches_control(&a, &b, 1, 1);
+    }
+}
+
+#[test]
+fn gate_removed_while_unloaded_reloads_open() {
+    for unload in [true, false] {
+        let (a, b) = parked_round_trip(
+            unload,
+            |_, _| {},
+            |nav| {
+                assert!(nav.remove_modifier(GATE));
+            },
+        );
+        assert_matches_control(&a, &b, 1, 1);
+    }
+}
+
+#[test]
+fn gate_moved_off_the_tile_while_unloaded_reloads_open() {
+    for unload in [true, false] {
+        let (a, b) = parked_round_trip(
+            unload,
+            |_, _| {},
+            |nav| {
+                let moved =
+                    ModifierSpec::new(GATE, detail_prism(5.0, 6.0), Effect::ClearFlags(u16::MAX));
+                nav.upsert_modifier(moved).unwrap();
+            },
+        );
+        assert_matches_control(&a, &b, 1, 1);
+    }
+}
+
+#[test]
+fn gate_closed_while_unloaded_reloads_closed() {
+    for unload in [true, false] {
+        let (a, b) = parked_round_trip(
+            unload,
+            |nav, _| {
+                nav.set_modifier_enabled(GATE, false).unwrap();
+            },
+            |nav| {
+                nav.set_modifier_enabled(GATE, true).unwrap();
+            },
+        );
+        assert_matches_control(&a, &b, 0, 1);
+    }
+}
+
+#[test]
+fn caller_overrides_survive_a_round_trip_under_and_after_the_gate() {
+    let edit = |nav: &mut NavMesh, r| {
+        // An enabled gate owns every flag bit, so the flag edit is made before it.
+        nav.set_modifier_enabled(GATE, false).unwrap();
+        nav.set_poly_flags(r, 5).unwrap();
+        nav.set_poly_area(r, 7).unwrap();
+        nav.set_modifier_enabled(GATE, true).unwrap();
+    };
+    for unload in [true, false] {
+        // Gate kept: the gate still owns every flag bit, the caller's area stays.
+        let (a, b) = parked_round_trip(unload, edit, |_| {});
+        assert_matches_control(&a, &b, 0, 7);
+        assert_eq!(a.0.poly_base_flags(a.1), Ok(5));
+        // Gate removed while unloaded: the caller's values show through.
+        let (a, b) = parked_round_trip(unload, edit, |nav| {
+            assert!(nav.remove_modifier(GATE));
+        });
+        assert_matches_control(&a, &b, 5, 7);
+    }
+}
+
+#[test]
+fn changed_content_reloads_with_its_own_baked_values() {
+    let (mut nav, r) = {
+        let mut nav = mesh();
+        nav.set_dynamic_layer(Some(closed_gate(detail_prism(0.75, 1.25))));
+        let r = nav.add_tile(tile(0, true)).unwrap();
+        (nav, r)
+    };
+    nav.set_poly_flags(r, 5).unwrap();
+    nav.set_poly_area(r, 7).unwrap();
+    let unloaded = nav.unload_tile(r).unwrap();
+    assert!(nav.remove_modifier(GATE));
+    let changed = tile_variant(0, true, 1);
+    let prepared = prepare_tile(nav.params(), nav.limits(), changed).unwrap();
+    // The saved state names the old content, so only a plain commit is possible.
+    assert!(
+        nav.commit_with_state(prepared.clone(), &unloaded.state)
+            .is_err()
+    );
+    let r2 = nav.commit(prepared).unwrap();
+    assert_eq!(nav.poly_flags(r2), Ok(1));
+    assert_eq!(nav.poly_area(r2), Ok(1));
 }

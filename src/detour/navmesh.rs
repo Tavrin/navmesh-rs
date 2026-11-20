@@ -1290,7 +1290,11 @@ impl NavMesh {
     /// and area. It is bound to the tile's current ref, so it can be restored only
     /// into the same tile incarnation, not after the tile was removed and added
     /// again. The blob is little-endian; polygon entries are `u16` flags, `u8` area
-    /// and a zero pad byte (upstream leaves the pad uninitialised).
+    /// and a pad byte (upstream leaves the pad uninitialised). The pad is 0 for an
+    /// ordinary polygon and 2 for a polygon the modifier layer manages, whose
+    /// stored values are effective ones: a restore leaves those polygons as the
+    /// current layer derives them. [`NavMesh::unload_tile`] also writes 1 for an
+    /// unmanaged polygon with caller edits.
     /// [`Error::BufferTooSmall`] when `out` is shorter than the state.
     pub fn store_tile_state(&self, tile: TileRef, out: &mut [u8]) -> Result<usize, Error> {
         let size = self.tile_state_size(tile)?;
@@ -1298,6 +1302,8 @@ impl NavMesh {
             return Err(Error::BufferTooSmall);
         }
         let t = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?;
+        #[cfg(feature = "dynamic")]
+        let slot = self.decode_poly_id(tile).1 as usize;
         out[0..4].copy_from_slice(&NAVMESH_STATE_MAGIC.to_le_bytes());
         let version = if self.has_explicit_layout() {
             2
@@ -1306,14 +1312,23 @@ impl NavMesh {
         };
         out[4..8].copy_from_slice(&version.to_le_bytes());
         out[8..TILE_STATE_HEADER_SIZE].copy_from_slice(&tile.to_le_bytes());
-        for (p, s) in t
+        for (ip, (p, s)) in t
             .polys
             .iter()
             .zip(out[TILE_STATE_HEADER_SIZE..size].chunks_exact_mut(TILE_POLY_STATE_SIZE))
+            .enumerate()
         {
             s[0..2].copy_from_slice(&p.flags.to_le_bytes());
             s[2] = p.area();
-            s[3] = 0;
+            #[cfg(feature = "dynamic")]
+            {
+                s[3] = self.modifiers.state_pad(slot, ip);
+            }
+            #[cfg(not(feature = "dynamic"))]
+            {
+                let _ = ip;
+                s[3] = 0;
+            }
         }
         if self.has_explicit_layout() {
             let l = self.ref_layout();
@@ -1349,14 +1364,16 @@ impl NavMesh {
             .get_mut(ti)
             .and_then(|s| s.tile.as_deref_mut())
             .ok_or(Error::InvalidRef)?;
-        if stream::apply_state(tile, data, size, |ip| {
+        // Entries marked as managed hold effective values: the tile already
+        // derives those polygons from the current layer over the caller base.
+        if stream::apply_state(tile, data, size, |ip, pad| {
             #[cfg(feature = "dynamic")]
             {
-                self.modifiers.manages_state(ti, ip)
+                pad == modifiers::MANAGED_PAD || self.modifiers.manages_state(ti, ip)
             }
             #[cfg(not(feature = "dynamic"))]
             {
-                let _ = ip;
+                let _ = (ip, pad);
                 false
             }
         }) {
