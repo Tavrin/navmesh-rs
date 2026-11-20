@@ -159,6 +159,25 @@ impl GridLayout {
         Ok(layout)
     }
 
+    /// Sets an explicit bake border, at least the native radius plus padding
+    /// and any enabled link-extraction reach. The interior tile grid is unchanged.
+    pub fn with_halo_cells(mut self, cfg: &BakeConfig, cells: i32) -> Result<Self, Error> {
+        super::validate_config(cfg)?;
+        self.halo_cells = cells;
+        self.halo = cells as f32 * cfg.recast.cs;
+        self.validate(cfg)?;
+        // The extrema cover the inclusive fetch bounds of all columns.
+        self.tile_config(cfg, TileKey { x: 0, z: 0 })?;
+        self.tile_config(
+            cfg,
+            TileKey {
+                x: self.tiles_x - 1,
+                z: self.tiles_z - 1,
+            },
+        )?;
+        Ok(self)
+    }
+
     /// The layout [`tiles`](super::tiles) would use for `input`, so a job over
     /// `input` returns the same tiles.
     ///

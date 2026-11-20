@@ -94,6 +94,8 @@ SHA-256 checksum of the preceding bytes. Unknown versions return
 - `DCFR` version 1 stores magic, a `u32` version, a SHA-256 binding of the
   frame snapshot, and `u64` crowd, rider and wait counts. Each crowd entry is
   a `u32` frame id and a `u64` byte length followed by its `DCRW` snapshot.
+  Each local crowd uses the shared base or extended
+  [crowd snapshot layout](BAKE-PROFILES.md#on-disk-bindings).
   A rider entry is a `u64` stable id, three `u32` values for the frame,
   native slot and generation, and a goal byte. If the byte is 1, a `u32`
   goal frame id and three position floats follow. A wait entry is a

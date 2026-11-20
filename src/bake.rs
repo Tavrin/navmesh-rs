@@ -38,6 +38,7 @@ pub use links::{ExtractedLink, LinkExtraction, LinkKind, LinkLimits};
 mod install;
 mod job;
 mod manifest;
+pub mod profiles;
 mod source;
 mod task;
 

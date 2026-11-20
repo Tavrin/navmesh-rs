@@ -8,6 +8,9 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Added
 
+- Independent agent-size bake profiles with checked tile halos, versioned
+  catalogs, and profile-bound streaming, queries, connectivity and crowds.
+  See [Agent-size bake profiles](docs/BAKE-PROFILES.md).
 - Moving platform frames with yaw-only poses, runtime docks, cross-frame
   routes, and stable riders for both crowds. Frame and framed crowd snapshots
   restore dock availability and riders in transit. See
