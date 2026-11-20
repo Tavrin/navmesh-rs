@@ -1,5 +1,6 @@
 //! Shared scheduling of abstract searches and live corridor windows.
 use super::portal_window::PortalWindow;
+use super::search::CoarseBuffers;
 use super::stitched::Crossing;
 use super::{
     CoarseSearch, CorridorWindow, RegionKey, RouteIndex, SectorGraph, SectorKey, WindowPoint,
@@ -382,6 +383,8 @@ struct WindowPlan {
 struct Request<'a> {
     priority: u8,
     coarse: Option<CoarseSearch<'a>>,
+    /// Label arrays of the finished coarse search, returned to the scheduler.
+    coarse_done: Option<CoarseBuffers>,
     corridor: BTreeSet<RegionKey>,
     coarse_cursor: usize,
     start: WindowPoint,
@@ -451,7 +454,7 @@ impl<'a> Request<'a> {
                     self.coarse_cursor += 1;
                 }
                 if self.coarse_cursor == path.len() {
-                    self.coarse = None;
+                    self.coarse_done = self.coarse.take().map(CoarseSearch::into_buffers);
                 }
             }
             return Ok(());
@@ -836,6 +839,9 @@ pub struct Navigator<'a> {
     next: u64,
     nodes: usize,
     epoch: u64,
+    /// Label arrays of finished coarse searches, reused by later requests (at
+    /// most one per request that searched at the same time).
+    coarse_buffers: Vec<CoarseBuffers>,
 }
 impl<'a> Navigator<'a> {
     /// Creates a scheduler with a bounded Detour node pool per active window.
@@ -863,6 +869,7 @@ impl<'a> Navigator<'a> {
             next: 0,
             nodes,
             epoch: atlas.epoch,
+            coarse_buffers: Vec::new(),
         })
     }
     /// Queues a route between polygons captured in the atlas.
@@ -894,9 +901,10 @@ impl<'a> Navigator<'a> {
         }
         let region = self.atlas.region(nav, start.polygon)?;
         let destination = self.atlas.region(nav, goal.polygon)?;
-        let coarse = self.atlas.coarse.request(
+        let coarse = self.atlas.coarse.request_reusing(
             self.atlas.coarse_key(region)?,
             self.atlas.coarse_key(destination)?,
+            self.coarse_buffers.pop().unwrap_or_default(),
         )?;
         let id = RequestId(self.next);
         self.next = self.next.checked_add(1).ok_or(Error::SizeOverflow)?;
@@ -905,6 +913,7 @@ impl<'a> Navigator<'a> {
             Request {
                 priority,
                 coarse: Some(coarse),
+                coarse_done: None,
                 corridor: BTreeSet::new(),
                 coarse_cursor: 0,
                 start,
@@ -1090,6 +1099,9 @@ impl<'a> Navigator<'a> {
             }
         }
         budget.spend(slice.used());
+        if let Some(buffers) = r.coarse_done.take() {
+            self.coarse_buffers.push(buffers);
+        }
         if r.state == RouteState::Planning {
             self.ready
                 .entry((r.published, Reverse(r.priority)))
@@ -1165,7 +1177,13 @@ impl<'a> Navigator<'a> {
             queue.retain(|k| *k != id);
             !queue.is_empty()
         });
-        self.requests.remove(&id).is_some()
+        let Some(r) = self.requests.remove(&id) else {
+            return false;
+        };
+        if let Some(buffers) = r.coarse.map(CoarseSearch::into_buffers).or(r.coarse_done) {
+            self.coarse_buffers.push(buffers);
+        }
+        true
     }
 }
 

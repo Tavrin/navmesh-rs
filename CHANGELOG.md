@@ -124,7 +124,10 @@ All notable changes to this project are documented in this file. The format foll
   smaller than the largest sector, binds the atlas to the whole filter, clears
   every request when `update` sees an invalidating edit, fails only the affected
   requests when `sync` finds an unloaded tile, and keeps label costs finite at
-  huge coordinates. Unstitched indexes are documented as hints. New fuzz targets
+  huge coordinates, and recycles finished coarse searches' label arrays instead
+  of freeing them inside an update slice, where the allocator could return heap
+  memory to the system at several times the slice's cost. Unstitched indexes
+  are documented as hints. New fuzz targets
   `sector_summary` and `super_record`.
 - Shared point goals can use mesh-checked goal slots and optional park or remove
   arrival policies in both crowd managers, preventing congestion at one destination.
