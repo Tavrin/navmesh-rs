@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-21
+
 ### Fixed
 
 - Saving a tile's state and restoring it, by unloading and reloading the tile or
@@ -536,7 +538,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.1...v0.2.2
