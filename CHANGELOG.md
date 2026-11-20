@@ -16,6 +16,40 @@ All notable changes to this project are documented in this file. The format foll
   jump clearance, and legacy links take precedence over duplicate steps.
   See [extended bake links](docs/BAKED-TRAVERSAL.md).
 
+## [0.2.5] - 2026-11-21
+
+### Fixed
+
+- Saving a tile's state and restoring it, by unloading and reloading the tile or
+  by `store_tile_state` and `restore_tile_state` on a loaded tile, no longer
+  brings back the effect of a gate that was opened, removed or moved in between.
+  Polygons a gate layer manages are now marked in the state's padding byte
+  (value 2) and take their flags and areas from the layer at restore time, over
+  the caller's own values. Padding values are 0 (ordinary), 1 (caller-edited
+  polygon in an unload state) and 2 (managed). States written by earlier
+  versions carry 0 there and load as before, with their stored values applied.
+  Version 0.2.4 and older readers ignore value 2 and apply the stored values.
+
+## [0.2.4] - 2026-11-20
+
+### Added
+
+- `Selector::DetailPrism` selects ground polygons by intersection with their
+  Detour detail triangles, including sloped-face contact within roundoff.
+- Modifier-managed polygons accept caller flag and area edits while preserving
+  base values for fields owned by enabled effects. New selections retain
+  existing caller edits. Base overrides can be inspected and removed and are
+  pruned when their tile content is retired.
+- DNDY version 1 snapshots still load. Selected polygons in a restored layer now
+  accept caller flag and area writes subject to modifier ownership. Saving a layer
+  with a caller base override or detail selector emits version 2.
+  See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
+
+### Fixed
+
+- `cargo clippy --no-default-features --features route,libm` is warning-free.
+  No behaviour change.
+
 ## [0.2.3] - 2026-11-20
 
 ### Added
@@ -514,7 +548,9 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.4...v0.2.5
+[0.2.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.0...v0.2.1

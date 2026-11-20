@@ -7,7 +7,8 @@
 //! for state of a tile ref read from the blob's first bytes.
 //!
 //! Properties: restore never panics; an accepted blob leaves exactly its flags and
-//! its area ids (masked to 6 bits) in the tile, read back with `store_tile_state`;
+//! its area ids (masked to 6 bits) in the tile (entries whose pad byte is 2 stay
+//! as they were), read back with `store_tile_state`;
 //! a rejected blob leaves the tile's state unchanged; `store_tile_state` succeeds
 //! exactly when the buffer holds `tile_state_size` bytes; refs that name no tile
 //! are errors.
@@ -83,12 +84,18 @@ fuzz_target!(|data: &[u8]| {
             assert!(blob.len() >= size);
             let after = stored(&nav, tile);
             let header = 8 + core::mem::size_of::<PolyRef>();
-            for (a, b) in after[header..]
+            for ((a, b), old) in after[header..]
                 .chunks_exact(4)
                 .zip(blob[header..].chunks_exact(4))
+                .zip(before[header..].chunks_exact(4))
             {
-                assert_eq!(a[0..2], b[0..2]);
-                assert_eq!(a[2], b[2] & 0x3f);
+                if b[3] == 2 {
+                    // Entries marked as layer-managed are left as they are.
+                    assert_eq!(a, old);
+                } else {
+                    assert_eq!(a[0..2], b[0..2]);
+                    assert_eq!(a[2], b[2] & 0x3f);
+                }
                 assert_eq!(a[3], 0);
             }
         }

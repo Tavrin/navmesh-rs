@@ -847,7 +847,7 @@ fn obstacle_rebuilds_and_layer_reload_preserve_gate_state() {
     layer
         .upsert(ModifierSpec::new(
             gate,
-            Selector::Prism {
+            Selector::DetailPrism {
                 verts_xz: vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 8.0]],
                 ymin: -1.0,
                 ymax: 3.0,

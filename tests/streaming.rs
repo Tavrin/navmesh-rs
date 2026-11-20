@@ -1759,8 +1759,6 @@ mod gates {
         }
         assert_eq!(nav.poly_flags(gate), Ok(4));
         assert_eq!(nav.poly_area(gate), Ok(9));
-        assert!(nav.set_poly_flags(gate, 15).is_err());
-        assert!(nav.set_poly_area(gate, 15).is_err());
 
         // Moving an enabled spec restores the old selection and applies at the new one.
         nav.upsert_modifier(ModifierSpec::new(
@@ -1856,6 +1854,7 @@ mod gates {
         let rec = ResidencyRecord::from_bytes(&nav.residency().to_bytes()).unwrap();
         let saved = nav.dynamic_layer().unwrap();
         let bytes = saved.to_bytes();
+        assert_eq!(&bytes[..8], b"DNDY\x01\0\0\0");
         let snapshot = DynamicLayer::from_bytes(&bytes, Limits::UNLIMITED).unwrap();
         assert_eq!(snapshot.to_bytes(), bytes);
         assert_eq!(snapshot.digest(), saved.digest());
@@ -1868,7 +1867,7 @@ mod gates {
         assert_eq!(restored.poly_flags(r), Ok(0));
 
         let mut unknown = bytes.clone();
-        unknown[4..8].copy_from_slice(&2u32.to_le_bytes());
+        unknown[4..8].copy_from_slice(&3u32.to_le_bytes());
         assert!(matches!(
             DynamicLayer::from_bytes(&unknown, Limits::UNLIMITED),
             Err(Error::InvalidSnapshot(SnapshotError::WrongVersion))

@@ -269,7 +269,9 @@ pub struct Workspace {
     usage: Usage,
     /// Set only by the crate's own pipelines while every compact field they pass
     /// to a stage was built by this crate and not exposed to caller edits since.
+    #[cfg(feature = "recast")]
     compact_trusted: bool,
+    #[cfg(feature = "recast")]
     pub(crate) regions_removed_small: u32,
     /// Checked at every work charge when present.
     cancel: Option<CancelToken>,
@@ -286,7 +288,9 @@ impl Workspace {
         Workspace {
             limits,
             usage: Usage::default(),
+            #[cfg(feature = "recast")]
             compact_trusted: false,
+            #[cfg(feature = "recast")]
             regions_removed_small: 0,
             cancel: None,
         }
@@ -300,11 +304,13 @@ impl Workspace {
 
     /// Whether the compact field passed to the running stage is known valid, so the
     /// whole-grid connection scan can be skipped (its work is still charged).
+    #[cfg(feature = "recast")]
     #[inline]
     pub(crate) fn compact_trusted(&self) -> bool {
         self.compact_trusted
     }
 
+    #[cfg(all(feature = "recast", any(feature = "detour", test)))]
     pub(crate) fn set_compact_trusted(&mut self, trusted: bool) {
         self.compact_trusted = trusted;
     }
@@ -324,11 +330,13 @@ impl Workspace {
         self.usage
     }
 
+    #[cfg(any(feature = "recast", feature = "crowd"))]
     pub(crate) fn begin(&mut self) {
         self.usage = Usage::default();
     }
 
     /// Charges `n` work units.
+    #[cfg(any(feature = "recast", feature = "crowd"))]
     #[inline]
     pub(crate) fn work(&mut self, n: u64) -> Result<(), Error> {
         if let Some(token) = &self.cancel
@@ -373,6 +381,7 @@ impl Workspace {
     }
 
     /// Grows `v` by `additional` elements of capacity, charging the bytes.
+    #[cfg(any(feature = "recast", feature = "crowd"))]
     pub(crate) fn reserve<T>(&mut self, v: &mut Vec<T>, additional: usize) -> Result<(), Error> {
         if v.capacity() - v.len() >= additional {
             return Ok(());
@@ -388,6 +397,7 @@ impl Workspace {
     }
 
     /// Pushes onto `v`, growing it through the workspace.
+    #[cfg(feature = "recast")]
     #[inline]
     pub(crate) fn push<T>(&mut self, v: &mut Vec<T>, value: T) -> Result<(), Error> {
         if v.len() == v.capacity() {
@@ -474,6 +484,7 @@ pub(crate) fn ceilf(x: f32) -> f32 {
 
 /// `floorf(x) as i32` without the library call: truncate, then step down for a
 /// negative fraction. Saturates and maps NaN to zero exactly like the `as` cast.
+#[cfg(any(feature = "recast", feature = "crowd-world", test))]
 #[inline(always)]
 pub(crate) fn floor_i32(x: f32) -> i32 {
     let t = x as i32;
@@ -485,6 +496,7 @@ pub(crate) fn floor_i32(x: f32) -> i32 {
 }
 
 /// `ceilf(x) as i32` without the library call (see [`floor_i32`]).
+#[cfg(any(feature = "recast", test))]
 #[inline(always)]
 pub(crate) fn ceil_i32(x: f32) -> i32 {
     let t = x as i32;
@@ -495,6 +507,7 @@ pub(crate) fn ceil_i32(x: f32) -> i32 {
     }
 }
 
+#[cfg(any(feature = "recast", feature = "crowd"))]
 #[inline]
 pub(crate) fn cosf(x: f32) -> f32 {
     #[cfg(all(feature = "std", not(feature = "libm")))]
@@ -508,24 +521,28 @@ pub(crate) fn cosf(x: f32) -> f32 {
 }
 
 /// `rcMin` for floats: `a < b ? a : b` (not `f32::min`, which treats NaN differently).
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn fmin(a: f32, b: f32) -> f32 {
     if a < b { a } else { b }
 }
 
 /// `rcMax` for floats: `a > b ? a : b`.
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn fmax(a: f32, b: f32) -> f32 {
     if a > b { a } else { b }
 }
 
 /// `rcSqr`.
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn sqr(a: f32) -> f32 {
     a * a
 }
 
 /// `rcClamp` for integers.
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
     if v < lo {
@@ -537,11 +554,13 @@ pub(crate) fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
     }
 }
 
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn vsub(a: &[f32], b: &[f32]) -> [f32; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
 
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn vcross(v1: &[f32; 3], v2: &[f32; 3]) -> [f32; 3] {
     [
@@ -551,6 +570,7 @@ pub(crate) fn vcross(v1: &[f32; 3], v2: &[f32; 3]) -> [f32; 3] {
     ]
 }
 
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn vnormalize(v: &mut [f32; 3]) {
     let d = 1.0 / sqrtf(sqr(v[0]) + sqr(v[1]) + sqr(v[2]));
@@ -559,6 +579,7 @@ pub(crate) fn vnormalize(v: &mut [f32; 3]) {
     v[2] *= d;
 }
 
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn vmin(mn: &mut [f32; 3], v: &[f32]) {
     mn[0] = fmin(mn[0], v[0]);
@@ -566,6 +587,7 @@ pub(crate) fn vmin(mn: &mut [f32; 3], v: &[f32]) {
     mn[2] = fmin(mn[2], v[2]);
 }
 
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn vmax(mx: &mut [f32; 3], v: &[f32]) {
     mx[0] = fmax(mx[0], v[0]);
@@ -573,6 +595,7 @@ pub(crate) fn vmax(mx: &mut [f32; 3], v: &[f32]) {
     mx[2] = fmax(mx[2], v[2]);
 }
 
+#[cfg(feature = "recast")]
 #[inline(always)]
 pub(crate) fn v3(s: &[f32]) -> [f32; 3] {
     [s[0], s[1], s[2]]

@@ -38,6 +38,7 @@ mod builder;
 mod endian;
 pub(crate) mod math;
 mod navmesh;
+#[cfg(feature = "recast")]
 pub(crate) use tile::LINK_SIZE;
 pub(crate) mod node;
 pub(crate) mod query;

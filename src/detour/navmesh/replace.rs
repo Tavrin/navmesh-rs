@@ -194,7 +194,9 @@ impl NavMesh {
             Plan::Swap { ti, old_salt, salt } => {
                 // Nothing below fails: the slot's page is allocated (it holds a
                 // tile) and the salt was checked.
-                drop(self.detach(ti));
+                let retain_dynamic_bases =
+                    cfg!(feature = "dynamic") && self.resident_hash(ti) == Some(t.hash);
+                drop(self.detach(ti, retain_dynamic_bases));
                 let target = Target {
                     ti,
                     prev: None,

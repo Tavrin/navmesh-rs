@@ -1228,48 +1228,67 @@ impl NavMesh {
         tile.off_mesh_cons.get(usize::try_from(ip).ok()?)
     }
 
-    fn poly_mut(&mut self, r: PolyRef) -> Result<&mut Poly, Error> {
-        self.tile_and_poly_by_ref(r)?;
-        let (_, it, ip) = self.decode_poly_id(r);
-        #[cfg(feature = "dynamic")]
-        self.check_unmanaged(it as usize, ip as usize)?;
-        self.slots
-            .get_mut(it as usize)
-            .and_then(|s| s.tile.as_deref_mut())
-            .and_then(|t| t.polys.get_mut(ip as usize))
-            .ok_or(Error::InvalidRef)
-    }
-
-    /// Sets a polygon's flags. A polygon governed by a modifier returns
-    /// [`Error::InvalidParameter`].
+    /// Sets a polygon's flags. On a modifier-managed polygon this sets the
+    /// caller's base flags except for bits owned by enabled flag effects.
+    /// Owned bits keep their previous base values so effective flags can be
+    /// used in a read-modify-write.
     pub fn set_poly_flags(&mut self, r: PolyRef, flags: u16) -> Result<(), Error> {
-        let poly = self.poly_mut(r)?;
+        self.tile_and_poly_by_ref(r)?;
+        let (_, ti, ip) = self.decode_poly_id(r);
+        let (ti, ip) = (ti as usize, ip as usize);
+        #[cfg(feature = "dynamic")]
+        if self.set_modifier_base(
+            ti,
+            ip,
+            crate::dynamic::BaseState {
+                flags: Some(flags),
+                area: None,
+            },
+        )? {
+            return Ok(());
+        }
+        let poly = &mut self.tile_mut(ti).polys[ip];
         let changed = poly.flags != flags;
         poly.flags = flags;
         if changed {
-            self.stamp_state(self.decode_poly_id(r).1 as usize);
+            self.stamp_state(ti);
         }
         Ok(())
     }
 
-    /// A polygon's flags.
+    /// A polygon's effective flags.
     pub fn poly_flags(&self, r: PolyRef) -> Result<u16, Error> {
         Ok(self.tile_and_poly_by_ref(r)?.1.flags)
     }
 
-    /// Sets a polygon's area. A polygon governed by a modifier returns
-    /// [`Error::InvalidParameter`].
+    /// Sets a polygon's area, masked to six bits. On a modifier-managed
+    /// polygon this sets the caller's base area when no enabled area effect
+    /// owns it. While owned, the base area is preserved.
     pub fn set_poly_area(&mut self, r: PolyRef, area: u8) -> Result<(), Error> {
-        let poly = self.poly_mut(r)?;
+        self.tile_and_poly_by_ref(r)?;
+        let (_, ti, ip) = self.decode_poly_id(r);
+        let (ti, ip) = (ti as usize, ip as usize);
+        #[cfg(feature = "dynamic")]
+        if self.set_modifier_base(
+            ti,
+            ip,
+            crate::dynamic::BaseState {
+                flags: None,
+                area: Some(area & 63),
+            },
+        )? {
+            return Ok(());
+        }
+        let poly = &mut self.tile_mut(ti).polys[ip];
         let before = poly.area();
         poly.set_area(area);
         if before != poly.area() {
-            self.stamp_state(self.decode_poly_id(r).1 as usize);
+            self.stamp_state(ti);
         }
         Ok(())
     }
 
-    /// A polygon's area.
+    /// A polygon's effective area.
     pub fn poly_area(&self, r: PolyRef) -> Result<u8, Error> {
         Ok(self.tile_and_poly_by_ref(r)?.1.area())
     }
@@ -1304,7 +1323,11 @@ impl NavMesh {
     /// and area. It is bound to the tile's current ref, so it can be restored only
     /// into the same tile incarnation, not after the tile was removed and added
     /// again. The blob is little-endian; polygon entries are `u16` flags, `u8` area
-    /// and a zero pad byte (upstream leaves the pad uninitialised).
+    /// and a pad byte (upstream leaves the pad uninitialised). The pad is 0 for an
+    /// ordinary polygon and 2 for a polygon the modifier layer manages, whose
+    /// stored values are effective ones: a restore leaves those polygons as the
+    /// current layer derives them. [`NavMesh::unload_tile`] also writes 1 for an
+    /// unmanaged polygon with caller edits.
     /// [`Error::BufferTooSmall`] when `out` is shorter than the state.
     pub fn store_tile_state(&self, tile: TileRef, out: &mut [u8]) -> Result<usize, Error> {
         let size = self.tile_state_size(tile)?;
@@ -1312,6 +1335,8 @@ impl NavMesh {
             return Err(Error::BufferTooSmall);
         }
         let t = self.tile_by_ref(tile).ok_or(Error::InvalidRef)?;
+        #[cfg(feature = "dynamic")]
+        let slot = self.decode_poly_id(tile).1 as usize;
         out[0..4].copy_from_slice(&NAVMESH_STATE_MAGIC.to_le_bytes());
         let version = if self.has_explicit_layout() {
             2
@@ -1320,14 +1345,23 @@ impl NavMesh {
         };
         out[4..8].copy_from_slice(&version.to_le_bytes());
         out[8..TILE_STATE_HEADER_SIZE].copy_from_slice(&tile.to_le_bytes());
-        for (p, s) in t
+        for (ip, (p, s)) in t
             .polys
             .iter()
             .zip(out[TILE_STATE_HEADER_SIZE..size].chunks_exact_mut(TILE_POLY_STATE_SIZE))
+            .enumerate()
         {
             s[0..2].copy_from_slice(&p.flags.to_le_bytes());
             s[2] = p.area();
-            s[3] = 0;
+            #[cfg(feature = "dynamic")]
+            {
+                s[3] = self.modifiers.state_pad(slot, ip);
+            }
+            #[cfg(not(feature = "dynamic"))]
+            {
+                let _ = ip;
+                s[3] = 0;
+            }
         }
         if self.has_explicit_layout() {
             let l = self.ref_layout();
@@ -1338,7 +1372,8 @@ impl NavMesh {
 
     /// Restores polygon flags and areas stored by [`NavMesh::store_tile_state`]
     /// (`dtNavMesh::restoreTileState`). The tile's ref and polygon refs do not
-    /// change. Governed polygons keep their derived flags and areas.
+    /// change. Modifier-managed polygons keep the result derived from the
+    /// current layer, including caller base edits saved in that layer.
     ///
     /// The blob is untrusted: it is checked completely before the tile is touched.
     /// Errors, in upstream's order: [`Error::InvalidRef`] for a ref that is not a
@@ -1362,14 +1397,16 @@ impl NavMesh {
             .get_mut(ti)
             .and_then(|s| s.tile.as_deref_mut())
             .ok_or(Error::InvalidRef)?;
-        if stream::apply_state(tile, data, size, |ip| {
+        // Entries marked as managed hold effective values: the tile already
+        // derives those polygons from the current layer over the caller base.
+        if stream::apply_state(tile, data, size, |ip, pad| {
             #[cfg(feature = "dynamic")]
             {
-                self.modifiers.governs(ti, ip)
+                pad == modifiers::MANAGED_PAD || self.modifiers.manages_state(ti, ip)
             }
             #[cfg(not(feature = "dynamic"))]
             {
-                let _ = ip;
+                let _ = (ip, pad);
                 false
             }
         }) {
@@ -1571,7 +1608,13 @@ impl NavMesh {
         let mut tile = tile;
         tile.managed_link_tile = self.link_layer() == Some(tile.header.layer);
         #[cfg(feature = "dynamic")]
-        let stamp = self.modifiers.attach_tile(&mut tile, ti);
+        let stamp = {
+            if let Some(old) = target.parked_hash.filter(|&old| hash != Some(old)) {
+                self.modifiers
+                    .prune_bases((tile.header.x, tile.header.y, tile.header.layer, old));
+            }
+            self.modifiers.attach_tile(&mut tile, ti, hash)
+        };
         let h = &tile.header;
         let (hx, hy, hl) = (h.x, h.y, h.layer);
 
@@ -1662,7 +1705,7 @@ impl NavMesh {
         let ti = self.resident_slot(r)?;
         self.check_ground_layer(self.tile_unchecked(ti as u32).header.layer)?;
         let next = self.next_salt(self.slots[ti].salt)?;
-        let tile = self.detach(ti);
+        let tile = self.detach(ti, false);
         self.release_slot(ti, next);
         self.runtime_ground_changed();
         Ok(tile.map(|t| t.data).unwrap_or_default())
@@ -1715,7 +1758,7 @@ impl NavMesh {
     /// Takes the tile out of slot `ti`: lookup list, links from its neighbours and
     /// global pairs. The slot's salt, free-list state and reservation are left to
     /// the caller.
-    fn detach(&mut self, ti: usize) -> Option<Box<MeshTile>> {
+    fn detach(&mut self, ti: usize, retain_dynamic_bases: bool) -> Option<Box<MeshTile>> {
         let (x, y, layer) = self
             .tile(ti)
             .map(|t| (t.header.x, t.header.y, t.header.layer))?;
@@ -1743,8 +1786,13 @@ impl NavMesh {
         let tile = self.slots[ti].tile.take();
         #[cfg(feature = "dynamic")]
         if let Some(tile) = tile.as_deref() {
+            if !retain_dynamic_bases {
+                self.modifiers.prune_resident_bases(tile, ti);
+            }
             self.modifiers.detach_tile(tile, ti);
         }
+        #[cfg(not(feature = "dynamic"))]
+        let _ = retain_dynamic_bases;
         self.slots[ti].hash = None;
         self.stamp_tile_change(ti);
         self.resident = self.resident.saturating_sub(1);

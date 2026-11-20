@@ -2,14 +2,18 @@
 
 use alloc::vec::Vec;
 
-use super::{DynamicLayer, Effect, MAX_PRISM_VERTICES, ModifierId, ModifierSpec, Selector};
+use super::{
+    BaseState, DynamicLayer, Effect, MAX_PRISM_VERTICES, ModifierId, ModifierSpec, Selector,
+};
 use crate::detour::content_hash;
 use crate::{Error, Limits, SnapshotError};
 
 const MAGIC: &[u8; 4] = b"DNDY";
-const VERSION: u32 = 1;
+const LEGACY: u32 = 1;
+const EXTENDED: u32 = 2;
 const HEADER: usize = 16;
 const DIGEST: usize = 32;
+const BASE_ENTRY: usize = 52;
 
 const SHORT: Error = Error::InvalidSnapshot(SnapshotError::TooShort);
 
@@ -21,7 +25,9 @@ impl ModifierSpec {
     pub(super) fn encoded_len(&self) -> usize {
         // ID, selector tag, selector payload, effect tag and value.
         8 + match &self.selector {
-            Selector::Prism { verts_xz, .. } => 10 + 8 * verts_xz.len(),
+            Selector::Prism { verts_xz, .. } | Selector::DetailPrism { verts_xz, .. } => {
+                10 + 8 * verts_xz.len()
+            }
             Selector::Links { .. } => 8,
         }
     }
@@ -34,8 +40,15 @@ impl ModifierSpec {
                 ymin,
                 ymax,
                 area,
+            }
+            | Selector::DetailPrism {
+                verts_xz,
+                ymin,
+                ymax,
+                area,
             } => {
-                out.extend_from_slice(&[0, verts_xz.len() as u8, area.unwrap_or(255)]);
+                let tag = if self.selector.is_detail() { 2 } else { 0 };
+                out.extend_from_slice(&[tag, verts_xz.len() as u8, area.unwrap_or(255)]);
                 out.extend_from_slice(&ymin.to_le_bytes());
                 out.extend_from_slice(&ymax.to_le_bytes());
                 for [x, z] in verts_xz {
@@ -61,10 +74,11 @@ impl ModifierSpec {
         out.extend_from_slice(&value.to_le_bytes());
     }
 
-    fn decode(input: &mut &[u8]) -> Result<Self, Error> {
+    fn decode(input: &mut &[u8], version: u32) -> Result<Self, Error> {
         let id = ModifierId(u32::from_le_bytes(read(input)?));
-        let selector = match read(input)? {
-            [0] => {
+        let [tag] = read(input)?;
+        let selector = match tag {
+            0 | 2 if tag == 0 || version == EXTENDED => {
                 let [n, area] = read(input)?;
                 let n = usize::from(n);
                 if !(3..=MAX_PRISM_VERTICES).contains(&n) {
@@ -82,14 +96,24 @@ impl ModifierSpec {
                         f32::from_le_bytes(read(input)?),
                     ]);
                 }
-                Selector::Prism {
-                    verts_xz,
-                    ymin,
-                    ymax,
-                    area: (area != 255).then_some(area),
+                let area = (area != 255).then_some(area);
+                if tag == 0 {
+                    Selector::Prism {
+                        verts_xz,
+                        ymin,
+                        ymax,
+                        area,
+                    }
+                } else {
+                    Selector::DetailPrism {
+                        verts_xz,
+                        ymin,
+                        ymax,
+                        area,
+                    }
                 }
             }
-            [1] => Selector::Links {
+            1 => Selector::Links {
                 user_id_min: u32::from_le_bytes(read(input)?),
                 user_id_max: u32::from_le_bytes(read(input)?),
             },
@@ -122,10 +146,33 @@ impl DynamicLayer {
         HEADER + self.bitset_len() + DIGEST
     }
 
+    pub(super) fn snapshot_len(
+        &self,
+        specs_size: usize,
+        base_count: usize,
+        detail: bool,
+    ) -> Result<usize, Error> {
+        u32::try_from(base_count).map_err(|_| Error::SizeOverflow)?;
+        let base_bytes = base_count
+            .checked_mul(BASE_ENTRY)
+            .ok_or(Error::SizeOverflow)?;
+        self.snapshot_base_len()
+            .checked_add(specs_size)
+            .and_then(|len| len.checked_add(4 * usize::from(detail || base_count != 0)))
+            .and_then(|len| len.checked_add(base_bytes))
+            .ok_or(Error::SizeOverflow)
+    }
+
     fn encode_payload(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.snapshot_base_len() + self.specs_size);
+        let extended = self.detail_count != 0 || !self.bases.is_empty();
+        let version = if extended { EXTENDED } else { LEGACY };
+        let size = self.snapshot_base_len()
+            + self.specs_size
+            + 4 * usize::from(extended)
+            + self.bases.len() * BASE_ENTRY;
+        let mut out = Vec::with_capacity(size);
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
         out.extend_from_slice(&self.max_ids.to_le_bytes());
         out.extend_from_slice(&(self.entries.len() as u32).to_le_bytes());
         out.resize(HEADER + self.bitset_len(), 0);
@@ -136,10 +183,24 @@ impl DynamicLayer {
             }
             entry.spec.encode(&mut out);
         }
+        if extended {
+            out.extend_from_slice(&(self.bases.len() as u32).to_le_bytes());
+            for (&((x, y, layer, hash), ip), base) in &self.bases {
+                for coordinate in [x, y, layer] {
+                    out.extend_from_slice(&coordinate.to_le_bytes());
+                }
+                out.extend_from_slice(&hash);
+                out.extend_from_slice(&ip.to_le_bytes());
+                out.extend_from_slice(&base.flags.unwrap_or_default().to_le_bytes());
+                out.push(base.area.unwrap_or(255));
+                out.push(u8::from(base.flags.is_some()));
+            }
+        }
         out
     }
 
-    /// Encodes the registered specs and enabled bits in canonical DNDY v1 format.
+    /// Encodes the layer in canonical DNDY format. Layers with detail selectors
+    /// or caller base edits use version 2. Other layers use version 1.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.encode_payload();
         let digest = content_hash(&out);
@@ -162,7 +223,8 @@ impl DynamicLayer {
         if &read(&mut input)? != MAGIC {
             return Err(Error::InvalidSnapshot(SnapshotError::WrongMagic));
         }
-        if u32::from_le_bytes(read(&mut input)?) != VERSION {
+        let version = u32::from_le_bytes(read(&mut input)?);
+        if !matches!(version, LEGACY | EXTENDED) {
             return Err(Error::InvalidSnapshot(SnapshotError::WrongVersion));
         }
         let max_ids = u32::from_le_bytes(read(&mut input)?);
@@ -194,11 +256,11 @@ impl DynamicLayer {
         let mut enabled_count: u64 = bits.iter().map(|byte| u64::from(byte.count_ones())).sum();
         let mut previous = None;
         for _ in 0..count {
-            let spec = ModifierSpec::decode(&mut specs)?;
+            let spec = ModifierSpec::decode(&mut specs, version)?;
             if previous.is_some_and(|old| old >= spec.id) {
                 return Err(invalid("modifier IDs out of order"));
             }
-            if let Selector::Prism { verts_xz, .. } = &spec.selector {
+            if let Some(verts_xz) = spec.selector.prism_vertices() {
                 workspace.charge_bytes::<[f32; 2]>(verts_xz.len())?;
                 work = work.saturating_add((verts_xz.len() * verts_xz.len()) as u64);
                 if work > limits.max_work {
@@ -213,7 +275,11 @@ impl DynamicLayer {
             enabled_count -= u64::from(enabled);
             previous = Some(spec.id);
             layer.specs_size += spec.encoded_len();
+            layer.detail_count += usize::from(spec.selector.is_detail());
             layer.entries.push(super::Entry { spec, enabled });
+        }
+        if version == EXTENDED {
+            layer.decode_bases(&mut specs, &mut workspace)?;
         }
         if !specs.is_empty() {
             return Err(Error::InvalidSnapshot(SnapshotError::TrailingBytes));
@@ -222,5 +288,49 @@ impl DynamicLayer {
             return Err(invalid("enabled bit without a specification"));
         }
         Ok(layer)
+    }
+
+    fn decode_bases(
+        &mut self,
+        input: &mut &[u8],
+        workspace: &mut crate::Workspace,
+    ) -> Result<(), Error> {
+        let count = u32::from_le_bytes(read(input)?) as usize;
+        if count > input.len() / BASE_ENTRY {
+            return Err(SHORT);
+        }
+        if count == 0 && self.detail_count == 0 {
+            return Err(invalid("empty modifier snapshot extension"));
+        }
+        workspace.charge_bytes::<((super::BaseTileKey, u32), BaseState)>(count)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let x = i32::from_le_bytes(read(input)?);
+            let y = i32::from_le_bytes(read(input)?);
+            let layer = i32::from_le_bytes(read(input)?);
+            let hash = read(input)?;
+            let ip = u32::from_le_bytes(read(input)?);
+            let flags = u16::from_le_bytes(read(input)?);
+            let [area, has_flags] = read(input)?;
+            let key = ((x, y, layer, hash), ip);
+            if previous.is_some_and(|old| old >= key) {
+                return Err(invalid("polygon base keys out of order"));
+            }
+            if has_flags > 1
+                || (has_flags == 0 && (flags != 0 || area == 255))
+                || !(area <= 63 || area == 255)
+            {
+                return Err(invalid("polygon base state"));
+            }
+            self.bases.insert(
+                key,
+                BaseState {
+                    flags: (has_flags == 1).then_some(flags),
+                    area: (area != 255).then_some(area),
+                },
+            );
+            previous = Some(key);
+        }
+        Ok(())
     }
 }

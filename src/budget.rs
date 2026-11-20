@@ -101,6 +101,11 @@ impl Budget {
     }
 
     /// Marks the whole allowance spent, for work that ran into the limit.
+    #[cfg(any(
+        feature = "crowd",
+        feature = "route",
+        all(feature = "recast", feature = "detour")
+    ))]
     pub(crate) fn exhaust(&mut self) {
         self.used = self.limit;
         self.refused = true;

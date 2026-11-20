@@ -8,7 +8,8 @@
 //! an argument. Operations: commit (tile, content variant), unload, remove, forget
 //! an unloaded tile, commit with the state saved at unload, budgeted commit,
 //! declare a column known, take refs, path and raycast queries, a resumable search
-//! begun or resumed, and a residency save/restore into a fresh navmesh.
+//! begun or resumed, and a residency save/restore into a fresh navmesh. A
+//! saved state may carry any value in a polygon entry's padding byte.
 //!
 //! Model: per tile key a content generation, bumped whenever the slot's salt must
 //! change (a removal, a forgotten reservation, a commit of other content into a
@@ -195,6 +196,14 @@ fuzz_target!(|data: &[u8]| {
                 if damaged {
                     if let Some(last) = state.last_mut() {
                         *last ^= 1;
+                    }
+                }
+                // The padding byte of a polygon entry only records where the
+                // stored values came from; any value must load.
+                let header = 8 + core::mem::size_of::<PolyRef>();
+                if arg & 0x20 != 0 {
+                    if let Some(pad) = state.get_mut(header + 3) {
+                        *pad = arg;
                     }
                 }
                 match nav.commit_with_state(t, &state) {
