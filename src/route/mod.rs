@@ -8,7 +8,7 @@
 //! it holds no polygon geometry.
 //!
 //! - [`SectorSummary`] (record `'DNSS'`): per sector and filter profile, the
-//!   *regions* (connected components of passable polygons inside the sector), the
+//!   *regions* (components of reciprocal links between passable polygons inside the sector), the
 //!   *portals* (maximal passable runs along each sector side, one per side, run and
 //!   region; wide runs carry two transition points), off-mesh links that leave the
 //!   sector, a floor-quantized `u16` table of exact transition-to-transition costs
@@ -21,7 +21,8 @@
 //! - [`summarize_tiles`] and [`SectorCollector`] (with `recast`): bake-side
 //!   construction from tile bytes, independent of what else is resident.
 //!
-//! Summaries depend only on the tile bytes of their sector and the filter profile:
+//! Isolated summaries depend only on their sector and filter profile. Stitched
+//! records also depend on the installed links, effective flags and areas:
 //! poly refs, slots and load order never reach the records, so the bytes are
 //! identical for any insertion order. Summaries never hash at query time; content ids
 //! are computed when a summary is built.
@@ -176,3 +177,8 @@ mod search;
 pub use search::{CoarseSearch, RegionKey, RouteIndex};
 mod window;
 pub use window::{CorridorWindow, WindowPoint};
+
+mod stitched;
+
+mod navigator;
+pub use navigator::{Navigator, RequestId, RouteAtlas, RouteState};

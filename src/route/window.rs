@@ -55,7 +55,10 @@ impl QueryFilter for WindowFilter {
 pub struct CorridorWindow {
     query: Option<DetachedQuery>,
     filter: WindowFilter,
+    owner: alloc::sync::Arc<()>,
     epoch: u64,
+    #[cfg(feature = "dynamic")]
+    state_epoch: u64,
     status: Status,
     finalized: bool,
     corridor: Vec<PolyRef>,
@@ -100,7 +103,10 @@ impl CorridorWindow {
         Ok(Self {
             query: Some(query.detach()),
             filter,
+            owner: nav.report_identity().clone(),
             epoch: nav.epoch(),
+            #[cfg(feature = "dynamic")]
+            state_epoch: nav.state_epoch(),
             status,
             finalized: false,
             corridor: Vec::new(),
@@ -116,7 +122,13 @@ impl CorridorWindow {
         budget: &mut Budget,
         max_unit: u64,
     ) -> Result<Progress, Error> {
-        if nav.epoch() != self.epoch {
+        #[cfg(feature = "dynamic")]
+        if nav.state_epoch() != self.state_epoch {
+            return Err(Error::MeshChanged);
+        }
+        if !alloc::sync::Arc::ptr_eq(&self.owner, nav.report_identity())
+            || nav.epoch() != self.epoch
+        {
             return Err(Error::MeshChanged);
         }
         if !self.status.is_in_progress() {
@@ -152,7 +164,13 @@ impl CorridorWindow {
     /// Finalizes after expansion completes. This copies up to `max_path` polygon
     /// refs and is not budgeted; schedule it separately and measure its cost.
     pub fn finish(&mut self, nav: &NavMesh, max_path: usize) -> Result<Status, Error> {
-        if nav.epoch() != self.epoch {
+        #[cfg(feature = "dynamic")]
+        if nav.state_epoch() != self.state_epoch {
+            return Err(Error::MeshChanged);
+        }
+        if !alloc::sync::Arc::ptr_eq(&self.owner, nav.report_identity())
+            || nav.epoch() != self.epoch
+        {
             return Err(Error::MeshChanged);
         }
         if self.finalized {
@@ -170,6 +188,9 @@ impl CorridorWindow {
         Ok(self.status)
     }
 
+    pub(super) fn take_corridor(&mut self) -> Vec<PolyRef> {
+        core::mem::take(&mut self.corridor)
+    }
     /// Final corridor and status, including partial-result or node-exhaustion bits.
     pub fn result(&self) -> Option<(&[PolyRef], Status)> {
         self.finalized

@@ -510,9 +510,12 @@ fn long_route_flat_comparator_in_frames() {
     if let Some(dir) = &cache {
         std::fs::create_dir_all(dir).unwrap();
         if cached {
-            assert_eq!(
-                std::fs::read_to_string(dir.join("complete")).unwrap(),
-                identity,
+            let stored = std::fs::read_to_string(dir.join("complete")).unwrap();
+            // These two additive bake options had no wire effect at their defaults.
+            let legacy = identity.replacen(", links: None, spare_links_per_tile: 0 }", " }", 1);
+            assert!(
+                stored == identity
+                    || (cfg.links.is_none() && cfg.spare_links_per_tile == 0 && stored == legacy),
                 "fixture identity"
             );
         } else {
@@ -660,6 +663,11 @@ fn long_route_flat_comparator_in_frames() {
         });
     }
     drop(q);
+    #[cfg(feature = "route")]
+    if env("NAV_ROUTE_CANDIDATE", 0) == 1 {
+        candidate::measure(&nav, &set, world);
+        return;
+    }
 
     if env("NAV_ROUTE_QUALITY_ONLY", 0) == 1 {
         let frame_units = std::env::var("NAV_ROUTE_FRAME_UNITS")
@@ -1110,3 +1118,7 @@ fn obstacle_field_is_a_pure_function_of_its_seed() {
     let other = ObstacleField::dense(8);
     assert_ne!(other.obstacle(3, 5), field.obstacle(3, 5));
 }
+
+#[cfg(feature = "route")]
+#[path = "common/route_candidate.rs"]
+mod candidate;

@@ -15,7 +15,7 @@ use core::cmp::Reverse;
 /// Magic bytes at the start of a sector summary record.
 pub const SECTOR_MAGIC: [u8; 4] = *b"DNSS";
 /// Version of the sector summary record this crate writes and reads.
-pub const SECTOR_VERSION: u16 = 1;
+pub const SECTOR_VERSION: u16 = 2;
 /// Quantized cost of an unreachable transition pair.
 pub const UNREACHABLE: u16 = 0xFFFF;
 
@@ -44,7 +44,7 @@ pub struct SectorTile {
     pub content_id: u32,
 }
 
-/// A connected component of passable polygons inside a sector.
+/// A component connected by reciprocal polygon links inside a sector.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[non_exhaustive]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -101,7 +101,7 @@ pub struct OffMeshEntry {
 /// dequantized costs never exceed the true cost. [`UNREACHABLE`] marks pairs with no
 /// path inside the sector.
 ///
-/// Record layout (little-endian): magic `'DNSS'`, version `u16`, flags `u16` (zero),
+/// Record layout (little-endian): magic `'DNSS'`, version `u16`, flags `u16` (bit zero denotes stitched exits),
 /// sector x `i32`, z `i32`, tiles per sector `u16`, layers `u8`, padding `u8`, profile
 /// `u32`, tile, portal, region and off-mesh counts (`u16` each), quantum `f32`, climb
 /// `f32`, polygon count `u32`; then tiles (x `i32`, z `i32`, layer `u8`, 3 padding
@@ -109,7 +109,11 @@ pub struct OffMeshEntry {
 /// (side `u8`, split `u8`, region `u16`, pos 3 x `f32`, extent 2 x `f32`, y range 2 x
 /// `f32`, tile index `u16`, padding `u16`), off-mesh entries (region `u16`, flags `u8`
 /// with bit 0 = bidirectional, padding `u8`, start 3 x `f32`, far 3 x `f32`, tile index
-/// `u16`, padding `u16`), and the `N x N` cost table, row = from, column = to.
+/// `u16`, padding `u16`). Three counted arrays follow, each prefixed by a `u32`:
+/// directed region pairs (two `u16`), polygon membership run starts (tile `u16`,
+/// polygon `u32`, region `u16`, with 65535 marking filtered or past-end), and
+/// stitched exits (from `u16`, sector x and z `i32`, to `u16`). The final
+/// `N x N` cost table is ordered by source row, then destination column.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SectorSummary {
     key: SectorKey,
@@ -124,6 +128,9 @@ pub struct SectorSummary {
     portals: Vec<Portal>,
     offmesh: Vec<OffMeshEntry>,
     costs: Vec<u16>,
+    pub(super) arcs: Vec<(u16, u16)>,
+    membership: Vec<(u16, u32, u16)>,
+    pub(super) exits: Option<Vec<(u16, SectorKey, u16)>>,
 }
 
 fn charge(budget: &mut Budget, n: u64) -> Result<(), Error> {
@@ -149,7 +156,7 @@ fn lerp(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
 }
 
 /// Midpoint of the portal between two linked polygons (Detour's `getPortalPoints`).
-fn entry_mid(
+pub(super) fn entry_mid(
     from: (&MeshTile, &Poly),
     from_ref: PolyRef,
     link: &Link,
@@ -336,12 +343,12 @@ impl SectorSummary {
             let (_, it, ip) = nav.decode_poly_id(r);
             let ti = *slot_index.get(&(it as usize))?;
             let n = *node_of.get(ti)?.get(ip as usize)?;
-            (n != NONE).then_some(n)
+            (n != NONE && nodes.get(n as usize)?.r == r).then_some(n)
         };
         // Adjacency inside the sector, with the entry point into the neighbour.
         let mut adj: Vec<Vec<(u32, [f32; 3])>> = Vec::with_capacity(nodes.len());
         let mut parent: Vec<u32> = (0..nodes.len() as u32).collect();
-        for (ni, node) in nodes.iter().enumerate() {
+        for node in &nodes {
             let t = tile_refs[node.tile];
             let p = &t.polys[node.poly];
             let mut out = Vec::new();
@@ -355,10 +362,6 @@ impl SectorSummary {
                     if let Some(mid) = entry_mid((t, p), node.r, link, (tt, &tt.polys[tn.poly])) {
                         out.push((to, mid));
                     }
-                    let (a, b) = (find(&mut parent, ni as u32), find(&mut parent, to));
-                    if a != b {
-                        parent[a.max(b) as usize] = a.min(b);
-                    }
                 }
                 l = link.next;
             }
@@ -369,6 +372,21 @@ impl SectorSummary {
                     .then(a.1[2].total_cmp(&b.1[2]))
             });
             adj.push(out);
+        }
+        // Contract only reciprocal edges. Remaining arcs retain their direction.
+        for (i, out) in adj.iter().enumerate() {
+            for &(to, _) in out {
+                charge(budget, 1)?;
+                if to as usize > i
+                    && adj[to as usize]
+                        .binary_search_by_key(&(i as u32), |edge| edge.0)
+                        .is_ok()
+                {
+                    let a = find(&mut parent, i as u32);
+                    let b = find(&mut parent, to);
+                    parent[a.max(b) as usize] = a.min(b);
+                }
+            }
         }
         // Regions numbered by their first polygon in canonical order.
         let mut region_of = vec![NONE; nodes.len()];
@@ -400,6 +418,36 @@ impl SectorSummary {
                         reg.bbox[a + 3] = reg.bbox[a + 3].max(c);
                     }
                 }
+            }
+        }
+        let mut arcs = Vec::new();
+        for (i, out) in adj.iter().enumerate() {
+            for &(j, _) in out {
+                let edge = (region_of[i] as u16, region_of[j as usize] as u16);
+                if edge.0 != edge.1 {
+                    arcs.push(edge);
+                }
+            }
+        }
+        arcs.sort_unstable();
+        arcs.dedup();
+        // Run starts include a sentinel for filtered polygons; lookup never uses boxes.
+        let mut membership = Vec::new();
+        for (ti, map) in node_of.iter().enumerate() {
+            let mut last = u16::MAX;
+            for (pi, &node) in map.iter().enumerate() {
+                let region = if node == NONE {
+                    u16::MAX
+                } else {
+                    region_of[node as usize] as u16
+                };
+                if region != last {
+                    membership.push((ti as u16, pi as u32, region));
+                    last = region;
+                }
+            }
+            if last != u16::MAX {
+                membership.push((ti as u16, map.len() as u32, u16::MAX));
             }
         }
         for reg in &mut regions {
@@ -701,9 +749,28 @@ impl SectorSummary {
             portals,
             offmesh,
             costs,
+            arcs,
+            membership,
+            exits: None,
         })
     }
 
+    /// Looks up a passable polygon by stable tile coordinates, layer and polygon index.
+    pub fn polygon_region(&self, x: i32, z: i32, layer: u8, poly: u32) -> Option<u16> {
+        let tile = self
+            .tiles
+            .binary_search_by_key(&(z, x, layer), |t| (t.z, t.x, t.layer))
+            .ok()? as u16;
+        let end = self
+            .membership
+            .partition_point(|&(t, p, _)| (t, p) <= (tile, poly));
+        let &(t, _, r) = self.membership.get(end.checked_sub(1)?)?;
+        (t == tile && r != u16::MAX).then_some(r)
+    }
+    /// Directed arcs between regions inside the sector.
+    pub fn region_arcs(&self) -> &[(u16, u16)] {
+        &self.arcs
+    }
     /// The sector.
     pub fn key(&self) -> SectorKey {
         self.key
@@ -772,6 +839,11 @@ impl SectorSummary {
             + REGION * self.regions.len()
             + PORTAL * self.portals.len()
             + OFFMESH * self.offmesh.len()
+            + 8
+            + self.arcs.len() * 4
+            + self.membership.len() * 8
+            + 4
+            + self.exits.as_ref().map_or(0, |e| 12 * e.len())
             + 2 * n * n
     }
 
@@ -780,7 +852,7 @@ impl SectorSummary {
         let mut w = Writer::with_capacity(self.encoded_len());
         w.out.extend_from_slice(&SECTOR_MAGIC);
         w.u16(SECTOR_VERSION);
-        w.u16(0);
+        w.u16(u16::from(self.exits.is_some()));
         w.i32(self.key.x);
         w.i32(self.key.z);
         w.u16(self.tiles_per_sector);
@@ -825,6 +897,25 @@ impl SectorSummary {
             w.u16(o.tile_index);
             w.u16(0);
         }
+        w.u32(self.arcs.len() as u32);
+        for &(a, b) in &self.arcs {
+            w.u16(a);
+            w.u16(b);
+        }
+        w.u32(self.membership.len() as u32);
+        for &(t, p, r) in &self.membership {
+            w.u16(t);
+            w.u32(p);
+            w.u16(r);
+        }
+        let exits = self.exits.as_deref().unwrap_or_default();
+        w.u32(exits.len() as u32);
+        for &(a, k, b) in exits {
+            w.u16(a);
+            w.i32(k.x);
+            w.i32(k.z);
+            w.u16(b);
+        }
         for &c in &self.costs {
             w.u16(c);
         }
@@ -843,7 +934,7 @@ impl SectorSummary {
         let magic = [r.u8()?, r.u8()?, r.u8()?, r.u8()?];
         r.require(magic == SECTOR_MAGIC)?;
         let (version, flags) = (r.u16()?, r.u16()?);
-        r.require(version == SECTOR_VERSION && flags == 0)?;
+        r.require(version == SECTOR_VERSION && flags <= 1)?;
         let key = SectorKey {
             x: r.i32()?,
             z: r.i32()?,
@@ -867,7 +958,7 @@ impl SectorSummary {
             return Err(Error::FormatLimit("sector transitions"));
         }
         let expected = HEADER + TILE * nt + REGION * nr + PORTAL * np + OFFMESH * nm + 2 * n * n;
-        r.require(data.len() == expected)?;
+        r.require(data.len() >= expected + 12)?;
         let k = i64::from(tiles_per_sector);
         let (x0, z0) = (i64::from(key.x) * k, i64::from(key.z) * k);
         let mut tiles: Vec<SectorTile> = Vec::with_capacity(nt);
@@ -936,6 +1027,72 @@ impl SectorSummary {
             r.require(usize::from(o.region) < nr && usize::from(o.tile_index) < nt)?;
             offmesh.push(o);
         }
+        let na = r.u32()? as usize;
+        r.require(na <= (data.len() - expected - 12) / 4)?;
+        let mut arcs = Vec::with_capacity(na);
+        for _ in 0..na {
+            let e = (r.u16()?, r.u16()?);
+            r.require(
+                e.0 != e.1 && usize::from(e.0.max(e.1)) < nr && arcs.last().is_none_or(|p| *p < e),
+            )?;
+            arcs.push(e);
+        }
+        let nmembers = r.u32()? as usize;
+        r.require(expected as u64 + 12 + na as u64 * 4 + nmembers as u64 * 8 <= data.len() as u64)?;
+        let mut membership = Vec::with_capacity(nmembers);
+        for _ in 0..nmembers {
+            let m = (r.u16()?, r.u32()?, r.u16()?);
+            r.require(
+                usize::from(m.0) < nt
+                    && (m.2 == u16::MAX || usize::from(m.2) < nr)
+                    && membership
+                        .last()
+                        .is_none_or(|&(t, p, _)| (t, p) < (m.0, m.1)),
+            )?;
+            membership.push(m);
+        }
+        let mut counts = vec![0u64; nr];
+        for (i, &(tile, poly, region)) in membership.iter().enumerate() {
+            if region == u16::MAX {
+                r.require(i > 0 && membership[i - 1].0 == tile && membership[i - 1].2 != region)?;
+                continue;
+            }
+            let &(next_tile, end, next_region) = membership
+                .get(i + 1)
+                .ok_or(Error::InvalidInput("unterminated polygon membership"))?;
+            r.require(tile == next_tile && next_region != region)?;
+            counts[usize::from(region)] += u64::from(end - poly);
+        }
+        r.require(
+            regions
+                .iter()
+                .zip(counts)
+                .all(|(region, n)| u64::from(region.polygon_count) == n),
+        )?;
+        let ne = r.u32()? as usize;
+        r.require(
+            (flags == 1 || ne == 0)
+                && expected as u64 + 12 + na as u64 * 4 + nmembers as u64 * 8 + ne as u64 * 12
+                    == data.len() as u64,
+        )?;
+        let mut exits = Vec::with_capacity(ne);
+        for _ in 0..ne {
+            let e = (
+                r.u16()?,
+                SectorKey {
+                    x: r.i32()?,
+                    z: r.i32()?,
+                },
+                r.u16()?,
+            );
+            r.require(
+                usize::from(e.0) < nr
+                    && !(e.1 == key && usize::from(e.2) >= nr)
+                    && exits.last().is_none_or(|p| *p < e),
+            )?;
+            exits.push(e);
+        }
+        let exits = (flags == 1).then_some(exits);
         let mut costs = Vec::with_capacity(n * n);
         for i in 0..n * n {
             let c = r.u16()?;
@@ -956,6 +1113,9 @@ impl SectorSummary {
             portals,
             offmesh,
             costs,
+            arcs,
+            membership,
+            exits,
         })
     }
 }
@@ -1008,9 +1168,8 @@ mod direction_regression {
     use crate::route::{SuperKey, SuperRecord};
 
     #[test]
-    fn super_regions_currently_lose_one_way_reachability() {
+    fn super_regions_preserve_one_way_reachability() {
         // Two disjoint floors connected only from the first to the second.
-        // This documents why the current region graph is only an optimistic hint.
         let make = |x, offmesh| SectorSummary {
             key: SectorKey { x, z: 0 },
             tiles_per_sector: 1,
@@ -1032,6 +1191,9 @@ mod direction_regression {
             portals: Vec::new(),
             offmesh,
             costs: vec![0],
+            arcs: vec![],
+            membership: vec![],
+            exits: None,
         };
         let a = make(
             0,
@@ -1047,8 +1209,7 @@ mod direction_regression {
         let record =
             SuperRecord::derive(SuperKey { x: 0, z: 0 }, &SectorParams::new(1, 2), &[&a, &b])
                 .unwrap();
-        // A single region falsely makes the reverse direction appear reachable.
-        assert_eq!(record.regions().len(), 1);
-        assert_eq!(record.regions()[0].members, vec![(0, 0), (1, 0)]);
+        assert_eq!(record.regions().len(), 2);
+        assert_eq!(record.region_arcs(), &[(0, 1)]);
     }
 }

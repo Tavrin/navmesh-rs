@@ -56,33 +56,43 @@ Sector compression, streaming, hierarchy memory and edit fan-out require a secto
 planner and are outside this flat baseline. Existing corpus parity and determinism
 checks remain independent compatibility gates.
 
-## Experimental query components
+## Directed routes
 
-The default-off `route` feature provides the sector summary records and two query
-components. `RouteIndex::build` compiles one profile's super-region graph into
-arrays outside the frame loop. `RouteIndex::request` starts a `CoarseSearch`;
-`resume` charges heap pops, individual edge relaxations and path reconstruction
-to a shared `Budget`. The completed corridor is exposed in reverse order, so
-completion does not hide an unbounded reversal. Stable region keys break ties.
-Dijkstra is used because geometric distance is not admissible for the region
-crossing lower bounds. A graph mutation invalidates existing searches.
+Enable the optional `route` feature and build a `SectorGraph::from_mesh` after
+installing the complete world, applying modifiers and linking its connections.
+The builder contracts reciprocal polygon links into sector regions and records
+the remaining directed arcs. It resolves both ends of every crossing against
+the installed polygon links, including runtime links and distant landings.
 
-`CorridorWindow` runs sliced search over the live mesh with a sector-set filter.
-Its detached state allows tile streaming between updates. A changed mesh epoch
-returns `MeshChanged`; this conservative policy also invalidates windows for
-unrelated edits. Admission allocates the node pool, and explicit `finish` copies
-the polygon corridor; these operations are not expansion-budgeted. Callers must
-inspect partial-result and node-exhaustion status bits. Window endpoints must be
-resident, and callers supply the sector margin and resolve portal positions.
+Sector and super-sector records use version 2. Regenerate both from the source
+tiles when upgrading. A sector record includes sorted directed arcs, run-length
+polygon membership and, when stitched, outgoing region addresses. A stitched
+super-sector records directed local arcs and exits addressed by destination
+sector and region. `RouteIndex::build_exact` requires stitched records with
+resolved destinations. Individually collected tile batches produce isolated
+sector summaries whose portal overlap and off-mesh landing estimates can guide
+queries. Bind them against a complete installed world before certifying a route.
 
-These are building blocks, not a qualified end-to-end long-route service. There
-is no automatic level-2 portal search, window advancement, first-move scheduling,
-or waiting/resumption service yet. No latency, fairness, cost, streaming, or
-full-world connectivity acceptance result is claimed for these components.
+Prepare a `RouteAtlas` with the same mesh and filter, then create a `Navigator`.
+Submit two `WindowPoint` endpoints with `request`. Call `update` repeatedly
+with one shared frame budget and the maximum units per scheduler turn. An
+unanswered request gets priority over a continuation. Level-three search
+selects a directed corridor. Level-two search connects portal representatives
+within it using the sector cost tables. The scheduler refines each sector on
+the live mesh and publishes `RouteState::Segment`. Follow the polygon refs
+from `segment` to the position from `toward`, then call `advance`. The last
+acknowledgment sets `Complete`. Call `cancel` to release the request.
 
-The current summary representation joins one-way off-mesh connections into
-undirected regions, and locates some far endpoints using bounding boxes. Therefore
-coarse connectivity is only an optimistic hint. A unit regression documents two
-regions connected in one direction collapsing to one super-region. Fixing exact
-reachability requires directed region transitions and unambiguous endpoint
-membership; callers must not use the current graph to certify reachability.
+A missing landing lets the agent reach its departure point before reporting
+`Waiting`. Call `sync` after residency changes. It compares slot identities
+outside the frame budget, restarts active windows and wakes waiting requests.
+A changed tile generation, modifier revision or runtime-link edit returns
+`MeshChanged`. Rebuild the graph and atlas and resubmit from the current
+position. The current navigator retains the level-two payloads while level-one
+tiles stream. Its mesh binding, scheduler handles and live polygon corridors
+are process-local.
+
+A work unit can include window allocation or corridor finalization. The work
+budget alone gives no wall-clock guarantee. The ignored `route_world` harness
+selects the candidate with `NAV_ROUTE_CANDIDATE=1` and the `parallel,route`
+features. Quality replay and pinned timing use the same seeded pair order.

@@ -46,7 +46,7 @@ parallel = ["dep:rayon"]
 serde = ["dep:serde"]
 
 # Opt-in sector summaries and resumable long-route queries.
-route = ["detour"]
+route = ["dynamic"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"], optional = true }

@@ -35,6 +35,20 @@ pub struct RouteIndex {
     profile: u32,
 }
 impl RouteIndex {
+    /// Builds the directed index for stitched records. Missing destinations and
+    /// records derived solely from isolated sectors are rejected.
+    pub fn build_exact(graph: &SectorGraph, profile: u32) -> Result<Self, Error> {
+        for record in graph.records(profile) {
+            if !record.is_stitched()
+                || record
+                    .destinations()
+                    .any(|(k, r)| graph.super_region(profile, k, r).is_none())
+            {
+                return Err(Error::InvalidInput("incomplete stitched graph"));
+            }
+        }
+        Self::build(graph, profile)
+    }
     /// Compiles the current graph, rejecting stale records and invalid costs.
     pub fn build(graph: &SectorGraph, profile: u32) -> Result<Self, Error> {
         let mut keys = Vec::new();

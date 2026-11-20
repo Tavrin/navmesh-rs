@@ -123,12 +123,24 @@ fn summaries_are_load_order_independent_and_match_the_bake_collector() {
         );
         assert!(!s.regions().is_empty() && s.polygon_count() > 0);
         split_regions += usize::from(s.regions().len() > 1);
-        // Weak components of ground polygons are mutually reachable inside the
-        // sector, and nothing else is.
+        // A finite table entry must agree with the directed region graph.
         for (i, a) in s.portals().iter().enumerate() {
+            let mut seen = std::collections::BTreeSet::from([a.region]);
+            let mut pending = vec![a.region];
+            while let Some(region) = pending.pop() {
+                for &(from, to) in s.region_arcs() {
+                    if from == region && seen.insert(to) {
+                        pending.push(to);
+                    }
+                }
+            }
             for (j, b) in s.portals().iter().enumerate() {
                 let q = s.quantized_cost(i, j).unwrap();
-                assert_eq!(q == UNREACHABLE, a.region != b.region, "{key:?} {i} {j}");
+                assert_eq!(
+                    q != UNREACHABLE,
+                    seen.contains(&b.region),
+                    "{key:?} {i} {j}"
+                );
                 if i == j {
                     assert_eq!(q, 0);
                 }
@@ -159,7 +171,7 @@ fn records_reject_malformed_bytes() {
         ("trailing", [good.as_slice(), &[0]].concat()),
         ("magic", bad(0, b'X')),
         ("version", bad(4, 9)),
-        ("flags", bad(6, 1)),
+        ("flags", bad(6, 2)),
         ("padding", bad(19, 1)),
         ("nan quantum", {
             let mut b = good.clone();
@@ -515,4 +527,65 @@ fn live_window_is_slice_invariant_and_rejects_tile_edits() {
         window.resume(&nav, &mut Budget::new(17), 17),
         Err(Error::MeshChanged)
     ));
+}
+
+#[test]
+fn stitched_corridors_agree_across_load_order_and_scheduler_slices() {
+    use navmesh_rs::detour::NavMeshQuery;
+    use navmesh_rs::route::{Navigator, RouteAtlas, RouteState, WindowPoint};
+    let (grid, tiles) = small_world();
+    let run = |nav: NavMesh| {
+        let filter = DefaultFilter::default();
+        let graph =
+            SectorGraph::from_mesh(&nav, &SectorParams::new(2, 2), &filter, nav.limits()).unwrap();
+        let atlas = RouteAtlas::new(&graph, &nav, filter.clone()).unwrap();
+        let query = NavMeshQuery::new(&nav, 64).unwrap();
+        let snap = |p| {
+            let (r, pos, _) = query
+                .find_nearest_poly(&p, &[8., 20., 8.], &filter)
+                .unwrap();
+            WindowPoint::new(r, pos)
+        };
+        let start = snap([12., 0., 45.]);
+        let goal = snap([100., 0., 55.]);
+        let route = |slice| {
+            let mut scheduler = Navigator::new(&atlas, 2048).unwrap();
+            let id = scheduler.request(&nav, start, goal).unwrap();
+            let mut corridor = Vec::new();
+            for _ in 0..100_000 {
+                scheduler
+                    .update(&nav, &mut Budget::new(slice), slice)
+                    .unwrap();
+                match scheduler.state(id).unwrap() {
+                    RouteState::Segment => {
+                        for &r in scheduler.segment(id).unwrap() {
+                            let t = nav.tile_and_poly_by_ref(r).unwrap().0;
+                            let key = (
+                                t.header.x,
+                                t.header.y,
+                                t.header.layer,
+                                nav.decode_poly_id(r).2,
+                            );
+                            if corridor.last() != Some(&key) {
+                                corridor.push(key);
+                            }
+                        }
+                        scheduler.advance(id).unwrap();
+                    }
+                    RouteState::Planning => {}
+                    RouteState::Complete => return corridor,
+                    other => panic!("{other:?}"),
+                }
+            }
+            panic!("route did not terminate")
+        };
+        let path = route(1);
+        assert_eq!(path, route(17));
+        assert_eq!(path, route(1000));
+        path
+    };
+    assert_eq!(
+        run(mesh(&grid, tiles.iter())),
+        run(mesh(&grid, tiles.iter().rev()))
+    );
 }
