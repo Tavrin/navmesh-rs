@@ -21,6 +21,10 @@ fn detail_prism(ymin: f32, ymax: f32) -> Selector {
 }
 
 fn tile(layer: i32, raised: bool) -> Vec<u8> {
+    tile_variant(layer, raised, 0)
+}
+
+fn tile_variant(layer: i32, raised: bool, user_id: u32) -> Vec<u8> {
     let verts = [0., 0., 0., 0., 0., 1., 1., 0., 1., 1., 0., 0.];
     let mut detail = verts.to_vec();
     detail.extend_from_slice(&[0.5, 1., 0.5]);
@@ -36,6 +40,7 @@ fn tile(layer: i32, raised: bool) -> Vec<u8> {
         cs: 1.,
         ch: 1.,
         tile_layer: layer,
+        user_id,
         ..Default::default()
     };
     if raised {
@@ -154,9 +159,8 @@ fn replacement_reselects_the_surface_and_reload_uses_the_current_gate_bit() {
         .tile_ref()
         .unwrap();
     assert_eq!(nav.poly_flags(raised), Ok(0));
-    nav.set_poly_flags(raised, 3).unwrap();
-
     nav.set_modifier_enabled(GATE, false).unwrap();
+    nav.set_poly_flags(raised, 3).unwrap();
     assert_eq!(nav.poly_flags(raised), Ok(3));
     let parked = nav.unload_tile(raised).unwrap();
     nav.set_modifier_enabled(GATE, true).unwrap();
@@ -178,7 +182,7 @@ fn replacement_reselects_the_surface_and_reload_uses_the_current_gate_bit() {
         .unwrap();
     assert_eq!(nav.poly_flags(raised_again), Ok(0));
     nav.set_modifier_enabled(GATE, false).unwrap();
-    assert_eq!(nav.poly_flags(raised_again), Ok(3));
+    assert_eq!(nav.poly_flags(raised_again), Ok(1));
 }
 
 #[test]
@@ -192,16 +196,16 @@ fn base_edits_are_folded_under_active_effects_and_saved_with_the_layer() {
             Effect::SetArea(9),
         ))
         .unwrap();
-    layer.set_enabled(ZONE, true).unwrap();
+    layer.set_enabled(GATE, false).unwrap();
     nav.set_dynamic_layer(Some(layer));
     let bytes = tile(0, true);
     let poly = nav.add_tile(bytes.clone()).unwrap();
-    let stamp = nav.state_stamp(poly);
     nav.set_poly_flags(poly, 0x8021).unwrap();
     nav.set_poly_area(poly, 79).unwrap();
+    nav.set_modifier_enabled(GATE, true).unwrap();
+    nav.set_modifier_enabled(ZONE, true).unwrap();
     assert_eq!(nav.poly_flags(poly), Ok(0));
     assert_eq!(nav.poly_area(poly), Ok(9));
-    assert_eq!(nav.state_stamp(poly), stamp);
     assert_eq!(nav.baked_poly_state(poly), Ok((1, 1)));
 
     let saved = nav.dynamic_layer().unwrap().to_bytes();
@@ -237,4 +241,134 @@ fn base_edits_are_folded_under_active_effects_and_saved_with_the_layer() {
         DynamicLayer::from_bytes(&unknown, Limits::UNLIMITED),
         Err(Error::InvalidSnapshot(SnapshotError::WrongVersion))
     ));
+}
+
+#[test]
+fn effective_read_modify_write_preserves_owned_base_fields() {
+    let mut layer = DynamicLayer::new(2, Limits::UNLIMITED).unwrap();
+    let selector = Selector::Prism {
+        verts_xz: OUTLINE.to_vec(),
+        ymin: 0.0,
+        ymax: 1.0,
+        area: None,
+    };
+    for (id, effect) in [(GATE, Effect::ClearFlags(1)), (ZONE, Effect::SetArea(9))] {
+        layer
+            .upsert(ModifierSpec::new(id, selector.clone(), effect))
+            .unwrap();
+        layer.set_enabled(id, true).unwrap();
+    }
+    let v1 = layer.to_bytes();
+    assert_eq!(&v1[..8], b"DNDY\x01\0\0\0");
+    let mut nav = mesh();
+    nav.set_dynamic_layer(Some(
+        DynamicLayer::from_bytes(&v1, Limits::UNLIMITED).unwrap(),
+    ));
+    let poly = nav.add_tile(tile(0, true)).unwrap();
+    nav.set_poly_flags(poly, nav.poly_flags(poly).unwrap() | 4)
+        .unwrap();
+    nav.set_poly_area(poly, nav.poly_area(poly).unwrap())
+        .unwrap();
+    nav.set_poly_area(poly, 13).unwrap();
+    assert_eq!(nav.poly_flags(poly), Ok(4));
+    assert_eq!(nav.poly_area(poly), Ok(9));
+    assert_eq!(nav.poly_base_flags(poly), Ok(5));
+    assert_eq!(nav.poly_base_area(poly), Ok(1));
+    let v2 = nav.dynamic_layer().unwrap().to_bytes();
+    assert_eq!(&v2[..8], b"DNDY\x02\0\0\0");
+    nav.set_modifier_enabled(GATE, false).unwrap();
+    nav.set_modifier_enabled(ZONE, false).unwrap();
+    assert_eq!(nav.poly_flags(poly), Ok(5));
+    assert_eq!(nav.poly_area(poly), Ok(1));
+}
+
+#[test]
+fn newly_selected_polygons_keep_prior_direct_writes() {
+    for path in 0..3 {
+        let mut nav = mesh();
+        let poly = nav.add_tile(tile(0, true)).unwrap();
+        nav.set_poly_flags(poly, 5).unwrap();
+        // Exercise tile-state restore as another way to edit an unmanaged polygon.
+        nav.set_poly_area(poly, 7).unwrap();
+        let mut state = vec![0; nav.tile_state_size(poly).unwrap()];
+        nav.store_tile_state(poly, &mut state).unwrap();
+        nav.set_poly_area(poly, 1).unwrap();
+        nav.restore_tile_state(poly, &state).unwrap();
+        let selector = detail_prism(0.75, 1.25);
+        match path {
+            0 => {
+                nav.set_dynamic_layer(Some(DynamicLayer::new(2, Limits::UNLIMITED).unwrap()));
+                nav.upsert_modifier(ModifierSpec::new(
+                    GATE,
+                    selector,
+                    Effect::ClearFlags(u16::MAX),
+                ))
+                .unwrap();
+                nav.set_modifier_enabled(GATE, true).unwrap();
+            }
+            1 => nav.set_dynamic_layer(Some(closed_gate(selector))),
+            _ => {
+                let parked = nav.unload_tile(poly).unwrap();
+                nav.set_dynamic_layer(Some(closed_gate(selector)));
+                let prepared = prepare_tile(nav.params(), nav.limits(), parked.bytes).unwrap();
+                assert_eq!(nav.commit_with_state(prepared, &parked.state), Ok(poly));
+            }
+        }
+        assert_eq!(nav.poly_flags(poly), Ok(0));
+        assert_eq!(nav.poly_base_flags(poly), Ok(5));
+        assert_eq!(nav.poly_base_area(poly), Ok(7));
+        nav.set_modifier_enabled(GATE, false).unwrap();
+        assert_eq!(nav.poly_flags(poly), Ok(5));
+        assert_eq!(nav.poly_area(poly), Ok(7));
+        assert_eq!(nav.dynamic_layer().unwrap().poly_base_edits().count(), 1);
+    }
+}
+
+#[test]
+fn replacing_or_removing_content_reclaims_the_base_edit_budget() {
+    let mut nav = mesh();
+    let limits = Limits {
+        max_bytes: 180,
+        ..Limits::UNLIMITED
+    };
+    nav.set_dynamic_layer(Some(DynamicLayer::new(1, limits).unwrap()));
+    nav.upsert_modifier(ModifierSpec::new(
+        GATE,
+        detail_prism(0.75, 1.25),
+        Effect::ClearFlags(1),
+    ))
+    .unwrap();
+    let mut poly = nav.add_tile(tile(0, true)).unwrap();
+    for variant in 1..=8 {
+        nav.set_poly_flags(poly, 5).unwrap();
+        let layer = nav.dynamic_layer().unwrap();
+        assert_eq!(layer.poly_base_edits().count(), 1);
+        assert!(layer.to_bytes().len() <= limits.max_bytes);
+        let data = tile_variant(0, true, variant);
+        if variant % 2 == 0 {
+            nav.remove_tile(poly).unwrap();
+            poly = nav.add_tile(data).unwrap();
+        } else {
+            let prepared = prepare_tile(nav.params(), nav.limits(), data).unwrap();
+            poly = nav.replace_tile(prepared).unwrap().tile_ref().unwrap();
+        }
+        assert_eq!(nav.poly_base_flags(poly), Ok(1));
+        assert_eq!(nav.dynamic_layer().unwrap().poly_base_edits().count(), 0);
+    }
+    nav.set_poly_flags(poly, 5).unwrap();
+    let edit = nav
+        .dynamic_layer()
+        .unwrap()
+        .poly_base_edits()
+        .next()
+        .unwrap();
+    let parked = nav.unload_tile(poly).unwrap();
+    let prepared = prepare_tile(nav.params(), nav.limits(), parked.bytes).unwrap();
+    assert_eq!(nav.commit(prepared), Ok(poly));
+    assert_eq!(nav.poly_base_flags(poly), Ok(5));
+    nav.set_modifier_enabled(GATE, true).unwrap();
+    assert!(nav.remove_poly_base_edit(&edit));
+    assert!(!nav.remove_poly_base_edit(&edit));
+    assert_eq!(nav.poly_base_flags(poly), Ok(1));
+    assert_eq!(nav.poly_flags(poly), Ok(0));
 }

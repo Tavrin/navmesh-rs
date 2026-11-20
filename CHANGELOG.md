@@ -9,9 +9,14 @@ All notable changes to this project are documented in this file. The format foll
 ### Added
 
 - `Selector::DetailPrism` selects ground polygons by intersection with their
-  Detour detail triangles. Modifier-managed polygons accept caller base flag
-  and area edits, with enabled effects applied over those values. DNDY snapshots
-  save the selector and base edits and continue to read version 1.
+  Detour detail triangles, including sloped-face contact within roundoff.
+- Modifier-managed polygons accept caller flag and area edits while preserving
+  base values for fields owned by enabled effects. New selections retain
+  existing caller edits. Base overrides can be inspected and removed and are
+  pruned when their tile content is retired.
+- DNDY version 1 snapshots still load. Selected polygons in a restored layer now
+  accept caller flag and area writes subject to modifier ownership. Saving a layer
+  with a caller base override or detail selector emits version 2.
   See [Dynamic modifiers](docs/DYNAMIC-MODIFIERS.md).
 
 ## [0.2.3] - 2026-11-20

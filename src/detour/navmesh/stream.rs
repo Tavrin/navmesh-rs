@@ -724,7 +724,17 @@ impl NavMesh {
         if footer[8..40] != t.hash || layout.is_some_and(|l| footer[40..] != l) {
             return Err(Error::InvalidTileState(TileStateError::WrongTile));
         }
-        let r = self.link_in(t.tile, target, Some(t.hash), true)?;
+        #[cfg(feature = "dynamic")]
+        let bases = self.modifiers.prepare_reload_bases(
+            &t.tile,
+            t.hash,
+            &state[super::TILE_STATE_HEADER_SIZE..]
+                [..t.tile.polys.len() * super::TILE_POLY_STATE_SIZE],
+        )?;
+        self.slots.ensure(target.ti)?;
+        #[cfg(feature = "dynamic")]
+        self.modifiers.capture_reload_bases(&t.tile, t.hash, bases);
+        let r = self.attach(t.tile, target, salt, Some(t.hash), true);
         self.restore_checked_state(target.ti, state, size)?;
         Ok(r)
     }
@@ -778,8 +788,18 @@ impl NavMesh {
             .map_err(|_| Error::AllocationFailed)?;
         state.resize(size, 0);
         self.store_tile_state(r, &mut state)?;
+        #[cfg(feature = "dynamic")]
+        if self.slots[ti].state_stamp != 0 {
+            let polys_end = super::TILE_STATE_HEADER_SIZE
+                + self.tile_unchecked(ti as u32).polys.len() * super::TILE_POLY_STATE_SIZE;
+            self.modifiers.mark_direct_bases(
+                self.tile_unchecked(ti as u32),
+                ti,
+                &mut state[super::TILE_STATE_HEADER_SIZE..polys_end],
+            );
+        }
         let known = self.slots[ti].hash;
-        let Some(tile) = self.detach(ti) else {
+        let Some(tile) = self.detach(ti, true) else {
             return Err(Error::InvalidRef);
         };
         let h = tile.header;
@@ -829,6 +849,11 @@ impl NavMesh {
             .parked_slot(&self.slots, key.x, key.y, layer)
             .ok_or(Error::InvalidParameter("no unloaded tile there"))?;
         let next = self.next_salt(self.slots[ti].salt)?;
+        #[cfg(feature = "dynamic")]
+        if let Some(parked) = self.slots[ti].parked {
+            self.modifiers
+                .prune_bases((key.x, key.y, layer, parked.hash));
+        }
         self.stream.unpark(key.x, key.y, layer);
         self.release_slot(ti, next);
         Ok(())

@@ -133,6 +133,30 @@ pub struct DynamicLayer {
 
 pub(crate) type BaseTileKey = (i32, i32, i32, [u8; 32]);
 
+/// A caller's saved overrides for one polygon of a particular tile content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PolyBaseEdit {
+    /// Tile column.
+    pub key: crate::detour::TileKey,
+    /// Tile layer within the column.
+    pub layer: i32,
+    /// SHA-256 identity of the tile content.
+    pub content_hash: [u8; 32],
+    /// Polygon index within the tile.
+    pub polygon_index: u32,
+    /// Caller flags, or baked flags when absent.
+    pub flags: Option<u16>,
+    /// Caller area, or baked area when absent.
+    pub area: Option<u8>,
+}
+
+impl PolyBaseEdit {
+    pub(crate) fn tile_key(&self) -> BaseTileKey {
+        (self.key.x, self.key.y, self.layer, self.content_hash)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct BaseState {
     pub(crate) flags: Option<u16>,
@@ -178,6 +202,14 @@ impl DynamicLayer {
     /// Registers a spec or replaces the spec of an existing ID.
     pub fn upsert(&mut self, spec: ModifierSpec) -> Result<(), Error> {
         self.validate_spec(&spec)?;
+        self.upsert_with_bases(spec, 0)
+    }
+
+    pub(crate) fn upsert_with_bases(
+        &mut self,
+        spec: ModifierSpec,
+        new_bases: usize,
+    ) -> Result<(), Error> {
         let at = self.position(spec.id);
         let old_size = at.ok().map_or(0, |i| self.entries[i].spec.encoded_len());
         let new_size = (self.specs_size - old_size)
@@ -188,7 +220,12 @@ impl DynamicLayer {
             .is_some_and(|i| self.entries[i].spec.selector.is_detail());
         let detail_count =
             self.detail_count - usize::from(old_detail) + usize::from(spec.selector.is_detail());
-        self.check_size(self.snapshot_len(new_size, self.bases.len(), detail_count != 0)?)?;
+        let count = self
+            .bases
+            .len()
+            .checked_add(new_bases)
+            .ok_or(Error::SizeOverflow)?;
+        self.check_size(self.snapshot_len(new_size, count, detail_count != 0)?)?;
         match at {
             Ok(i) => self.entries[i].spec = spec,
             Err(i) => {
@@ -253,6 +290,55 @@ impl DynamicLayer {
             .unwrap_or_default()
     }
 
+    /// Iterates over saved caller overrides in tile and polygon order.
+    /// Includes edits for unloaded tiles.
+    pub fn poly_base_edits(&self) -> impl Iterator<Item = PolyBaseEdit> + '_ {
+        self.bases
+            .iter()
+            .map(
+                |(&((x, y, layer, content_hash), polygon_index), base)| PolyBaseEdit {
+                    key: crate::detour::TileKey { x, y },
+                    layer,
+                    content_hash,
+                    polygon_index,
+                    flags: base.flags,
+                    area: base.area,
+                },
+            )
+    }
+
+    /// Removes an override identified by the tile content and polygon index.
+    /// Returns whether it existed.
+    pub fn remove_poly_base_edit(&mut self, edit: &PolyBaseEdit) -> bool {
+        self.bases
+            .remove(&(edit.tile_key(), edit.polygon_index))
+            .is_some()
+    }
+
+    pub(crate) fn prune_tile_bases(&mut self, key: BaseTileKey) {
+        let entries: Vec<_> = self
+            .bases
+            .range((key, 0)..=(key, u32::MAX))
+            .map(|(&entry, _)| entry)
+            .collect();
+        for entry in entries {
+            self.bases.remove(&entry);
+        }
+    }
+
+    pub(crate) fn check_new_bases(&self, new_bases: usize) -> Result<(), Error> {
+        let count = self
+            .bases
+            .len()
+            .checked_add(new_bases)
+            .ok_or(Error::SizeOverflow)?;
+        self.check_size(self.snapshot_len(self.specs_size, count, self.uses_detail())?)
+    }
+
+    pub(crate) fn capture_base(&mut self, key: BaseTileKey, ip: usize, base: BaseState) {
+        self.bases.insert((key, ip as u32), base);
+    }
+
     pub(crate) fn set_base(
         &mut self,
         tile: BaseTileKey,
@@ -265,8 +351,7 @@ impl DynamicLayer {
         }
         let old = self.bases.get(&key).copied();
         if old.is_none() {
-            let count = self.bases.len().checked_add(1).ok_or(Error::SizeOverflow)?;
-            self.check_size(self.snapshot_len(self.specs_size, count, false)?)?;
+            self.check_new_bases(1)?;
         }
         self.bases.insert(key, base);
         Ok(old != Some(base))
@@ -279,7 +364,7 @@ impl DynamicLayer {
         Ok(())
     }
 
-    fn validate_spec(&self, spec: &ModifierSpec) -> Result<(), Error> {
+    pub(crate) fn validate_spec(&self, spec: &ModifierSpec) -> Result<(), Error> {
         if spec.id.0 >= self.max_ids || matches!(spec.effect, Effect::SetArea(64..)) {
             return Err(Error::InvalidParameter("modifier ID or area"));
         }

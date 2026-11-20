@@ -48,7 +48,18 @@ fn overlaps_triangle(prism: &Prism<'_>, triangle: [[f32; 3]; 3]) -> bool {
     let ac = sub(c, a);
     let edges = [ab, sub(c, b), ac];
     let up = [0.0, 1.0, 0.0];
-    let overlaps_axis = |axis: [f64; 3]| {
+    let span = core::array::from_fn(|i| {
+        [
+            bounds.0[i],
+            bounds.1[i],
+            prism.bounds.0[i],
+            prism.bounds.1[i],
+        ]
+        .into_iter()
+        .map(|value| (f64::from(value) - a[i]).abs())
+        .fold(0.0, f64::max)
+    });
+    let overlaps_axis = |(axis, magnitude): ([f64; 3], [f64; 3])| {
         let p = dot(ab, axis);
         let q = dot(ac, axis);
         let tri_min = p.min(q).min(0.0);
@@ -62,7 +73,12 @@ fn overlaps_triangle(prism: &Prism<'_>, triangle: [[f32; 3]; 3]) -> bool {
         }
         let bottom = (f64::from(prism.bounds.0[1]) - a[1]) * axis[1];
         let top = (f64::from(prism.bounds.1[1]) - a[1]) * axis[1];
-        tri_min <= xz_max + bottom.max(top) && tri_max >= xz_min + bottom.min(top)
+        // The absolute cross-product terms bound even a nearly cancelled
+        // axis. Together with the relative spans they bound roundoff in both
+        // projections, including coordinate differences and interval sums.
+        let tolerance = 32.0 * f64::EPSILON * dot(span, magnitude);
+        tri_min <= xz_max + bottom.max(top) + tolerance
+            && tri_max >= xz_min + bottom.min(top) - tolerance
     };
     // The bounds check already covers the prism's horizontal faces.
     overlaps_axis(cross(ab, ac))
@@ -86,10 +102,101 @@ fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
     (a[0] * b[0] + a[2] * b[2]) + a[1] * b[1]
 }
 
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
-    ]
+fn cross(a: [f64; 3], b: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let terms = [
+        (a[1] * b[2], a[2] * b[1]),
+        (a[2] * b[0], a[0] * b[2]),
+        (a[0] * b[1], a[1] * b[0]),
+    ];
+    (
+        terms.map(|(p, q)| p - q),
+        terms.map(|(p, q)| p.abs() + q.abs()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type Point = [i128; 3];
+
+    fn difference(a: Point, b: Point) -> Point {
+        core::array::from_fn(|i| a[i] - b[i])
+    }
+
+    fn normal(a: Point, b: Point) -> Point {
+        core::array::from_fn(|i| {
+            let (j, k) = ((i + 1) % 3, (i + 2) % 3);
+            a[j] * b[k] - a[k] * b[j]
+        })
+    }
+
+    // All coordinates are integer numerators over the same power of two.
+    // Project the actual box vertices and triangle vertices with exact i128
+    // arithmetic. The common rational denominator cannot affect comparisons.
+    fn exact_overlap(triangle: [Point; 3], lo: Point, hi: Point) -> bool {
+        let corners: [Point; 8] = core::array::from_fn(|bits| {
+            core::array::from_fn(|i| if bits & (1 << i) == 0 { lo[i] } else { hi[i] })
+        });
+        let edges =
+            core::array::from_fn::<_, 3, _>(|i| difference(triangle[(i + 1) % 3], triangle[i]));
+        let axes = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+        let intersects = |axis: Point| {
+            let project = |point: Point| (0..3).map(|i| point[i] * axis[i]).sum::<i128>();
+            let tri = triangle.map(project);
+            let prism = corners.map(project);
+            tri.iter().min() <= prism.iter().max() && prism.iter().min() <= tri.iter().max()
+        };
+        intersects(normal(edges[0], edges[1]))
+            && axes.iter().all(|&axis| {
+                intersects(axis) && edges.iter().all(|&edge| intersects(normal(axis, edge)))
+            })
+    }
+
+    #[test]
+    fn sloped_face_contact_agrees_with_exact_rational_sat() {
+        let mut seed = 0x276e_8e5b_u32;
+        let mut component = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            4 * (i128::from(seed >> 11) - (1 << 20))
+        };
+        for case in 0..128 {
+            let origin: Point = core::array::from_fn(|_| component());
+            let u: Point = core::array::from_fn(|_| component());
+            let v: Point = core::array::from_fn(|_| component());
+            let triangle = [
+                origin,
+                core::array::from_fn(|i| origin[i] + u[i]),
+                core::array::from_fn(|i| origin[i] + v[i]),
+            ];
+            // A prism vertex lies strictly inside the triangle, at barycentric
+            // coordinates (1/2, 1/4, 1/4). All other prism vertices lie on the
+            // outward side of the sloped face.
+            let contact: Point = core::array::from_fn(|i| origin[i] + (u[i] + v[i]) / 4);
+            let face = normal(u, v);
+            assert!(face.iter().all(|&x| x != 0));
+            let scale = [1.0 / 4096.0, 1.0, 256.0][case % 3];
+            let f = |x: i128| x as f32 * scale;
+            for gap in [0, 1] {
+                let near: Point = core::array::from_fn(|i| contact[i] + face[i].signum() * gap);
+                let far: Point = core::array::from_fn(|i| near[i] + face[i].signum() * 16);
+                let lo: Point = core::array::from_fn(|i| near[i].min(far[i]));
+                let hi: Point = core::array::from_fn(|i| near[i].max(far[i]));
+                let outline = [
+                    [f(lo[0]), f(lo[2])],
+                    [f(hi[0]), f(lo[2])],
+                    [f(hi[0]), f(hi[2])],
+                    [f(lo[0]), f(hi[2])],
+                ];
+                let prism = Prism::new(&outline, f(lo[1]), f(hi[1]), None);
+                let expected = exact_overlap(triangle, lo, hi);
+                assert_eq!(expected, gap == 0, "oracle case {case}");
+                assert_eq!(
+                    overlaps_triangle(&prism, triangle.map(|p| p.map(f))),
+                    expected,
+                    "case {case}, gap {gap}"
+                );
+            }
+        }
+    }
 }

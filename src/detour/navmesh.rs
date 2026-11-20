@@ -1196,8 +1196,9 @@ impl NavMesh {
     }
 
     /// Sets a polygon's flags. On a modifier-managed polygon this sets the
-    /// caller's base flags. Enabled modifiers still clear or set the bits
-    /// named in their masks, in ascending modifier ID order.
+    /// caller's base flags except for bits owned by enabled flag effects.
+    /// Owned bits keep their previous base values so effective flags can be
+    /// used in a read-modify-write.
     pub fn set_poly_flags(&mut self, r: PolyRef, flags: u16) -> Result<(), Error> {
         self.tile_and_poly_by_ref(r)?;
         let (_, ti, ip) = self.decode_poly_id(r);
@@ -1228,8 +1229,8 @@ impl NavMesh {
     }
 
     /// Sets a polygon's area, masked to six bits. On a modifier-managed
-    /// polygon this sets the caller's base area. The last enabled area effect
-    /// in modifier ID order still determines its effective area.
+    /// polygon this sets the caller's base area when no enabled area effect
+    /// owns it. While owned, the base area is preserved.
     pub fn set_poly_area(&mut self, r: PolyRef, area: u8) -> Result<(), Error> {
         self.tile_and_poly_by_ref(r)?;
         let (_, ti, ip) = self.decode_poly_id(r);
@@ -1557,7 +1558,13 @@ impl NavMesh {
         let mut tile = tile;
         tile.managed_link_tile = self.link_layer() == Some(tile.header.layer);
         #[cfg(feature = "dynamic")]
-        let stamp = self.modifiers.attach_tile(&mut tile, ti, hash);
+        let stamp = {
+            if let Some(old) = target.parked_hash.filter(|&old| hash != Some(old)) {
+                self.modifiers
+                    .prune_bases((tile.header.x, tile.header.y, tile.header.layer, old));
+            }
+            self.modifiers.attach_tile(&mut tile, ti, hash)
+        };
         let h = &tile.header;
         let (hx, hy, hl) = (h.x, h.y, h.layer);
 
@@ -1647,7 +1654,7 @@ impl NavMesh {
         let ti = self.resident_slot(r)?;
         self.check_ground_layer(self.tile_unchecked(ti as u32).header.layer)?;
         let next = self.next_salt(self.slots[ti].salt)?;
-        let tile = self.detach(ti);
+        let tile = self.detach(ti, false);
         self.release_slot(ti, next);
         self.runtime_ground_changed();
         Ok(tile.map(|t| t.data).unwrap_or_default())
@@ -1700,7 +1707,7 @@ impl NavMesh {
     /// Takes the tile out of slot `ti`: lookup list, links from its neighbours and
     /// global pairs. The slot's salt, free-list state and reservation are left to
     /// the caller.
-    fn detach(&mut self, ti: usize) -> Option<Box<MeshTile>> {
+    fn detach(&mut self, ti: usize, retain_dynamic_bases: bool) -> Option<Box<MeshTile>> {
         let (x, y, layer) = self
             .tile(ti)
             .map(|t| (t.header.x, t.header.y, t.header.layer))?;
@@ -1727,8 +1734,13 @@ impl NavMesh {
         let tile = self.slots[ti].tile.take();
         #[cfg(feature = "dynamic")]
         if let Some(tile) = tile.as_deref() {
+            if !retain_dynamic_bases {
+                self.modifiers.prune_resident_bases(tile, ti);
+            }
             self.modifiers.detach_tile(tile, ti);
         }
+        #[cfg(not(feature = "dynamic"))]
+        let _ = retain_dynamic_bases;
         self.slots[ti].hash = None;
         self.stamp_tile_change(ti);
         self.resident = self.resident.saturating_sub(1);
