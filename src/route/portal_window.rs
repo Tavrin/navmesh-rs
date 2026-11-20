@@ -2,7 +2,7 @@
 use super::{SectorKey, SectorParams, WindowPoint, summary::entry_mid};
 use crate::detour::{DefaultFilter, NULL_LINK, NavMesh, PolyRef, QueryFilter};
 use crate::{Budget, Error};
-use alloc::{collections::BinaryHeap, vec::Vec};
+use alloc::{boxed::Box, collections::BinaryHeap, vec::Vec};
 use core::cmp::Reverse;
 
 struct Node {
@@ -14,12 +14,51 @@ struct Node {
     parent: usize,
 }
 
+// Retain populated pages between windows. A new search writes over old nodes
+// in index order, so restarting costs the same regardless of its predecessor.
+const NODES_PER_PAGE: usize = 64;
+const HEADS_PER_PAGE: usize = 256;
+
+#[derive(Default)]
+struct NodePages {
+    pages: Vec<Vec<Node>>,
+    len: usize,
+}
+impl NodePages {
+    fn push(&mut self, node: Node) {
+        let page_index = self.len / NODES_PER_PAGE;
+        let offset = self.len % NODES_PER_PAGE;
+        if page_index == self.pages.len() {
+            self.pages.push(Vec::with_capacity(NODES_PER_PAGE));
+        }
+        let page = &mut self.pages[page_index];
+        if offset == page.len() {
+            page.push(node);
+        } else {
+            page[offset] = node;
+        }
+        self.len += 1;
+    }
+}
+impl core::ops::Index<usize> for NodePages {
+    type Output = Node;
+    fn index(&self, i: usize) -> &Self::Output {
+        &self.pages[i / NODES_PER_PAGE][i % NODES_PER_PAGE]
+    }
+}
+impl core::ops::IndexMut<usize> for NodePages {
+    fn index_mut(&mut self, i: usize) -> &mut Self::Output {
+        &mut self.pages[i / NODES_PER_PAGE][i % NODES_PER_PAGE]
+    }
+}
+
 pub(super) struct PortalWindow {
     sectors: Vec<SectorKey>,
     target: WindowPoint,
     minimum: f32,
-    heads: Vec<u32>,
-    nodes: Vec<Node>,
+    head_mask: usize,
+    heads: Vec<Option<Box<[u32; HEADS_PER_PAGE]>>>,
+    nodes: NodePages,
     open: BinaryHeap<Reverse<(u32, u32, usize)>>,
     best: usize,
     expanded: usize,
@@ -34,6 +73,7 @@ impl PortalWindow {
         filter: &DefaultFilter,
         limit: usize,
     ) -> Self {
+        let buckets = (limit / 2).max(1).next_power_of_two();
         let mut window = Self {
             sectors: Vec::new(),
             target,
@@ -42,9 +82,10 @@ impl PortalWindow {
                 .iter()
                 .copied()
                 .fold(f32::INFINITY, f32::min),
-            heads: alloc::vec![0; (limit / 2).max(1).next_power_of_two()],
-            nodes: Vec::with_capacity(limit),
-            open: BinaryHeap::with_capacity(limit.min(4096)),
+            head_mask: buckets - 1,
+            heads: alloc::vec![None; buckets.div_ceil(HEADS_PER_PAGE)],
+            nodes: NodePages::default(),
+            open: BinaryHeap::new(),
             best: 0,
             expanded: 0,
             active: None,
@@ -63,7 +104,7 @@ impl PortalWindow {
         self.best = 0;
         self.expanded = 0;
         self.active = None;
-        self.nodes.clear();
+        self.nodes.len = 0;
         self.nodes.push(Node {
             point: start,
             previous: 0,
@@ -143,15 +184,16 @@ impl PortalWindow {
             #[allow(clippy::unnecessary_cast)]
             let hash = (e.r#ref as u64).wrapping_mul(0x9e3779b97f4a7c15)
                 ^ (point.polygon as u64).rotate_left(27);
-            let bucket = ((hash ^ (hash >> 32)) as usize) & (self.heads.len() - 1);
+            let bucket = ((hash ^ (hash >> 32)) as usize) & self.head_mask;
             // After a restart the first insertion into a bucket must find
             // an empty chain. A head can name a current node of this bucket
             // only if an insertion has already overwritten it in this window.
-            let head = self.heads[bucket];
-            let head = if self
-                .nodes
-                .get(head as usize)
-                .is_some_and(|n| n.bucket == bucket as u32)
+            let page = self.heads[bucket / HEADS_PER_PAGE]
+                .get_or_insert_with(|| Box::new([0; HEADS_PER_PAGE]));
+            let slot = &mut page[bucket % HEADS_PER_PAGE];
+            let head = *slot;
+            let head = if (head as usize) < self.nodes.len
+                && self.nodes[head as usize].bucket == bucket as u32
             {
                 head
             } else {
@@ -166,10 +208,10 @@ impl PortalWindow {
                 index = old.next;
             }
             if index == 0 {
-                if self.nodes.len() >= limit {
+                if self.nodes.len >= limit {
                     return Err(Error::LimitExceeded);
                 }
-                index = self.nodes.len() as u32;
+                index = self.nodes.len as u32;
                 self.nodes.push(Node {
                     point: WindowPoint::new(e.r#ref, mid),
                     previous: point.polygon,
@@ -178,7 +220,7 @@ impl PortalWindow {
                     cost,
                     parent: id,
                 });
-                self.heads[bucket] = index;
+                *slot = index;
             } else if self.nodes[index as usize].cost <= cost {
                 continue;
             }

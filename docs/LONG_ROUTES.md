@@ -102,7 +102,9 @@ position. The current navigator retains the level-two payloads while level-one
 tiles stream. Its mesh binding, scheduler handles and live polygon corridors
 are process-local.
 
-A work unit can include window allocation or corridor finalization. The work
+Live refinement allocates node and hash-table pages as it examines links. A
+window reuses these pages when the next search starts. A work unit can include
+corridor finalization. The work
 budget alone gives no wall-clock guarantee. The ignored `route_world` harness
 selects the candidate with `NAV_ROUTE_CANDIDATE=1` and the `parallel,route`
 features. Quality replay and pinned timing use the same seeded pair order.
