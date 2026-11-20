@@ -15,7 +15,8 @@ positive radius.
    stream. Drain each job regularly to keep pending output bounded.
 2. Use `GridLayout::new` or `GridLayout::from_input` for the native halo. For an
    explicitly authored halo, use `with_halo_cells` with each profile's config.
-   It checks the radius, link-extraction reach and padded grid limits.
+   It checks the radius, link-extraction reach and padded grid limits. Each profile
+   can configure [ladder, stair-step and level-gap extraction](BAKED-TRAVERSAL.md).
 3. Create a `ProfileCatalogBuilder` with the profile's runtime layout options.
    Insert every delivered result, including explicit empty columns. Store
    nonempty DNAV payloads under the SHA-256 of their original bytes. The same

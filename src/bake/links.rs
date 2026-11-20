@@ -5,6 +5,10 @@ use crate::recast::{CompactHeightfield, Heightfield, MESH_NULL_IDX, NULL_AREA, P
 use crate::{Error, Workspace};
 use alloc::vec::Vec;
 
+mod extended;
+pub(super) use extended::extract_extended;
+pub use extended::{ExtendedLinkExtraction, GapLinks, LadderLinks, StepLinks};
+
 /// Parameters for one traversal kind, in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkLimits {
@@ -22,7 +26,7 @@ pub struct LinkLimits {
 /// Clearance uses a continuous swept square of half-width `walkable_radius`,
 /// conservatively enclosing a cylindrical agent; corner contacts may reject links.
 /// Every kind requires an absolute height change greater than `walkable_climb`;
-/// in particular, equal-height gap jumps are excluded by this minimum-height rule.
+/// For equal-height jumps, see [`ExtendedLinkExtraction::level_gaps`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkExtraction {
     /// Downward links.
@@ -59,11 +63,7 @@ impl LinkExtraction {
             .flatten()
             .map(|l| l.distance)
             .fold(0.0f32, f32::max);
-        let cells = ceilf(reach / cs);
-        if !cells.is_finite() || cells >= (i32::MAX / 4) as f32 {
-            return Err(Error::SizeOverflow);
-        }
-        Ok(cells as i32)
+        reach_cells(reach, cs)
     }
 }
 
@@ -77,6 +77,7 @@ pub enum LinkKind {
     /// Upward traversal.
     Climb,
 }
+
 /// One generated, one-directional connection, also installed in the tile bytes.
 #[derive(Clone, Debug)]
 pub struct ExtractedLink {
@@ -108,18 +109,63 @@ impl PartialEq for ExtractedLink {
 }
 impl Eq for ExtractedLink {}
 
+/// An extended traversal connection included in the baked tile bytes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ExtendedExtractedLink {
+    /// Departure on a walkable surface.
+    pub start: [f32; 3],
+    /// Arrival on a walkable surface.
+    pub end: [f32; 3],
+    /// Endpoint attachment radius.
+    pub radius: f32,
+    /// Traversal kind. Ladders are bidirectional.
+    pub kind: crate::detour::OffMeshKind,
+    /// Caller-selected area.
+    pub area: u8,
+    /// Caller-selected flags.
+    pub flags: u16,
+}
+
+impl PartialEq for ExtendedExtractedLink {
+    fn eq(&self, other: &Self) -> bool {
+        self.start.map(f32::to_bits) == other.start.map(f32::to_bits)
+            && self.end.map(f32::to_bits) == other.end.map(f32::to_bits)
+            && self.radius.to_bits() == other.radius.to_bits()
+            && self.kind == other.kind
+            && self.area == other.area
+            && self.flags == other.flags
+    }
+}
+impl Eq for ExtendedExtractedLink {}
+
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(super) struct TileLinks {
+    pub legacy: Vec<ExtractedLink>,
+    pub extended: Vec<ExtendedExtractedLink>,
+}
+
 pub(super) fn halo(c: &BakeConfig) -> Result<i32, Error> {
     let base = c
         .recast
         .walkable_radius
         .checked_add(3)
         .ok_or(Error::SizeOverflow)?;
-    match c.links {
-        None => Ok(base),
-        Some(l) => base
-            .checked_add(l.reach_cells(c.recast.cs)?)
-            .ok_or(Error::SizeOverflow),
+    let legacy = c.links.map_or(Ok(0), |l| l.reach_cells(c.recast.cs))?;
+    base.checked_add(legacy.max(reach_cells(c.extended_links.reach(), c.recast.cs)?))
+        .ok_or(Error::SizeOverflow)
+}
+
+fn reach_cells(reach: f32, cs: f32) -> Result<i32, Error> {
+    if reach == 0.0 {
+        return Ok(0);
     }
+    let cells = ceilf(reach / cs);
+    if !cells.is_finite() || cells >= (i32::MAX / 4) as f32 {
+        return Err(Error::SizeOverflow);
+    }
+    Ok(cells as i32)
 }
 
 fn column(h: &CompactHeightfield, p: [f32; 3]) -> Option<usize> {
@@ -415,10 +461,10 @@ pub(super) fn extract(
     }
     Ok(out)
 }
-fn flush(
+fn flush<T: Clone>(
     ws: &mut Workspace,
-    run: &mut Vec<(ExtractedLink, usize)>,
-    out: &mut Vec<ExtractedLink>,
+    run: &mut Vec<(T, usize)>,
+    out: &mut Vec<T>,
 ) -> Result<(), Error> {
     if !run.is_empty() {
         ws.push(out, run[run.len() / 2].0.clone())?;

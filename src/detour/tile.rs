@@ -111,6 +111,28 @@ pub struct BvNode {
     pub i: i32,
 }
 
+/// Explicit traversal kind carried by an extracted off-mesh connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OffMeshKind {
+    /// A bidirectional climb along an authored ladder.
+    Ladder,
+    /// A short step between disconnected walking surfaces.
+    Step,
+    /// A jump between landings at the same height.
+    LevelGap,
+}
+
+impl OffMeshKind {
+    pub(super) const fn flags(self) -> u8 {
+        match self {
+            Self::Ladder => 0xad,
+            Self::Step => 0xa8,
+            Self::LevelGap => 0xaa,
+        }
+    }
+}
+
 /// Off-mesh connection (`dtOffMeshConnection`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[allow(missing_docs)]
@@ -121,6 +143,18 @@ pub struct OffMeshConnection {
     pub flags: u8,
     pub side: u8,
     pub user_id: u32,
+}
+
+impl OffMeshConnection {
+    /// The explicit traversal kind, if the connection carries one.
+    pub fn kind(&self) -> Option<OffMeshKind> {
+        match self.flags {
+            0xad => Some(OffMeshKind::Ladder),
+            0xa8 => Some(OffMeshKind::Step),
+            0xaa => Some(OffMeshKind::LevelGap),
+            _ => None,
+        }
+    }
 }
 
 /// A tile resident in a navmesh (`dtMeshTile`), decoded from validated bytes.

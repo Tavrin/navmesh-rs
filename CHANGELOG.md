@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in bake extraction for tagged ladders, short stair steps across disconnected
+  surfaces, and jumps across level gaps. Each profile configures its own clearance,
+  reach and traversal cost areas. Both crowds report the traversal kind in external
+  mode. See [extended bake links](docs/BAKED-TRAVERSAL.md).
+
 ## [0.2.3] - 2026-11-20
 
 ### Added

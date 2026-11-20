@@ -322,7 +322,7 @@ pub fn mark_box_area(
     Ok(())
 }
 
-fn point_in_poly(verts: &[f32], p: &[f32; 3]) -> bool {
+pub(crate) fn point_in_area_polygon(verts: &[f32], p: &[f32; 3]) -> bool {
     let n = verts.len() / 3;
     let mut inside = false;
     let mut j = n.wrapping_sub(1);
@@ -394,7 +394,7 @@ pub fn mark_convex_poly_area(
                     0.0,
                     chf.bmin[2] + (z as f32 + 0.5) * chf.cs,
                 ];
-                if point_in_poly(verts, &p) {
+                if point_in_area_polygon(verts, &p) {
                     chf.areas[i] = area;
                 }
             }

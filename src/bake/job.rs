@@ -42,6 +42,8 @@ pub struct TileOutput {
     pub output_hash: Option<u64>,
     /// Generated traversal connections.
     pub links: Vec<super::ExtractedLink>,
+    /// Generated ladders, steps and level gap jumps in bake order.
+    pub extended_links: Vec<super::ExtendedExtractedLink>,
 }
 
 struct Fetched {
@@ -218,7 +220,7 @@ fn output(
     input_hash: u64,
     data: Option<Vec<u8>>,
     triangulation: TriangulationReport,
-    links: Vec<super::ExtractedLink>,
+    links: super::links::TileLinks,
 ) -> TileOutput {
     TileOutput {
         key,
@@ -226,7 +228,8 @@ fn output(
         data,
         triangulation,
         input_hash,
-        links,
+        links: links.legacy,
+        extended_links: links.extended,
     }
 }
 

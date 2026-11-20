@@ -34,7 +34,10 @@ use crate::recast::{self, Config};
 use crate::{Error, Limits, UpstreamFixes, Workspace};
 
 mod links;
-pub use links::{ExtractedLink, LinkExtraction, LinkKind, LinkLimits};
+pub use links::{
+    ExtendedExtractedLink, ExtendedLinkExtraction, ExtractedLink, GapLinks, LadderLinks,
+    LinkExtraction, LinkKind, LinkLimits, StepLinks,
+};
 mod install;
 mod job;
 mod manifest;
@@ -158,6 +161,8 @@ pub struct BakeConfig {
     pub fixes: UpstreamFixes,
     /// Optional boundary traversal extraction; disabled by default.
     pub links: Option<LinkExtraction>,
+    /// Optional ladder, stair-step and level-gap traversal extraction.
+    pub extended_links: ExtendedLinkExtraction,
     /// Ground-polygon slots reserved in each nonempty tile for runtime links.
     pub spare_links_per_tile: u32,
 }
@@ -194,6 +199,7 @@ impl Default for BakeConfig {
             strict_triangulation: false,
             fixes: UpstreamFixes::NONE,
             links: None,
+            extended_links: ExtendedLinkExtraction::default(),
             spare_links_per_tile: 0,
         }
     }
@@ -236,6 +242,8 @@ pub struct Tile {
     pub triangulation: recast::TriangulationReport,
     /// Generated traversal connections, in boundary/sample order.
     pub links: Vec<ExtractedLink>,
+    /// Generated ladders, steps and level gap jumps in bake order.
+    pub extended_links: Vec<ExtendedExtractedLink>,
 }
 
 /// Ordered tiles and their Detour layout; not in recastnavigation.
@@ -294,6 +302,7 @@ fn validate_config(c: &BakeConfig) -> Result<(), Error> {
     if let Some(links) = c.links {
         links.validate()?;
     }
+    c.extended_links.validate()?;
     let base = c.recast;
     if !positive(base.cs)
         || !positive(base.ch)
@@ -629,7 +638,11 @@ fn bake(
     // Slots are allocated fallibly and byte-charged before rayon sees them.
     let mut results = ws.vec(
         p.configs.len(),
-        Ok((None, recast::TriangulationReport::default(), Vec::new())),
+        Ok((
+            None,
+            recast::TriangulationReport::default(),
+            links::TileLinks::default(),
+        )),
     )?;
     let columns = p.columns;
     let coord = |i: usize| -> Result<(i32, i32), Error> {
@@ -660,7 +673,8 @@ fn bake(
             y,
             data,
             triangulation,
-            links,
+            links: links.legacy,
+            extended_links: links.extended,
         });
     }
     Ok(BakedTiles {
@@ -705,7 +719,7 @@ type TileResult = Result<
     (
         Option<Vec<u8>>,
         recast::TriangulationReport,
-        Vec<ExtractedLink>,
+        links::TileLinks,
     ),
     Error,
 >;
@@ -950,7 +964,11 @@ mod tests {
             .build()
             .unwrap();
         let mut results = core::array::from_fn::<_, 4, _>(|_| {
-            Ok((None, recast::TriangulationReport::default(), Vec::new()))
+            Ok((
+                None,
+                recast::TriangulationReport::default(),
+                links::TileLinks::default(),
+            ))
         });
         pool.install(|| {
             fill_results(&mut results, true, |i| {
@@ -960,7 +978,11 @@ mod tests {
                 } else if i == 3 {
                     Err(Error::Failed)
                 } else {
-                    Ok((None, recast::TriangulationReport::default(), Vec::new()))
+                    Ok((
+                        None,
+                        recast::TriangulationReport::default(),
+                        links::TileLinks::default(),
+                    ))
                 }
             })
         });

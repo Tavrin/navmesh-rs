@@ -125,7 +125,8 @@ WASI extraction digests both equal `13dcb3885bf0a7d6`.
 
 The two-slab diagnostic over 16 repeats records default/extraction totals of
 7,176,151 / 11,909,987 ns, tile sizes 828 / 1,140 bytes, and two links.
-Equal-height gap jumps remain excluded. Halo landings without local target
+The extraction settings measured here exclude equal-height gap jumps. See
+[Extended bake links](BAKED-TRAVERSAL.md) for the separate opt-in. Halo landings without local target
 polygon IDs remain separate; the complete-set reference covers single-tile
 pipelines rather than claiming a complete cross-halo installation oracle.
 

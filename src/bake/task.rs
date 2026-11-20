@@ -15,7 +15,7 @@ use crate::detour::{self, NavMeshCreateParams};
 use crate::recast::{
     self, CompactHeightfield, Config, ContourSet, Heightfield, PolyMesh, PolyMeshDetail,
 };
-use crate::{CancelToken, Error, Limits, Usage, Workspace};
+use crate::{CancelToken, Error, Limits, UpstreamFixes, Usage, Workspace};
 
 // Stage APIs reset accounting. Supply the remaining per-tile budget at each
 // boundary, then accumulate usage so a later stage cannot spend it again.
@@ -225,8 +225,9 @@ pub(super) struct TileTask<'a> {
     source: Option<TriSource<'a>>,
     state: State,
     pub(super) report: Option<super::TileReport>,
-    pub(super) links: Vec<super::ExtractedLink>,
+    pub(super) links: super::links::TileLinks,
     solid: Option<Heightfield>,
+    incoming_ladder_links: u32,
 }
 
 impl<'a> TileTask<'a> {
@@ -260,8 +261,9 @@ impl<'a> TileTask<'a> {
             source: Some(source),
             state: State::Finished,
             report: None,
-            links: Vec::new(),
+            links: super::links::TileLinks::default(),
             solid: None,
+            incoming_ladder_links: 0,
         }
     }
 
@@ -440,7 +442,7 @@ impl<'a> TileTask<'a> {
                 let chf = self.tw.stage(|ws| {
                     CompactHeightfield::build(ws, cfg.walkable_height, cfg.walkable_climb, &hf)
                 })?;
-                if self.c.links.is_some() {
+                if self.c.links.is_some() || self.c.extended_links.enabled() {
                     self.solid = Some(hf);
                 }
                 self.state = State::Erode { chf };
@@ -454,7 +456,9 @@ impl<'a> TileTask<'a> {
                 Ok(Advance::More)
             }
             State::Volumes { mut chf, next } => {
-                if let Some(v) = self.volumes.get(next) {
+                if let Some(v) = self.volumes.get(next)
+                    && !self.c.extended_links.is_ladder_marker(v.area)
+                {
                     self.tw.trusted_stage(|ws| {
                         recast::mark_convex_poly_area(
                             ws, &v.verts, v.hmin, v.hmax, v.area, &mut chf,
@@ -578,6 +582,12 @@ impl<'a> TileTask<'a> {
                         return Err(Error::InvalidParameter("detail sample distance too small"));
                     }
                 }
+                // Typed links resolve landings against the detail surface. With
+                // zero edge sampling, triangulate the ground polygon itself.
+                let mut fixes = self.c.fixes;
+                if self.c.extended_links.enabled() {
+                    fixes |= UpstreamFixes::ZERO_SAMPLE_DIST;
+                }
                 let detail = self.tw.trusted_stage(|ws| {
                     PolyMeshDetail::build_with_fixes(
                         ws,
@@ -585,7 +595,7 @@ impl<'a> TileTask<'a> {
                         &chf,
                         cfg.detail_sample_dist,
                         cfg.detail_sample_max_error,
-                        self.c.fixes,
+                        fixes,
                     )
                 })?;
                 if mesh.npolys == 0 {
@@ -594,7 +604,7 @@ impl<'a> TileTask<'a> {
                     }
                     return Ok(Advance::Done(None, report));
                 }
-                self.state = if self.c.links.is_some() {
+                self.state = if self.c.links.is_some() || self.c.extended_links.enabled() {
                     State::Links {
                         chf,
                         mesh,
@@ -617,9 +627,20 @@ impl<'a> TileTask<'a> {
                 report,
             } => {
                 let solid = self.solid.take().ok_or(Error::Failed)?;
-                self.links = self
-                    .tw
-                    .stage(|ws| super::links::extract(ws, &self.c, &mesh, &chf, &solid))?;
+                (self.links, self.incoming_ladder_links) = self.tw.stage(|ws| {
+                    let legacy = super::links::extract(ws, &self.c, &mesh, &chf, &solid)?;
+                    let mut extended = Vec::new();
+                    let incoming = super::links::extract_extended(
+                        ws,
+                        &self.c,
+                        &mesh,
+                        &chf,
+                        &solid,
+                        &self.volumes,
+                        &mut extended,
+                    )?;
+                    Ok((super::links::TileLinks { legacy, extended }, incoming))
+                })?;
                 self.state = State::Dnav {
                     mesh,
                     detail,
@@ -727,11 +748,13 @@ impl<'a> TileTask<'a> {
             self.cfg.bmax,
             self.c.tile_limits.max_bytes,
         );
-        let off = if self.c.links.is_some() {
+        let mut kinds = Vec::new();
+        let off = if !self.links.extended.is_empty() || self.c.links.is_some() {
             self.tw.stage(|ws| {
                 ws.charge_bytes::<u8>(
                     (original.off_mesh_con_count as usize)
-                        .checked_add(self.links.len())
+                        .checked_add(self.links.legacy.len())
+                        .and_then(|n| n.checked_add(self.links.extended.len()))
                         .ok_or(Error::SizeOverflow)?
                         .checked_mul(128)
                         .ok_or(Error::SizeOverflow)?,
@@ -750,18 +773,37 @@ impl<'a> TileTask<'a> {
                         original.off_mesh_con_user_id.get(i).copied().unwrap_or(0),
                     )?;
                 }
-                for (i, l) in self.links.iter().enumerate() {
+                if self.c.extended_links.enabled() {
+                    kinds = ws.vec(combined.len(), None)?;
+                }
+                let legacy = self
+                    .links
+                    .legacy
+                    .iter()
+                    .map(|l| (l.start, l.end, l.radius, l.flags, l.area, None));
+                let extended = self
+                    .links
+                    .extended
+                    .iter()
+                    .map(|l| (l.start, l.end, l.radius, l.flags, l.area, Some(l.kind)));
+                for (i, (start, end, radius, flags, area, kind)) in
+                    legacy.chain(extended).enumerate()
+                {
                     ws.work(1)?;
+                    let before = combined.len();
                     combined.push(
                         original.off_mesh_con_count as u64 + i as u64,
-                        l.start,
-                        l.end,
-                        l.radius,
-                        l.flags,
-                        l.area,
-                        false,
+                        start,
+                        end,
+                        radius,
+                        flags,
+                        area,
+                        kind == Some(detour::OffMeshKind::Ladder),
                         0,
                     )?;
+                    if self.c.extended_links.enabled() && combined.len() > before {
+                        ws.push(&mut kinds, kind)?;
+                    }
                 }
                 Ok(())
             })?;
@@ -817,7 +859,11 @@ impl<'a> TileTask<'a> {
             let bound = n
                 .checked_mul(128)
                 .and_then(|n| {
-                    n.checked_add((c.spare_links_per_tile as usize).checked_mul(detour::LINK_SIZE)?)
+                    n.checked_add(
+                        (c.spare_links_per_tile as usize)
+                            .checked_add(self.incoming_ladder_links as usize)?
+                            .checked_mul(detour::LINK_SIZE)?,
+                    )
                 })
                 .ok_or(Error::SizeOverflow)?;
             let polys = usize::try_from(mesh.npolys).map_err(|_| Error::SizeOverflow)?;
@@ -830,12 +876,26 @@ impl<'a> TileTask<'a> {
                 .ok_or(Error::SizeOverflow)?;
             work(ws, bound.checked_add(sort_work).ok_or(Error::SizeOverflow)?)?;
             ws.charge_bytes::<u8>(bound)?;
-            let data =
-                detour::create_with_spare_links(&params, &c.tile_limits, c.spare_links_per_tile)?;
+            let data = detour::create_bake_tile(
+                &params,
+                &c.tile_limits,
+                c.spare_links_per_tile,
+                self.incoming_ladder_links,
+                &kinds,
+            )?;
             let retained = self
                 .links
+                .legacy
                 .capacity()
                 .checked_mul(core::mem::size_of::<super::ExtractedLink>())
+                .and_then(|n| {
+                    n.checked_add(
+                        self.links
+                            .extended
+                            .capacity()
+                            .checked_mul(core::mem::size_of::<super::ExtendedExtractedLink>())?,
+                    )
+                })
                 .and_then(|n| n.checked_add(data.len()))
                 .ok_or(Error::SizeOverflow)?;
             if retained > c.tile_limits.max_tile_bytes {

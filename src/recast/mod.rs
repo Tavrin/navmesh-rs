@@ -28,6 +28,8 @@ mod layers;
 mod mesh;
 mod region;
 
+#[cfg(feature = "detour")]
+pub(crate) use area::point_in_area_polygon;
 pub use area::{
     erode_walkable_area, mark_box_area, mark_convex_poly_area, mark_cylinder_area,
     median_filter_walkable_area, offset_poly,
