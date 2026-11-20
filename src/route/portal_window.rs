@@ -141,7 +141,12 @@ impl PortalWindow {
                 if node.point.polygon == self.target.polygon {
                     return Ok(Some((self.corridor(id), self.target)));
                 }
-                if prefix && self.expanded >= 24 && self.best != 0 {
+                if prefix && self.expanded >= 24 {
+                    // A prefix is short: without a node closer to the target there
+                    // is none to publish.
+                    if self.best == 0 {
+                        return Err(Error::Failed);
+                    }
                     return Ok(Some((
                         self.corridor(self.best),
                         self.nodes[self.best].point,
@@ -199,13 +204,20 @@ impl PortalWindow {
             } else {
                 0
             };
+            // The link's unit covers its first probe; each further chain step is
+            // charged (at most what is left, ending the slice).
             let mut index = head;
+            let mut hops = 0u64;
             while index != 0 {
                 let old = &self.nodes[index as usize];
                 if old.point.polygon == e.r#ref && old.previous == point.polygon {
                     break;
                 }
                 index = old.next;
+                hops += 1;
+            }
+            if hops > 1 && !budget.spend(hops - 1) {
+                budget.exhaust();
             }
             if index == 0 {
                 if self.nodes.len >= limit {

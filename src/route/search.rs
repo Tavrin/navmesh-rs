@@ -36,20 +36,44 @@ pub struct RouteIndex {
 }
 impl RouteIndex {
     /// Builds the directed index for stitched records. Missing destinations and
-    /// records derived solely from isolated sectors are rejected.
+    /// records derived solely from isolated sectors are rejected, and so are exits
+    /// whose destination sector's record lists another content id (records of
+    /// different bakes mixed after a partial re-bake).
     pub fn build_exact(graph: &SectorGraph, profile: u32) -> Result<Self, Error> {
         for record in graph.records(profile) {
             if !record.is_stitched()
                 || record
                     .destinations()
-                    .any(|(k, r)| graph.super_region(profile, k, r).is_none())
+                    .any(|(k, r, _)| graph.super_region(profile, k, r).is_none())
             {
                 return Err(Error::InvalidInput("incomplete stitched graph"));
+            }
+            for (k, _, content) in record.destinations() {
+                let listed = graph
+                    .super_record(profile, graph.params().super_of(k))
+                    .and_then(|d| {
+                        let i = d
+                            .sectors()
+                            .binary_search_by_key(&(k.z, k.x), |(s, _)| (s.z, s.x))
+                            .ok()?;
+                        d.sector_content_ids().get(i).copied()
+                    });
+                if listed != Some(content) {
+                    return Err(Error::InvalidInput("stitched records from different bakes"));
+                }
             }
         }
         Self::build(graph, profile)
     }
     /// Compiles the current graph, rejecting stale records and invalid costs.
+    ///
+    /// Over unstitched records (isolated summaries) the result is a hint, not
+    /// proof: portal overlap is matched symmetrically although links can be
+    /// one-way, an off-mesh link lands in the first region whose box holds its far
+    /// end, and off-mesh links beyond the neighbouring super-sectors are dropped.
+    /// Such an index can report routes that do not exist and miss ones that do.
+    /// Use [`build_exact`](Self::build_exact) on records stitched by
+    /// [`SectorGraph::from_mesh`] for exact reachability.
     pub fn build(graph: &SectorGraph, profile: u32) -> Result<Self, Error> {
         let mut keys = Vec::new();
         for record in graph.records(profile) {
@@ -84,6 +108,17 @@ impl RouteIndex {
     /// Starts a coarse query. Admission allocates labels and is not frame-budgeted.
     /// Missing records are reported as invalid input rather than disconnection.
     pub fn request(&self, start: RegionKey, goal: RegionKey) -> Result<CoarseSearch<'_>, Error> {
+        self.request_reusing(start, goal, CoarseBuffers::default())
+    }
+
+    /// [`request`](Self::request) over the label arrays of a finished search, so
+    /// a scheduler neither allocates nor frees them while it runs.
+    pub(super) fn request_reusing(
+        &self,
+        start: RegionKey,
+        goal: RegionKey,
+        buffers: CoarseBuffers,
+    ) -> Result<CoarseSearch<'_>, Error> {
         let locate = |key| {
             self.keys
                 .binary_search(&key)
@@ -91,24 +126,45 @@ impl RouteIndex {
         };
         let start = locate(start)?;
         let goal = locate(goal)?;
-        let mut distance = vec![f32::INFINITY; self.keys.len()];
+        let CoarseBuffers {
+            mut distance,
+            mut parent,
+            mut open,
+            mut path,
+        } = buffers;
+        distance.clear();
+        distance.resize(self.keys.len(), f32::INFINITY);
         distance[start] = 0.0;
-        let mut open = BinaryHeap::new();
+        parent.clear();
+        parent.resize(self.keys.len(), usize::MAX);
+        open.clear();
         open.push(Reverse((0u32, start)));
+        path.clear();
         Ok(CoarseSearch {
             index: self,
             revision: self.revision,
             profile: self.profile,
             goal,
             distance,
-            parent: vec![usize::MAX; self.keys.len()],
+            parent,
             open,
             active: None,
             trace: None,
-            path: Vec::new(),
+            path,
             done: false,
         })
     }
+}
+
+/// The label arrays of a coarse search, kept by a scheduler between searches.
+/// Freeing them inside a frame slice can return heap memory to the system there
+/// (a trim costing far more than the slice's work), so they are recycled instead.
+#[derive(Default)]
+pub(super) struct CoarseBuffers {
+    distance: Vec<f32>,
+    parent: Vec<usize>,
+    open: BinaryHeap<Reverse<(u32, usize)>>,
+    path: Vec<RegionKey>,
 }
 
 /// A coarse query with stable tie-breaking and array-indexed labels.
@@ -188,5 +244,16 @@ impl CoarseSearch<'_> {
     /// that the live mesh is disconnected. `None` means still planning.
     pub fn corridor_reversed(&self) -> Option<&[RegionKey]> {
         self.done.then_some(self.path.as_slice())
+    }
+
+    /// Ends the search, keeping its label arrays for
+    /// [`RouteIndex::request_reusing`].
+    pub(super) fn into_buffers(self) -> CoarseBuffers {
+        CoarseBuffers {
+            distance: self.distance,
+            parent: self.parent,
+            open: self.open,
+            path: self.path,
+        }
     }
 }

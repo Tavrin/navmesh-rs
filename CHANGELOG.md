@@ -106,6 +106,29 @@ All notable changes to this project are documented in this file. The format foll
 
 ### Fixed
 
+- Long routes (`route` feature): sector (`DNSS`) and super-sector (`DNSR`) records
+  move to version 3; regenerate them from the source tiles. Older versions are
+  rejected with `InvalidSnapshot(WrongVersion)`. Stitched exits and super-sector
+  sector lists carry a 64-bit summary content id, so records of different bakes
+  leave a super-sector stale, including records whose exits land in a re-baked
+  super-sector, or fail `RouteIndex::build_exact` instead of combining; decoders
+  reject exits naming two content ids for one sector. Inserting every summary
+  of a partial re-bake leaves fresh records in any order, and summary versions
+  are computed once instead of on every check.
+  Inserting and decoding records charge their work against `Limits::max_work`;
+  decoders also reject duplicate or skipped super-region members, portals off
+  their side, self-loop exits and costs the region arcs do not connect.
+  `SectorSummary::build` charges its transition cost table before allocating it.
+  `Navigator` charges node-pool setup, finalization and string pulling, retries
+  a single-sector window with the whole pool before failing, rejects pools
+  smaller than the largest sector, binds the atlas to the whole filter, clears
+  every request when `update` sees an invalidating edit, fails only the affected
+  requests when `sync` finds an unloaded tile, and keeps label costs finite at
+  huge coordinates, and recycles finished coarse searches' label arrays instead
+  of freeing them inside an update slice, where the allocator could return heap
+  memory to the system at several times the slice's cost. Unstitched indexes
+  are documented as hints. New fuzz targets
+  `sector_summary` and `super_record`.
 - Shared point goals can use mesh-checked goal slots and optional park or remove
   arrival policies in both crowd managers, preventing congestion at one destination.
   Existing arrival behavior remains the default.

@@ -168,3 +168,19 @@ the embedded crowd reader accepts some out-of-range field values and normalises 
 | `profile_records` | mode byte, then slot history (`NPRS`), saved polygon reference (`NPRF`) or single-profile crowd (`NPCW`) |
 | `profile_mixed_crowd` | mixed-profile crowd (`NPCM`) bound to two installed profiles |
 | `framed_profile_crowd` | framed mixed-profile crowd (`NPFM`) bound to a two-frame world of profile meshes |
+
+Long-route records (enable `--features route`). The input is a mode byte: bit 0 clear,
+the rest is the record; bit 0 set, the next byte picks a stitched record of a 3 x 2 grid
+of linked quads (built once in `src/route_records.rs`) and the rest patches it as above
+(without a checksum). Records are read under the bounded `persisted::LIMITS`, so a crafted
+count ends in `LimitExceeded`.
+
+| Target | Record |
+|---|---|
+| `sector_summary` | sector summary (`DNSS`) inserted into an empty graph and into the stitched grid's graph; a refused insert leaves the graph's counts unchanged |
+| `super_record` | super-sector record (`DNSR`) installed twice into an empty graph and once into the stitched grid's graph; a refused install keeps the previous record |
+
+```sh
+cargo +nightly fuzz run sector_summary --features route -- -max_len=65536
+cargo +nightly fuzz run super_record --features route -- -max_len=65536
+```

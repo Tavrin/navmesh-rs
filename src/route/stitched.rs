@@ -98,40 +98,57 @@ impl SectorGraph {
                 }
             }
         }
+        // Exits name the destination summary's content id (defined before stitching).
+        let contents: BTreeMap<SectorKey, u64> = graph
+            .sectors
+            .iter()
+            .map(|((_, key), s)| (*key, s.content_id()))
+            .collect();
         for ((_, key), s) in &mut graph.sectors {
             let mut exits: Vec<_> = crossings
                 .get(key)
                 .into_iter()
                 .flatten()
-                .map(|c| (c.from, c.sector, c.region))
-                .collect();
+                .map(|c| {
+                    let content = contents.get(&c.sector).copied().ok_or(Error::InvalidRef)?;
+                    Ok((c.from, c.sector, c.region, content))
+                })
+                .collect::<Result<_, Error>>()?;
             exits.sort_unstable();
             exits.dedup();
             s.exits = Some(exits);
+            s.version = super::summary::fingerprint(&s.to_bytes());
         }
         let mut groups: BTreeMap<SuperKey, Vec<&SectorSummary>> = BTreeMap::new();
         for ((_, key), s) in &graph.sectors {
             groups.entry(params.super_of(*key)).or_default().push(s);
         }
+        // Summaries built from the installed mesh, like the builds above, run
+        // without a work limit.
+        let mut budget = Budget::unlimited();
         for (sk, members) in groups {
-            let record = SuperRecord::derive(sk, params, &members)?;
+            let (record, _) = SuperRecord::derive_budgeted(sk, params, &members, &mut budget)?;
             graph.supers.insert(
                 (profile, sk),
                 super::graph::SuperNode {
                     record,
                     stale: false,
+                    foreign: false,
                     edges: Vec::new(),
                 },
             );
         }
         for sk in graph.supers.keys().map(|p| p.1).collect::<Vec<_>>() {
-            let edges = graph.edges_of(profile, sk);
+            let (edges, foreign) = graph.edges_of(profile, sk, &mut budget)?;
             if let Some(node) = graph.supers.get_mut(&(profile, sk)) {
                 node.edges = edges;
+                node.foreign = foreign;
             }
         }
+        graph.rebuild_inbound();
         graph.global_links = nav.global_off_mesh_links();
         graph.bound_profile = Some(profile);
+        graph.bound_filter = Some(filter.clone());
         graph.owner = Some(nav.report_identity().clone());
         graph.crossings = crossings;
         graph.bound_epoch = Some(nav.epoch());

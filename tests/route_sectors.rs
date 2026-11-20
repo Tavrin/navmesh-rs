@@ -20,7 +20,7 @@ use navmesh_rs::route::{
     SectorCollector, SectorGraph, SectorKey, SectorParams, SectorSummary, SuperKey, SuperRecord,
     UNREACHABLE, profile_hash,
 };
-use navmesh_rs::{Budget, Error, Limits};
+use navmesh_rs::{Budget, Error, Limits, SnapshotError};
 
 fn bake(world: &World, cfg: &BakeConfig) -> (GridLayout, Vec<TileOutput>) {
     let grid = world.layout(cfg);
@@ -170,7 +170,6 @@ fn records_reject_malformed_bytes() {
         ("truncated", good[..good.len() - 1].to_vec()),
         ("trailing", [good.as_slice(), &[0]].concat()),
         ("magic", bad(0, b'X')),
-        ("version", bad(4, 9)),
         ("flags", bad(6, 2)),
         ("padding", bad(19, 1)),
         ("nan quantum", {
@@ -189,6 +188,11 @@ fn records_reject_malformed_bytes() {
             "{what}"
         );
     }
+    // Another version is the typed version error, not corruption.
+    assert_eq!(
+        SectorSummary::from_bytes(&bad(4, 2), &limits),
+        Err(Error::InvalidSnapshot(SnapshotError::WrongVersion))
+    );
     let tight = Limits {
         max_bytes: good.len() - 1,
         ..Limits::default()
@@ -215,6 +219,12 @@ fn records_reject_malformed_bytes() {
     ] {
         assert!(SuperRecord::from_bytes(&bytes, &limits).is_err());
     }
+    let mut old = good.clone();
+    old[4] = 2;
+    assert_eq!(
+        SuperRecord::from_bytes(&old, &limits),
+        Err(Error::InvalidSnapshot(SnapshotError::WrongVersion))
+    );
 }
 
 /// Super-regions reachable from `(key, region)` over level-3 edges.
@@ -350,8 +360,8 @@ fn sector_graph_memory_and_edit_cost() {
     }
     let n = sectors.len() as f64;
     let (p, r, t) = (sum_p / n, sum_r / n, sum_t / n);
-    // Published level-2 formula: per sector 44 + 16 T + 28 R + 36 P + 2 P^2.
-    let formula = n * (44.0 + 16.0 * t + 28.0 * r + 36.0 * p + 2.0 * p * p);
+    // Published level-2 formula: per sector 44 + 20 T + 28 R + 36 P + 2 P^2.
+    let formula = n * (44.0 + 20.0 * t + 28.0 * r + 36.0 * p + 2.0 * p * p);
     let design_estimate = n * (36.0 * 36.0 * 2.0 + 36.0 * 32.0);
     let compression_p05 = percentile(&mut ratio, 0.05);
 
@@ -588,4 +598,543 @@ fn stitched_corridors_agree_across_load_order_and_scheduler_slices() {
         run(mesh(&grid, tiles.iter())),
         run(mesh(&grid, tiles.iter().rev()))
     );
+}
+
+fn snap(nav: &NavMesh, p: [f32; 3]) -> navmesh_rs::route::WindowPoint {
+    let query = navmesh_rs::detour::NavMeshQuery::new(nav, 64).unwrap();
+    let (r, pos, _) = query
+        .find_nearest_poly(&p, &[8., 20., 8.], &DefaultFilter::default())
+        .unwrap();
+    assert_ne!(r, 0);
+    navmesh_rs::route::WindowPoint::new(r, pos)
+}
+
+/// An unstitched one-tile `'DNSS'` record with `regions` one-polygon regions and
+/// `offmesh` off-mesh entries of region 0 whose far ends lie outside every region.
+fn crafted_summary(regions: u16, offmesh: u16) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(b"DNSS");
+    b.extend_from_slice(&3u16.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&[0; 8]); // sector x, z
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&[1, 0]); // layers, padding
+    b.extend_from_slice(&0u32.to_le_bytes()); // profile
+    for n in [1, 0, regions, offmesh] {
+        b.extend_from_slice(&n.to_le_bytes()); // tiles, portals, regions, off-mesh
+    }
+    b.extend_from_slice(&1f32.to_le_bytes());
+    b.extend_from_slice(&0f32.to_le_bytes());
+    b.extend_from_slice(&u32::from(regions).to_le_bytes());
+    b.extend_from_slice(&[0; 12]); // tile x, z, layer and padding
+    b.extend_from_slice(&7u64.to_le_bytes());
+    for r in 0..regions {
+        b.extend_from_slice(&1u32.to_le_bytes());
+        for v in [r as f32, 0., 0., r as f32 + 0.5, 0., 0.5] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    for _ in 0..offmesh {
+        b.extend_from_slice(&[0; 4]); // region, flags, padding
+        for v in [0.2f32, 0., 0.2, 1e6, 0., 1e6] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&[0; 4]); // tile index, padding
+    }
+    b.extend_from_slice(&0u32.to_le_bytes()); // arcs
+    b.extend_from_slice(&(u32::from(regions) + 1).to_le_bytes());
+    for r in 0..=regions {
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&u32::from(r).to_le_bytes());
+        b.extend_from_slice(&if r == regions { u16::MAX } else { r }.to_le_bytes());
+    }
+    b.extend_from_slice(&0u32.to_le_bytes()); // exits
+    let n = usize::from(offmesh);
+    for i in 0..n * n {
+        let c = if i % (n + 1) == 0 { 0 } else { UNREACHABLE };
+        b.extend_from_slice(&c.to_le_bytes());
+    }
+    b
+}
+
+#[test]
+fn crafted_sector_records_end_at_the_work_limit() {
+    let bytes = crafted_summary(1000, 500);
+    let params = SectorParams::new(1, 1);
+    // Decoding fits the limit; matching 500 off-mesh landings against 1000 region
+    // boxes does not.
+    let limits = Limits {
+        max_work: 300_000,
+        ..Limits::UNLIMITED
+    };
+    assert!(SectorSummary::from_bytes(&bytes, &limits).is_ok());
+    let mut graph = SectorGraph::new(&params, limits).unwrap();
+    assert_eq!(graph.insert_sector(&bytes), Err(Error::LimitExceeded));
+    assert_eq!((graph.sector_count(), graph.super_count()), (0, 0));
+    let mut unlimited = SectorGraph::new(&params, Limits::UNLIMITED).unwrap();
+    assert!(unlimited.insert_sector(&bytes).is_ok());
+}
+
+#[test]
+fn records_reject_inconsistent_contents() {
+    let (grid, tiles) = small_world();
+    let params = SectorParams::new(2, 2);
+    let nav = mesh(&grid, tiles.iter());
+    let limits = Limits::default();
+    let summaries: Vec<_> = sectors_of(&grid, &params)
+        .into_iter()
+        .map(|k| summary(&nav, k, &params))
+        .collect();
+    // A portal moved to the opposite side no longer lies in its tile's column.
+    let s = summaries.iter().find(|s| !s.portals().is_empty()).unwrap();
+    let mut b = s.to_bytes();
+    let at = 44 + 20 * s.tiles().len() + 28 * s.regions().len();
+    b[at] = (b[at] + 4) & 7;
+    assert!(matches!(
+        SectorSummary::from_bytes(&b, &limits),
+        Err(Error::InvalidInput(_))
+    ));
+    // A finite cost between regions the arcs do not connect.
+    let (s, f, t) = summaries
+        .iter()
+        .filter(|s| s.region_arcs().is_empty())
+        .find_map(|s| {
+            let region = |i: usize| s.portals().get(i).map(|p| p.region);
+            let n = s.transition_count();
+            (0..n * n).find_map(|i| {
+                let (f, t) = (i / n, i % n);
+                (region(f).is_some()
+                    && region(t).is_some()
+                    && region(f) != region(t)
+                    && s.quantized_cost(f, t) == Some(UNREACHABLE))
+                .then_some((s, f, t))
+            })
+        })
+        .expect("a sector split by the wall");
+    let n = s.transition_count();
+    let mut b = s.to_bytes();
+    let at = b.len() - 2 * n * n + 2 * (f * n + t);
+    b[at..at + 2].copy_from_slice(&1u16.to_le_bytes());
+    assert!(matches!(
+        SectorSummary::from_bytes(&b, &limits),
+        Err(Error::InvalidInput(_))
+    ));
+    // Super-region members must name each sector region exactly once.
+    let members: Vec<_> = summaries
+        .iter()
+        .filter(|s| params.super_of(s.key()) == SuperKey { x: 0, z: 0 })
+        .collect();
+    let rec = SuperRecord::derive(SuperKey { x: 0, z: 0 }, &params, &members).unwrap();
+    let good = rec.to_bytes();
+    let first = 44 + 20 * rec.sectors().len() + 36 * rec.regions().len();
+    let count: usize = rec.regions().iter().map(|r| r.members.len()).sum();
+    // The last member skips a region index.
+    let mut gap = good.clone();
+    let last = first + 4 * (count - 1) + 2;
+    let g = u16::from_le_bytes([gap[last], gap[last + 1]]) + 1;
+    gap[last..last + 2].copy_from_slice(&g.to_le_bytes());
+    let mut cases = vec![gap];
+    if rec.regions().len() > 1 {
+        // The second super-region's first member repeats the first's.
+        let mut twice = good.clone();
+        twice.copy_within(first..first + 4, first + 4 * rec.regions()[0].members.len());
+        cases.push(twice);
+    }
+    for b in cases {
+        assert!(matches!(
+            SuperRecord::from_bytes(&b, &limits),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+}
+
+#[test]
+fn records_from_different_bakes_are_not_combined() {
+    use navmesh_rs::route::RouteIndex;
+    let (grid, tiles) = small_world();
+    let nav = mesh(&grid, tiles.iter());
+    let filter = DefaultFilter::default();
+    let profile = profile_hash(&filter);
+    // Exact index: an exit naming another content id of its destination sector.
+    let params = SectorParams::new(1, 1);
+    let g = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let keys = sectors_of(&grid, &params);
+    let records: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|k| {
+            g.super_record(profile, params.super_of(*k))
+                .unwrap()
+                .to_bytes()
+        })
+        .collect();
+    let load = |tamper: bool| {
+        let mut h = SectorGraph::new(&params, Limits::default()).unwrap();
+        for (i, bytes) in records.iter().enumerate() {
+            let mut b = bytes.clone();
+            if tamper && i == 0 {
+                b[44 + 12] ^= 1; // the listed content id of its only sector
+            }
+            h.insert_super(&b).unwrap();
+        }
+        h
+    };
+    assert!(RouteIndex::build_exact(&load(false), profile).is_ok());
+    assert!(matches!(
+        RouteIndex::build_exact(&load(true), profile),
+        Err(Error::InvalidInput(_))
+    ));
+    // Derivation: a summary re-baked alone leaves its super-sector stale.
+    let params = SectorParams::new(1, 2);
+    let g = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let keys = sectors_of(&grid, &params);
+    let bytes: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|k| g.sector(profile, *k).unwrap().to_bytes())
+        .collect();
+    let insert_all = |changed: Option<(usize, &[u8])>| {
+        let mut h = SectorGraph::new(&params, Limits::default()).unwrap();
+        for (i, b) in bytes.iter().enumerate() {
+            let b = changed.filter(|c| c.0 == i).map_or(b.as_slice(), |c| c.1);
+            h.insert_sector(b).unwrap();
+        }
+        h
+    };
+    let fresh = insert_all(None);
+    assert!(
+        keys.iter()
+            .all(|k| fresh.is_stale(profile, params.super_of(*k)) == Some(false))
+    );
+    let shared = |k: &SectorKey| {
+        keys.iter()
+            .filter(|o| params.super_of(**o) == params.super_of(*k))
+            .count()
+            > 1
+    };
+    let (i, rebaked) = keys
+        .iter()
+        .enumerate()
+        .filter(|(_, k)| shared(k))
+        .find_map(|(i, _)| {
+            let mut b = bytes[i].clone();
+            b[44 + 12] ^= 1; // a source tile's content id
+            SectorSummary::from_bytes(&b, &Limits::default())
+                .is_ok()
+                .then_some((i, b))
+        })
+        .expect("a re-bakeable sector sharing its super-sector");
+    let mixed = insert_all(Some((i, &rebaked)));
+    assert_eq!(
+        mixed.is_stale(profile, params.super_of(keys[i])),
+        Some(true)
+    );
+    assert_eq!(
+        RouteIndex::build(&mixed, profile).err(),
+        Some(Error::MeshChanged)
+    );
+}
+
+/// The old bake, the re-bake with one tile of sector `a` removed, `a` and the
+/// super-sector members of the old bake.
+fn rebaked_world() -> (SectorGraph, SectorGraph, SectorKey, Vec<SectorKey>, u32) {
+    let (grid, tiles) = small_world();
+    let mut nav = mesh(&grid, tiles.iter());
+    let filter = DefaultFilter::default();
+    let params = SectorParams::new(2, 2);
+    let old = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let tile = TileKey { x: 1, z: 2 };
+    let slot = nav.tiles_at(tile.x, tile.z, 4)[0];
+    nav.remove_tile(nav.tile_ref(slot)).unwrap();
+    let new = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let a = params.sector_of_tile(tile.x, tile.z);
+    (
+        old,
+        new,
+        a,
+        sectors_of(&grid, &params),
+        profile_hash(&filter),
+    )
+}
+
+/// Inserts the re-baked summaries of `keys` in super-sector `sk`, in order.
+fn insert_rebaked(g: &mut SectorGraph, new: &SectorGraph, sk: SuperKey, keys: &[SectorKey]) {
+    let profile = profile_hash(&DefaultFilter::default());
+    let params = *g.params();
+    for k in keys.iter().filter(|k| params.super_of(**k) == sk) {
+        let update = g
+            .insert_sector(&new.sector(profile, *k).unwrap().to_bytes())
+            .unwrap();
+        assert_eq!(update.supers, 1);
+    }
+}
+
+#[test]
+fn a_summary_only_rebake_ends_with_a_fresh_record_in_either_order() {
+    let (old, new, a, keys, profile) = rebaked_world();
+    let sk = old.params().super_of(a);
+    let others: Vec<SectorKey> = keys
+        .iter()
+        .copied()
+        .filter(|k| *k != a && old.params().super_of(*k) == sk)
+        .collect();
+    assert!(!others.is_empty());
+    for a_first in [true, false] {
+        let mut order = others.clone();
+        if a_first {
+            order.insert(0, a);
+        } else {
+            order.push(a);
+        }
+        let mut g = old.clone();
+        insert_rebaked(&mut g, &new, sk, &order[..1]);
+        assert_eq!(g.is_stale(profile, sk), Some(true), "a_first {a_first}");
+        insert_rebaked(&mut g, &new, sk, &order[1..]);
+        assert_eq!(g.is_stale(profile, sk), Some(false), "a_first {a_first}");
+        assert_eq!(g.super_record(profile, sk), new.super_record(profile, sk));
+    }
+}
+
+#[test]
+fn a_rebaked_destination_leaves_the_records_naming_it_stale() {
+    use navmesh_rs::route::RouteIndex;
+    let (old, new, a, keys, profile) = rebaked_world();
+    let params = *old.params();
+    let t = params.super_of(a);
+    // S: the super-sector of the sector beyond `a`, whose exits land in `a`.
+    let s = params.super_of(SectorKey { x: a.x, z: a.z + 1 });
+    assert_ne!(s, t);
+    let mut g = old.clone();
+    insert_rebaked(&mut g, &new, t, &keys);
+    assert_eq!(g.is_stale(profile, t), Some(false));
+    assert_eq!(g.is_stale(profile, s), Some(true));
+    assert_eq!(
+        RouteIndex::build(&g, profile).err(),
+        Some(Error::MeshChanged)
+    );
+    assert!(RouteIndex::build_exact(&g, profile).is_err());
+    // Re-baking S as well restores an exact graph.
+    insert_rebaked(&mut g, &new, s, &keys);
+    assert_eq!(g.is_stale(profile, s), Some(false));
+    assert!(RouteIndex::build(&g, profile).is_ok());
+    assert!(RouteIndex::build_exact(&g, profile).is_ok());
+}
+
+/// Flips the content id of one of two trailing stitched exits (20 bytes each, after
+/// their `u32` count, ending at `end`) that name the same sector other than `own`.
+fn conflicting_exit(b: &[u8], end: usize, own: Option<SectorKey>) -> Option<Vec<u8>> {
+    let (at, ne) = (1..=end / 20).find_map(|ne| {
+        let start = end.checked_sub(20 * ne + 4)?;
+        let count = u32::from_le_bytes(b[start..start + 4].try_into().unwrap());
+        (count as usize == ne).then_some((start + 4, ne))
+    })?;
+    let key = |i: usize| &b[at + 20 * i + 2..at + 20 * i + 10];
+    let own = own.map(|k| [k.x.to_le_bytes(), k.z.to_le_bytes()].concat());
+    let i =
+        (1..ne).find(|&i| (0..i).any(|j| key(i) == key(j)) && own.as_deref() != Some(key(i)))?;
+    let mut out = b.to_vec();
+    out[at + 20 * i + 12] ^= 1;
+    Some(out)
+}
+
+#[test]
+fn records_reject_two_content_ids_for_one_sector() {
+    let (old, _, _, keys, profile) = rebaked_world();
+    let limits = Limits::default();
+    let conflict = Some(Error::InvalidInput(
+        "conflicting content ids for one sector",
+    ));
+    let summary = keys
+        .iter()
+        .find_map(|k| {
+            let s = old.sector(profile, *k)?;
+            let b = s.to_bytes();
+            let n = s.transition_count();
+            conflicting_exit(&b, b.len() - 2 * n * n, Some(*k))
+        })
+        .expect("a sector with two exits into one sector");
+    assert_eq!(SectorSummary::from_bytes(&summary, &limits).err(), conflict);
+    let record = keys
+        .iter()
+        .find_map(|k| {
+            let b = old
+                .super_record(profile, old.params().super_of(*k))?
+                .to_bytes();
+            conflicting_exit(&b, b.len(), None)
+        })
+        .expect("a record with two exits into one sector");
+    assert_eq!(SuperRecord::from_bytes(&record, &limits).err(), conflict);
+}
+
+#[test]
+fn loaded_records_relink_like_the_built_graph() {
+    let (grid, tiles) = small_world();
+    let nav = mesh(&grid, tiles.iter());
+    let filter = DefaultFilter::default();
+    let profile = profile_hash(&filter);
+    let params = SectorParams::new(1, 1);
+    let g = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let keys: Vec<SuperKey> = sectors_of(&grid, &params)
+        .into_iter()
+        .map(|k| params.super_of(k))
+        .collect();
+    // Destinations arrive after the records whose exits name them.
+    let mut h = SectorGraph::new(&params, Limits::default()).unwrap();
+    for k in keys.iter().rev() {
+        h.insert_super(&g.super_record(profile, *k).unwrap().to_bytes())
+            .unwrap();
+    }
+    for k in &keys {
+        for r in 0..g.super_record(profile, *k).unwrap().regions().len() as u16 {
+            assert_eq!(g.super_edges(profile, *k, r), h.super_edges(profile, *k, r));
+        }
+    }
+}
+
+#[test]
+fn a_record_at_the_coordinate_limit_never_links_to_itself() {
+    // One super-sector at x = i32::MAX with facing portals on its +x and -x sides.
+    let mut b = Vec::new();
+    b.extend_from_slice(b"DNSR");
+    b.extend_from_slice(&3u16.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&i32::MAX.to_le_bytes());
+    b.extend_from_slice(&0i32.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&1u16.to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes()); // profile
+    b.extend_from_slice(&0f32.to_le_bytes()); // climb
+    b.extend_from_slice(&1u16.to_le_bytes()); // sectors
+    b.extend_from_slice(&1u16.to_le_bytes()); // regions
+    for n in [1u32, 2, 0] {
+        b.extend_from_slice(&n.to_le_bytes()); // members, portals, off-mesh
+    }
+    b.extend_from_slice(&i32::MAX.to_le_bytes());
+    b.extend_from_slice(&[0; 16]); // sector z, version, content id
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(&[0; 28]); // crossing bound and box
+    b.extend_from_slice(&[0; 4]); // member (0, 0)
+    for side in [0u8, 4] {
+        b.extend_from_slice(&[side, 0, 0, 0, 0, 0, 0, 0]);
+        for v in [0f32, 0., 5., 0., 10., 0., 0.] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&[0; 8]); // arcs, exits
+    let params = SectorParams::new(1, 1);
+    let mut graph = SectorGraph::new(&params, Limits::default()).unwrap();
+    graph.insert_super(&b).unwrap();
+    assert!(
+        graph
+            .super_edges(0, SuperKey { x: i32::MAX, z: 0 }, 0)
+            .is_empty()
+    );
+}
+
+#[test]
+fn an_atlas_binds_the_whole_filter_not_its_hash() {
+    use navmesh_rs::route::RouteAtlas;
+    // Two filters with one profile hash, found offline by a birthday search over
+    // the bit patterns of two area costs.
+    let with = |(one, two): (u32, u32)| {
+        let mut f = DefaultFilter::default();
+        f.area_cost[1] = f32::from_bits(one);
+        f.area_cost[2] = f32::from_bits(two);
+        f
+    };
+    let (a, b) = ((0x3f45_6a57, 0x3f72_b41d), (0x3fd5_f03d, 0x3fb3_5020));
+    assert_eq!(profile_hash(&with(a)), profile_hash(&with(b)));
+    let (grid, tiles) = small_world();
+    let nav = mesh(&grid, tiles.iter());
+    let graph =
+        SectorGraph::from_mesh(&nav, &SectorParams::new(2, 2), &with(a), nav.limits()).unwrap();
+    assert!(RouteAtlas::new(&graph, &nav, with(a)).is_ok());
+    assert!(matches!(
+        RouteAtlas::new(&graph, &nav, with(b)),
+        Err(Error::MeshChanged)
+    ));
+}
+
+#[test]
+fn navigator_pools_hold_the_largest_sector_and_failures_clear_corridors() {
+    use navmesh_rs::route::{Navigator, RouteAtlas, RouteState};
+    let (grid, tiles) = small_world();
+    let mut nav = mesh(&grid, tiles.iter());
+    let filter = DefaultFilter::default();
+    let params = SectorParams::new(2, 2);
+    let graph = SectorGraph::from_mesh(&nav, &params, &filter, nav.limits()).unwrap();
+    let atlas = RouteAtlas::new(&graph, &nav, filter.clone()).unwrap();
+    let largest = sectors_of(&grid, &params)
+        .iter()
+        .filter_map(|k| graph.compression(profile_hash(&filter), *k))
+        .map(|c| c.polygons as usize)
+        .max()
+        .unwrap();
+    assert!(matches!(
+        Navigator::new(&atlas, largest - 1),
+        Err(Error::InvalidParameter(_))
+    ));
+    let mut s = Navigator::new(&atlas, largest).unwrap();
+    let (start, goal) = (snap(&nav, [12., 0., 45.]), snap(&nav, [100., 0., 55.]));
+    let id = s.request(&nav, start, goal).unwrap();
+    for _ in 0..1000 {
+        if s.state(id) != Some(RouteState::Planning) {
+            break;
+        }
+        s.update(&nav, &mut Budget::new(500), 500).unwrap();
+    }
+    assert_eq!(s.state(id), Some(RouteState::Segment));
+    // An edit through the published corridor fails the request: no getter keeps
+    // returning the closed corridor.
+    let poly = s.segment(id).unwrap()[0];
+    nav.set_poly_flags(poly, 0).unwrap();
+    assert_eq!(
+        s.update(&nav, &mut Budget::new(500), 500),
+        Err(Error::MeshChanged)
+    );
+    assert_eq!(s.state(id), Some(RouteState::Failed(Error::MeshChanged)));
+    assert!(s.segment(id).is_none() && s.corners(id).is_none() && s.toward(id).is_none());
+}
+
+#[test]
+fn sync_fails_only_requests_crossing_an_unloaded_tile() {
+    use navmesh_rs::route::{Navigator, RouteAtlas, RouteState};
+    let (grid, tiles) = small_world();
+    let mut nav = mesh(&grid, tiles.iter());
+    let filter = DefaultFilter::default();
+    let graph =
+        SectorGraph::from_mesh(&nav, &SectorParams::new(2, 2), &filter, nav.limits()).unwrap();
+    let atlas = RouteAtlas::new(&graph, &nav, filter.clone()).unwrap();
+    let mut s = Navigator::new(&atlas, 4096).unwrap();
+    let near = s
+        .request(&nav, snap(&nav, [10., 0., 10.]), snap(&nav, [30., 0., 30.]))
+        .unwrap();
+    let far = s
+        .request(
+            &nav,
+            snap(&nav, [105., 0., 20.]),
+            snap(&nav, [110., 0., 100.]),
+        )
+        .unwrap();
+    for _ in 0..1000 {
+        if [near, far]
+            .iter()
+            .all(|id| s.state(*id) != Some(RouteState::Planning))
+        {
+            break;
+        }
+        s.update(&nav, &mut Budget::new(500), 500).unwrap();
+    }
+    let tile_of = |r| nav.decode_poly_id_tile(r);
+    let unloaded = tile_of(s.segment(near).unwrap()[0]);
+    assert!(
+        s.segment(far)
+            .unwrap()
+            .iter()
+            .all(|r| tile_of(*r) != unloaded)
+    );
+    nav.unload_tile(nav.tile_ref(unloaded as usize)).unwrap();
+    assert_eq!(s.sync(&nav), Ok(()));
+    assert_eq!(s.state(near), Some(RouteState::Failed(Error::MeshChanged)));
+    assert_eq!(s.state(far), Some(RouteState::Segment));
+    assert!(s.segment(far).is_some());
 }

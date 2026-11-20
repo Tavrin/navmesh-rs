@@ -22,6 +22,9 @@ impl Writer {
     pub(crate) fn u32(&mut self, v: u32) {
         self.out.extend_from_slice(&v.to_le_bytes());
     }
+    pub(crate) fn u64(&mut self, v: u64) {
+        self.out.extend_from_slice(&v.to_le_bytes());
+    }
     pub(crate) fn i32(&mut self, v: i32) {
         self.out.extend_from_slice(&v.to_le_bytes());
     }
@@ -64,6 +67,9 @@ impl<'a> Reader<'a> {
     }
     pub(crate) fn u32(&mut self) -> Result<u32, Error> {
         Ok(u32::from_le_bytes(self.take()?))
+    }
+    pub(crate) fn u64(&mut self) -> Result<u64, Error> {
+        Ok(u64::from_le_bytes(self.take()?))
     }
     pub(crate) fn i32(&mut self) -> Result<i32, Error> {
         Ok(i32::from_le_bytes(self.take()?))
