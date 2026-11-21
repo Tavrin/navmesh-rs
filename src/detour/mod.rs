@@ -65,7 +65,9 @@ pub use resumable::{
     DistanceToWallSearch, LocalNeighbourhoodSearch, PolysAroundSearch, RaycastSearch,
     SurfaceMoveSearch,
 };
-pub use tile::{BvNode, Link, MeshHeader, MeshTile, OffMeshConnection, Poly, PolyDetail};
+pub use tile::{
+    BvNode, Link, MeshHeader, MeshTile, OffMeshConnection, OffMeshKind, Poly, PolyDetail,
+};
 
 use crate::{Error, TileDataError, TileStateError};
 
@@ -223,4 +225,4 @@ pub fn raw_status<T>(r: &Result<T, Error>, ok: impl FnOnce(&T) -> Status) -> u32
 pub(crate) use tile::check_bake_tile_limits;
 
 #[cfg(feature = "recast")]
-pub(crate) use builder::create_with_spare_links;
+pub(crate) use builder::create_bake_tile;

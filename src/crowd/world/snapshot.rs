@@ -429,6 +429,9 @@ fn read_agent(
                     poly,
                     user_id,
                     link_id,
+                    kind: nav
+                        .off_mesh_connection_by_ref(poly)
+                        .and_then(|con| con.kind()),
                     start,
                     end,
                     departure,

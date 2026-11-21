@@ -58,6 +58,32 @@ impl<'a> Iterator for ColumnIter<'a> {
     }
 }
 
+// A bordered tile's starting cell in a coordinate system shared by all tiles.
+// Compute each plane from its global integer index so rasterization agrees at
+// cell edges even when the world cell size is not exactly representable.
+#[derive(Clone, Copy)]
+pub(crate) struct RasterGrid {
+    pub(crate) origin: [f32; 2],
+    pub(crate) first: [i64; 2],
+    pub(crate) cell_size: f32,
+}
+
+impl RasterGrid {
+    pub(crate) fn position(self, axis: usize, cell: i32, offset: f64) -> f64 {
+        f64::from(self.origin[axis])
+            + ((self.first[axis] + i64::from(cell)) as f64 + offset) * f64::from(self.cell_size)
+    }
+
+    pub(crate) fn cell(self, axis: usize, position: f64) -> i32 {
+        let coordinate = (position - f64::from(self.origin[axis])) / f64::from(self.cell_size);
+        let truncated = coordinate as i64;
+        let floor = truncated.saturating_sub(i64::from(coordinate < truncated as f64));
+        floor
+            .saturating_sub(self.first[axis])
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+    }
+}
+
 impl Heightfield {
     /// An empty heightfield over the given grid (`rcCreateHeightfield`).
     /// Both dimensions must be positive or both zero; a grid with exactly one
@@ -273,6 +299,18 @@ impl Heightfield {
         areas: &[u8],
         flag_merge_thr: i32,
     ) -> Result<(), Error> {
+        self.rasterize_indexed(ws, verts, tris, areas, flag_merge_thr, None)
+    }
+
+    pub(crate) fn rasterize_indexed(
+        &mut self,
+        ws: &mut Workspace,
+        verts: &[f32],
+        tris: &[i32],
+        areas: &[u8],
+        flag_merge_thr: i32,
+        grid: Option<RasterGrid>,
+    ) -> Result<(), Error> {
         ws.begin();
         self.check()?;
         validate_mesh(verts, tris, areas.len())?;
@@ -285,7 +323,7 @@ impl Heightfield {
             let v0 = v3(&verts[tri[0] as usize * 3..]);
             let v1 = v3(&verts[tri[1] as usize * 3..]);
             let v2 = v3(&verts[tri[2] as usize * 3..]);
-            self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr)?;
+            self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr, grid)?;
         }
         Ok(())
     }
@@ -333,7 +371,7 @@ impl Heightfield {
         let ich = 1.0 / self.ch;
         for (t, &area) in verts.chunks_exact(9).zip(areas) {
             let (v0, v1, v2) = (v3(&t[0..]), v3(&t[3..]), v3(&t[6..]));
-            self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr)?;
+            self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr, None)?;
         }
         Ok(())
     }
@@ -358,7 +396,7 @@ impl Heightfield {
         }
         let ics = 1.0 / self.cs;
         let ich = 1.0 / self.ch;
-        self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr)
+        self.rasterize_tri(ws, &v0, &v1, &v2, area, ics, ich, flag_merge_thr, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -372,6 +410,7 @@ impl Heightfield {
         ics: f32,
         ich: f32,
         flag_merge_thr: i32,
+        grid: Option<RasterGrid>,
     ) -> Result<(), Error> {
         let bmin = self.bmin;
         let bmax = self.bmax;
@@ -394,8 +433,20 @@ impl Heightfield {
         let w = self.width;
         let h = self.height;
         let by = bmax[1] - bmin[1];
-        let z0 = clamp(((tmin[2] - bmin[2]) * ics) as i32, -1, h - 1);
-        let z1 = clamp(((tmax[2] - bmin[2]) * ics) as i32, 0, h - 1);
+        let cell = |axis: usize, p: f32| {
+            grid.map_or_else(
+                || ((p - bmin[axis]) * ics) as i32,
+                |grid| grid.cell(axis / 2, f64::from(p)),
+            )
+        };
+        let far_edge = |axis: usize, i: i32| {
+            grid.map_or_else(
+                || (bmin[axis] + i as f32 * cs) + cs,
+                |grid| grid.position(axis / 2, i + 1, 0.0) as f32,
+            )
+        };
+        let z0 = clamp(cell(2, tmin[2]), -1, h - 1);
+        let z1 = clamp(cell(2, tmax[2]), 0, h - 1);
         ws.work(((z1 - z0 + 1).max(0)) as u64)?;
 
         // Four polygon buffers whose roles (in, inRow, p1, p2) are permuted by
@@ -410,8 +461,7 @@ impl Heightfield {
         inp[6..9].copy_from_slice(v2);
         let mut nv_in = 3usize;
         for z in z0..=z1 {
-            let cell_z = bmin[2] + z as f32 * cs;
-            let (nv_row, nv_rest) = divide_poly(&inp[..], nv_in, row, p1, cell_z + cs, 2)?;
+            let (nv_row, nv_rest) = divide_poly(&inp[..], nv_in, row, p1, far_edge(2, z), 2)?;
             core::mem::swap(&mut inp, &mut p1);
             nv_in = nv_rest;
             if nv_row < 3 || z < 0 {
@@ -427,8 +477,8 @@ impl Heightfield {
                     max_x = row[v * 3];
                 }
             }
-            let x0 = ((min_x - bmin[0]) * ics) as i32;
-            let x1 = ((max_x - bmin[0]) * ics) as i32;
+            let x0 = cell(0, min_x);
+            let x1 = cell(0, max_x);
             if x1 < 0 || x0 >= w {
                 continue;
             }
@@ -437,8 +487,7 @@ impl Heightfield {
             ws.work((x1 - x0 + 1) as u64)?;
             let mut nv2 = nv_row;
             for x in x0..=x1 {
-                let cx = bmin[0] + x as f32 * cs;
-                let (nv, rest) = divide_poly(&row[..], nv2, p1, p2, cx + cs, 0)?;
+                let (nv, rest) = divide_poly(&row[..], nv2, p1, p2, far_edge(0, x), 0)?;
                 core::mem::swap(&mut row, &mut p2);
                 nv2 = rest;
                 if nv < 3 || x < 0 {

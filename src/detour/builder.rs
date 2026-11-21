@@ -405,8 +405,14 @@ pub fn create_nav_mesh_data_f32(p: &NavMeshCreateParams, verts: &[f32]) -> Resul
             }
         }
     }
-    let data =
-        create_with_workspace_impl(p, &Limits::UNLIMITED, &mut Workspace::new(), Some(verts), 0)?;
+    let data = create_with_workspace_impl(
+        p,
+        &Limits::UNLIMITED,
+        &mut Workspace::new(),
+        Some(verts),
+        0,
+        BakedLinks::default(),
+    )?;
     // Validate all serialized indices, detail sections and connection fields too.
     super::MeshTile::parse(data).map(|tile| tile.data)
 }
@@ -424,7 +430,41 @@ pub(crate) fn create_with_spare_links(
     limits: &Limits,
     spare_links_per_tile: u32,
 ) -> Result<Vec<u8>, Error> {
-    create_with_workspace_impl(p, limits, &mut Workspace::new(), None, spare_links_per_tile)
+    create_with_workspace_impl(
+        p,
+        limits,
+        &mut Workspace::new(),
+        None,
+        spare_links_per_tile,
+        BakedLinks::default(),
+    )
+}
+
+#[derive(Default)]
+struct BakedLinks<'a> {
+    incoming_ladders: u32,
+    kinds: &'a [Option<super::OffMeshKind>],
+}
+
+#[cfg(feature = "recast")]
+pub(crate) fn create_bake_tile(
+    p: &NavMeshCreateParams,
+    limits: &Limits,
+    spare_links: u32,
+    incoming_ladders: u32,
+    kinds: &[Option<super::OffMeshKind>],
+) -> Result<Vec<u8>, Error> {
+    create_with_workspace_impl(
+        p,
+        limits,
+        &mut Workspace::new(),
+        None,
+        spare_links,
+        BakedLinks {
+            incoming_ladders,
+            kinds,
+        },
+    )
 }
 
 fn create_with_workspace_impl(
@@ -433,6 +473,7 @@ fn create_with_workspace_impl(
     ws: &mut Workspace,
     world: Option<&[f32]>,
     spare_links_per_tile: u32,
+    baked: BakedLinks<'_>,
 ) -> Result<Vec<u8>, Error> {
     if p.nvp as usize > VERTS_PER_POLYGON || p.nvp < 3 {
         return Err(Error::InvalidParameter("nvp"));
@@ -484,6 +525,8 @@ fn create_with_workspace_impl(
     let mut off_bounds = None;
     let mut stored_off = 0usize;
     let mut off_link_count = 0usize;
+    let mut extra_links = baked.incoming_ladders as usize;
+    let kind = |i| baked.kinds.get(i).copied().flatten();
     if noff > 0 {
         let mut hmin = f32::MAX;
         let mut hmax = -f32::MAX;
@@ -515,7 +558,7 @@ fn create_with_workspace_impl(
             let p1 = &p.off_mesh_con_verts[i * 6 + 3..];
             let mut c0 = classify_off_mesh_point(p0, &bmin, &bmax);
             let c1 = classify_off_mesh_point(p1, &bmin, &bmax);
-            if c0 == 0xff && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
+            if c0 == 0xff && kind(i).is_none() && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
                 c0 = 0;
             }
             if c0 == 0xff {
@@ -525,6 +568,9 @@ fn create_with_workspace_impl(
                 off_link_count += 1;
             }
             if c0 == 0xff {
+                extra_links = extra_links
+                    .checked_add(usize::from(kind(i).is_some() && c1 != 0xff))
+                    .ok_or(Error::SizeOverflow)?;
                 stored_off += 1;
             }
         }
@@ -561,6 +607,7 @@ fn create_with_workspace_impl(
     }
     let max_link_count = (edge_count + portal_count * 2 + off_link_count * 2)
         .checked_add(spare_links_per_tile as usize)
+        .and_then(|n| n.checked_add(extra_links))
         .filter(|&n| n <= i32::MAX as usize && n <= usize::MAX / LINK_SIZE)
         .ok_or(Error::SizeOverflow)?;
     if tot_vert > 0xffff {
@@ -607,7 +654,7 @@ fn create_with_workspace_impl(
             class[i * 2] = classify_off_mesh_point(p0, &bmin, &bmax);
             class[i * 2 + 1] =
                 classify_off_mesh_point(&p.off_mesh_con_verts[i * 6 + 3..], &bmin, &bmax);
-            if class[i * 2] == 0xff && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
+            if class[i * 2] == 0xff && kind(i).is_none() && (p0[1] < bmin[1] || p0[1] > bmax[1]) {
                 class[i * 2] = 0;
             }
         }
@@ -813,11 +860,16 @@ fn create_with_workspace_impl(
                 }
                 c.f32(p.off_mesh_con_rad[i])
                     .u16((npolys + n) as u16)
-                    .u8(if p.off_mesh_con_dir[i] != 0 {
-                        OFFMESH_CON_BIDIR
-                    } else {
-                        0
-                    })
+                    .u8(kind(i).map_or_else(
+                        || {
+                            if p.off_mesh_con_dir[i] != 0 {
+                                OFFMESH_CON_BIDIR
+                            } else {
+                                0
+                            }
+                        },
+                        super::OffMeshKind::flags,
+                    ))
                     .u8(class[i * 2 + 1])
                     .u32(p.off_mesh_con_user_id.get(i).copied().unwrap_or(0));
                 n += 1;
@@ -932,7 +984,7 @@ mod limit_tests {
             }
             let mut ws = Workspace::new();
             assert_eq!(
-                create_with_workspace_impl(&p, &tight, &mut ws, None, 0),
+                create_with_workspace_impl(&p, &tight, &mut ws, None, 0, BakedLinks::default()),
                 Err(Error::LimitExceeded)
             );
             assert_eq!(ws.usage().bytes, 0);

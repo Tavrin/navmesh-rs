@@ -5,6 +5,10 @@ use crate::recast::{CompactHeightfield, Heightfield, MESH_NULL_IDX, NULL_AREA, P
 use crate::{Error, Workspace};
 use alloc::vec::Vec;
 
+mod extended;
+pub use extended::{ExtendedLinkExtraction, GapLinks, LadderLinks, StepLinks};
+pub(super) use extended::{LadderGrid, extract_extended};
+
 /// Parameters for one traversal kind, in world units.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkLimits {
@@ -22,7 +26,7 @@ pub struct LinkLimits {
 /// Clearance uses a continuous swept square of half-width `walkable_radius`,
 /// conservatively enclosing a cylindrical agent; corner contacts may reject links.
 /// Every kind requires an absolute height change greater than `walkable_climb`;
-/// in particular, equal-height gap jumps are excluded by this minimum-height rule.
+/// For equal-height jumps, see [`ExtendedLinkExtraction::level_gaps`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LinkExtraction {
     /// Downward links.
@@ -59,11 +63,7 @@ impl LinkExtraction {
             .flatten()
             .map(|l| l.distance)
             .fold(0.0f32, f32::max);
-        let cells = ceilf(reach / cs);
-        if !cells.is_finite() || cells >= (i32::MAX / 4) as f32 {
-            return Err(Error::SizeOverflow);
-        }
-        Ok(cells as i32)
+        reach_cells(reach, cs)
     }
 }
 
@@ -77,6 +77,7 @@ pub enum LinkKind {
     /// Upward traversal.
     Climb,
 }
+
 /// One generated, one-directional connection, also installed in the tile bytes.
 #[derive(Clone, Debug)]
 pub struct ExtractedLink {
@@ -108,18 +109,63 @@ impl PartialEq for ExtractedLink {
 }
 impl Eq for ExtractedLink {}
 
+/// An extended traversal connection included in the baked tile bytes.
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct ExtendedExtractedLink {
+    /// Departure on a walkable surface.
+    pub start: [f32; 3],
+    /// Arrival on a walkable surface.
+    pub end: [f32; 3],
+    /// Endpoint attachment radius.
+    pub radius: f32,
+    /// Traversal kind. Ladders are bidirectional.
+    pub kind: crate::detour::OffMeshKind,
+    /// Caller-selected area.
+    pub area: u8,
+    /// Caller-selected flags.
+    pub flags: u16,
+}
+
+impl PartialEq for ExtendedExtractedLink {
+    fn eq(&self, other: &Self) -> bool {
+        self.start.map(f32::to_bits) == other.start.map(f32::to_bits)
+            && self.end.map(f32::to_bits) == other.end.map(f32::to_bits)
+            && self.radius.to_bits() == other.radius.to_bits()
+            && self.kind == other.kind
+            && self.area == other.area
+            && self.flags == other.flags
+    }
+}
+impl Eq for ExtendedExtractedLink {}
+
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
+pub(super) struct TileLinks {
+    pub legacy: Vec<ExtractedLink>,
+    pub extended: Vec<ExtendedExtractedLink>,
+}
+
 pub(super) fn halo(c: &BakeConfig) -> Result<i32, Error> {
     let base = c
         .recast
         .walkable_radius
         .checked_add(3)
         .ok_or(Error::SizeOverflow)?;
-    match c.links {
-        None => Ok(base),
-        Some(l) => base
-            .checked_add(l.reach_cells(c.recast.cs)?)
-            .ok_or(Error::SizeOverflow),
+    let legacy = c.links.map_or(Ok(0), |l| l.reach_cells(c.recast.cs))?;
+    base.checked_add(legacy.max(reach_cells(c.extended_links.reach(), c.recast.cs)?))
+        .ok_or(Error::SizeOverflow)
+}
+
+fn reach_cells(reach: f32, cs: f32) -> Result<i32, Error> {
+    if reach == 0.0 {
+        return Ok(0);
     }
+    let cells = ceilf(reach / cs);
+    if !cells.is_finite() || cells >= (i32::MAX / 4) as f32 {
+        return Err(Error::SizeOverflow);
+    }
+    Ok(cells as i32)
 }
 
 fn column(h: &CompactHeightfield, p: [f32; 3]) -> Option<usize> {
@@ -145,10 +191,38 @@ fn clear(
     height: f32,
     radius: f32,
 ) -> Result<bool, Error> {
-    let min_x = floorf((a[0].min(b[0]) - radius - solid.bmin[0]) / solid.cs) as i32;
-    let max_x = floorf((a[0].max(b[0]) + radius - solid.bmin[0]) / solid.cs) as i32;
-    let min_z = floorf((a[2].min(b[2]) - radius - solid.bmin[2]) / solid.cs) as i32;
-    let max_z = floorf((a[2].max(b[2]) + radius - solid.bmin[2]) / solid.cs) as i32;
+    clear_with_grid(ws, solid, a, b, lift, height, radius, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clear_with_grid(
+    ws: &mut Workspace,
+    solid: &Heightfield,
+    a: [f32; 3],
+    b: [f32; 3],
+    lift: f32,
+    height: f32,
+    radius: f32,
+    grid: Option<LadderGrid>,
+) -> Result<bool, Error> {
+    let bounds = |axis: usize| {
+        let (lo, hi) = (a[axis].min(b[axis]), a[axis].max(b[axis]));
+        if let Some(grid) = grid {
+            return grid.covered_cells(axis / 2, lo, hi, radius);
+        }
+        (
+            floorf((lo - radius - solid.bmin[axis]) / solid.cs) as i32,
+            floorf((hi + radius - solid.bmin[axis]) / solid.cs) as i32,
+        )
+    };
+    let (min_x, max_x) = bounds(0);
+    let (min_z, max_z) = bounds(2);
+    let boundary = |axis: usize, i: i32| {
+        grid.map_or_else(
+            || f64::from(solid.bmin[axis]) + f64::from(i) * f64::from(solid.cs),
+            |grid| grid.raster.position(axis / 2, i, 0.0),
+        )
+    };
     if min_x < 0 || min_z < 0 || max_x >= solid.width || max_z >= solid.height {
         return Ok(false);
     }
@@ -158,14 +232,14 @@ fn clear(
             for span in solid.column((x + z * solid.width) as usize) {
                 ws.work(1)?;
                 let lo = [
-                    solid.bmin[0] as f64 + x as f64 * solid.cs as f64 - radius as f64,
+                    boundary(0, x) - radius as f64,
                     (solid.bmin[1] + span.smin as f32 * solid.ch) as f64 - height as f64,
-                    solid.bmin[2] as f64 + z as f64 * solid.cs as f64 - radius as f64,
+                    boundary(2, z) - radius as f64,
                 ];
                 let hi = [
-                    solid.bmin[0] as f64 + (x + 1) as f64 * solid.cs as f64 + radius as f64,
+                    boundary(0, x + 1) + radius as f64,
                     (solid.bmin[1] + span.smax as f32 * solid.ch) as f64,
-                    solid.bmin[2] as f64 + (z + 1) as f64 * solid.cs as f64 + radius as f64,
+                    boundary(2, z + 1) + radius as f64,
                 ];
                 let mut enter = 0.0f64;
                 let mut exit = 1.0f64;
@@ -415,10 +489,10 @@ pub(super) fn extract(
     }
     Ok(out)
 }
-fn flush(
+fn flush<T: Clone>(
     ws: &mut Workspace,
-    run: &mut Vec<(ExtractedLink, usize)>,
-    out: &mut Vec<ExtractedLink>,
+    run: &mut Vec<(T, usize)>,
+    out: &mut Vec<T>,
 ) -> Result<(), Error> {
     if !run.is_empty() {
         ws.push(out, run[run.len() / 2].0.clone())?;

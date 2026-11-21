@@ -1,9 +1,12 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use navmesh_rs::bake::{self, BakeConfig, Input, LinkExtraction, LinkLimits};
+use navmesh_rs::bake::{
+    self, AreaVolume, BakeConfig, GapLinks, Input, LadderLinks, LinkExtraction, LinkLimits,
+    StepLinks,
+};
 use navmesh_rs::{Limits, Workspace};
 fuzz_target!(|data: &[u8]| {
-    if data.len() < 6 {
+    if data.len() < 10 {
         return;
     }
     let y = data[0] as f32 / 32.0;
@@ -35,7 +38,24 @@ fuzz_target!(|data: &[u8]| {
         0.,
     ];
     let tris = [0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7];
-    let input = Input::new(&verts, &tris);
+    let axis = 8. + gap * 0.5;
+    let marker_verts = [
+        axis - 5.,
+        0.,
+        1.,
+        axis - 5.,
+        0.,
+        7.,
+        axis + 5.,
+        0.,
+        7.,
+        axis + 5.,
+        0.,
+        1.,
+    ];
+    let volumes = [AreaVolume::ladder(&marker_verts, 0., y + 1.)];
+    let mut input = Input::new(&verts, &tris);
+    input.volumes = &volumes;
     let mut cfg = BakeConfig::default();
     cfg.recast.cs = 0.5;
     cfg.recast.ch = 0.1;
@@ -61,6 +81,13 @@ fuzz_target!(|data: &[u8]| {
         area_ids: [1, 2, 3],
         flags: [1, 2, 4],
     });
+    let distance = f32::from(data[7] % 20) * 0.5;
+    let clearance = f32::from(data[8] % 10) * 0.2;
+    let step = f32::from(data[9] % 20) * 0.2;
+    cfg.extended_links.ladders = (data[6] & 1 != 0).then_some(LadderLinks::new(distance, 4, 1));
+    cfg.extended_links.steps = (data[6] & 2 != 0).then_some(StepLinks::new(distance, step, 5, 1));
+    cfg.extended_links.level_gaps =
+        (data[6] & 4 != 0).then_some(GapLinks::new(distance, clearance, 6, 1));
     if let Ok(serial) = bake::tiles(&input, &cfg, &mut Workspace::new()) {
         if let Ok(repeat) = bake::tiles_parallel(&input, &cfg, &mut Workspace::new()) {
             assert_eq!(serial.tiles, repeat.tiles);
@@ -68,5 +95,9 @@ fuzz_target!(|data: &[u8]| {
         for l in serial.tiles.iter().flat_map(|t| &t.links) {
             assert!(l.start.iter().chain(&l.end).all(|v| v.is_finite()));
         }
+        for l in serial.tiles.iter().flat_map(|t| &t.extended_links) {
+            assert!(l.start.iter().chain(&l.end).all(|v| v.is_finite()));
+        }
+        assert!(serial.into_navmesh(Limits::default()).is_ok());
     }
 });

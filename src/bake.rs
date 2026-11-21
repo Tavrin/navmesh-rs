@@ -34,7 +34,10 @@ use crate::recast::{self, Config};
 use crate::{Error, Limits, UpstreamFixes, Workspace};
 
 mod links;
-pub use links::{ExtractedLink, LinkExtraction, LinkKind, LinkLimits};
+pub use links::{
+    ExtendedExtractedLink, ExtendedLinkExtraction, ExtractedLink, GapLinks, LadderLinks,
+    LinkExtraction, LinkKind, LinkLimits, StepLinks,
+};
 mod install;
 mod job;
 mod manifest;
@@ -73,7 +76,7 @@ pub enum Partition {
     Layers,
 }
 
-/// Convex area marking after erosion; not in recastnavigation as a type.
+/// A convex volume for area painting or ladder extraction.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AreaVolume<'a> {
@@ -83,8 +86,23 @@ pub struct AreaVolume<'a> {
     pub hmin: f32,
     /// Maximum world-space height.
     pub hmax: f32,
-    /// Recast area id, 0..=63.
+    /// Recast area id, 0..=63, for area painting. Ignored for ladders.
     pub area: u8,
+    ladder: bool,
+}
+
+impl<'a> AreaVolume<'a> {
+    /// Authors a ladder shaft footprint and inclusive range of landing heights.
+    /// A ladder volume never paints ground.
+    pub fn ladder(verts: &'a [f32], hmin: f32, hmax: f32) -> Self {
+        Self {
+            verts,
+            hmin,
+            hmax,
+            area: 0,
+            ladder: true,
+        }
+    }
 }
 
 /// Borrowed tile-bake inputs; not in recastnavigation. Construct with [`Input::new`].
@@ -98,7 +116,7 @@ pub struct Input<'a> {
     /// Optional area per triangle; unwalkable slopes are cleared. With `None`,
     /// walkable triangles start as [`recast::WALKABLE_AREA`].
     pub areas: Option<&'a [u8]>,
-    /// Convex area markings, applied in slice order after erosion.
+    /// Convex ladder volumes and area markings. Paint is applied in slice order after erosion.
     pub volumes: &'a [AreaVolume<'a>],
     /// Only the `off_mesh_con_*` fields are read; all other fields are ignored.
     /// Links retain their input order within each tile.
@@ -158,6 +176,8 @@ pub struct BakeConfig {
     pub fixes: UpstreamFixes,
     /// Optional boundary traversal extraction; disabled by default.
     pub links: Option<LinkExtraction>,
+    /// Optional ladder, stair-step and level-gap traversal extraction.
+    pub extended_links: ExtendedLinkExtraction,
     /// Ground-polygon slots reserved in each nonempty tile for runtime links.
     pub spare_links_per_tile: u32,
 }
@@ -194,6 +214,7 @@ impl Default for BakeConfig {
             strict_triangulation: false,
             fixes: UpstreamFixes::NONE,
             links: None,
+            extended_links: ExtendedLinkExtraction::default(),
             spare_links_per_tile: 0,
         }
     }
@@ -236,6 +257,8 @@ pub struct Tile {
     pub triangulation: recast::TriangulationReport,
     /// Generated traversal connections, in boundary/sample order.
     pub links: Vec<ExtractedLink>,
+    /// Generated ladders, steps and level gap jumps in bake order.
+    pub extended_links: Vec<ExtendedExtractedLink>,
 }
 
 /// Ordered tiles and their Detour layout; not in recastnavigation.
@@ -294,6 +317,7 @@ fn validate_config(c: &BakeConfig) -> Result<(), Error> {
     if let Some(links) = c.links {
         links.validate()?;
     }
+    c.extended_links.validate()?;
     let base = c.recast;
     if !positive(base.cs)
         || !positive(base.ch)
@@ -352,7 +376,7 @@ fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prep
             || !v.hmin.is_finite()
             || !v.hmax.is_finite()
             || v.hmin > v.hmax
-            || v.area > 63
+            || (!v.ladder && v.area > 63)
         {
             return Err(Error::InvalidInput("area volume"));
         }
@@ -467,6 +491,9 @@ fn prepare(input: &Input<'_>, c: &BakeConfig, ws: &mut Workspace) -> Result<Prep
     // filtering in Recast's quantized span domain (not the geometry's y bounds).
     let mut volume_buckets = ws.vec(count, Vec::new())?;
     for (i, v) in input.volumes.iter().enumerate() {
+        if v.ladder && c.extended_links.ladders.is_none() {
+            continue;
+        }
         work(ws, v.verts.len())?;
         let (lo, hi) = recast::calc_bounds(v.verts);
         let cell = |v: f32, n: i32| (floorf(v) as i32).clamp(0, n - 1);
@@ -539,10 +566,10 @@ fn build_tile(
     cfg: &Config,
     bucket: &[usize],
     volume_bucket: &[usize],
-    x: i32,
-    y: i32,
+    key: TileKey,
+    origin: [f32; 3],
 ) -> TileResult {
-    build_tile_counted(input, c, cfg, bucket, volume_bucket, x, y).0
+    build_tile_counted(input, c, cfg, bucket, volume_bucket, key, origin).0
 }
 
 /// Builds one tile from a borrowed input; also returns the work the tile charged.
@@ -552,14 +579,14 @@ fn build_tile_counted(
     cfg: &Config,
     bucket: &[usize],
     volume_bucket: &[usize],
-    x: i32,
-    y: i32,
+    key: TileKey,
+    origin: [f32; 3],
 ) -> (TileResult, u64) {
     let mut task = TileTask::new(
         c,
         cfg,
-        x,
-        y,
+        key,
+        origin,
         Cow::Borrowed(input.verts),
         TriSource::Bucket { input, bucket },
         volume_bucket
@@ -629,7 +656,11 @@ fn bake(
     // Slots are allocated fallibly and byte-charged before rayon sees them.
     let mut results = ws.vec(
         p.configs.len(),
-        Ok((None, recast::TriangulationReport::default(), Vec::new())),
+        Ok((
+            None,
+            recast::TriangulationReport::default(),
+            links::TileLinks::default(),
+        )),
     )?;
     let columns = p.columns;
     let coord = |i: usize| -> Result<(i32, i32), Error> {
@@ -644,8 +675,8 @@ fn bake(
             &p.configs[i],
             &p.buckets[i],
             &p.volume_buckets[i],
-            x,
-            y,
+            TileKey { x, z: y },
+            p.params.orig,
         )
     };
     fill_results(&mut results, parallel, build);
@@ -660,7 +691,8 @@ fn bake(
             y,
             data,
             triangulation,
-            links,
+            links: links.legacy,
+            extended_links: links.extended,
         });
     }
     Ok(BakedTiles {
@@ -705,7 +737,7 @@ type TileResult = Result<
     (
         Option<Vec<u8>>,
         recast::TriangulationReport,
-        Vec<ExtractedLink>,
+        links::TileLinks,
     ),
     Error,
 >;
@@ -773,18 +805,21 @@ mod tests {
                 hmin: -1.,
                 hmax: 2.,
                 area: 1,
+                ladder: false,
             },
             AreaVolume {
                 verts: &local,
                 hmin: 0.1,
                 hmax: 0.3,
                 area: 3,
+                ladder: false,
             },
             AreaVolume {
                 verts: &local,
                 hmin: 0.1,
                 hmax: 0.3,
                 area: 7,
+                ladder: false,
             },
         ];
         let mut input = Input::new(&verts, &tris);
@@ -800,8 +835,8 @@ mod tests {
                 &p.configs[i],
                 &p.buckets[i],
                 &p.volume_buckets[i],
-                i as i32,
-                0,
+                TileKey { x: i as i32, z: 0 },
+                p.params.orig,
             )
             .unwrap();
             let all = build_tile(
@@ -810,13 +845,21 @@ mod tests {
                 &p.configs[i],
                 &p.buckets[i],
                 &[0, 1, 2],
-                i as i32,
-                0,
+                TileKey { x: i as i32, z: 0 },
+                p.params.orig,
             )
             .unwrap();
             assert_eq!(culled, all);
-            let no_volumes =
-                build_tile(&input, &c, &p.configs[i], &p.buckets[i], &[], i as i32, 0).unwrap();
+            let no_volumes = build_tile(
+                &input,
+                &c,
+                &p.configs[i],
+                &p.buckets[i],
+                &[],
+                TileKey { x: i as i32, z: 0 },
+                p.params.orig,
+            )
+            .unwrap();
             assert_ne!(culled, no_volumes);
         }
     }
@@ -868,6 +911,7 @@ mod tests {
                     hmin: -1.,
                     hmax: 2.,
                     area: 3,
+                    ladder: false,
                 })
                 .collect();
             let mut input = Input::new(&verts, &tris);
@@ -886,17 +930,24 @@ mod tests {
                     &p.configs[i],
                     &p.buckets[i],
                     &p.volume_buckets[i],
-                    i as i32,
-                    0,
+                    TileKey { x: i as i32, z: 0 },
+                    p.params.orig,
                 );
                 let data = data.unwrap();
                 assert!(data.0.is_some());
                 work += tile_work;
                 if n == 8 {
                     let all: Vec<_> = (0..volumes.len()).collect();
-                    let unculled =
-                        build_tile(&input, &c, &p.configs[i], &p.buckets[i], &all, i as i32, 0)
-                            .unwrap();
+                    let unculled = build_tile(
+                        &input,
+                        &c,
+                        &p.configs[i],
+                        &p.buckets[i],
+                        &all,
+                        TileKey { x: i as i32, z: 0 },
+                        p.params.orig,
+                    )
+                    .unwrap();
                     assert_eq!(data, unculled);
                 }
             }
@@ -950,7 +1001,11 @@ mod tests {
             .build()
             .unwrap();
         let mut results = core::array::from_fn::<_, 4, _>(|_| {
-            Ok((None, recast::TriangulationReport::default(), Vec::new()))
+            Ok((
+                None,
+                recast::TriangulationReport::default(),
+                links::TileLinks::default(),
+            ))
         });
         pool.install(|| {
             fill_results(&mut results, true, |i| {
@@ -960,7 +1015,11 @@ mod tests {
                 } else if i == 3 {
                     Err(Error::Failed)
                 } else {
-                    Ok((None, recast::TriangulationReport::default(), Vec::new()))
+                    Ok((
+                        None,
+                        recast::TriangulationReport::default(),
+                        links::TileLinks::default(),
+                    ))
                 }
             })
         });

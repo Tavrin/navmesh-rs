@@ -28,6 +28,8 @@ mod layers;
 mod mesh;
 mod region;
 
+#[cfg(feature = "detour")]
+pub(crate) use area::point_in_area_polygon;
 pub use area::{
     erode_walkable_area, mark_box_area, mark_convex_poly_area, mark_cylinder_area,
     median_filter_walkable_area, offset_poly,
@@ -35,6 +37,8 @@ pub use area::{
 pub use compact::{CompactCell, CompactHeightfield, CompactSpan};
 pub use contour::{CONTOUR_TESS_AREA_EDGES, CONTOUR_TESS_WALL_EDGES, Contour, ContourSet};
 pub use detail::PolyMeshDetail;
+#[cfg(feature = "detour")]
+pub(crate) use heightfield::RasterGrid;
 pub use heightfield::{Heightfield, Span};
 pub use layers::{HeightfieldLayer, HeightfieldLayerSet};
 pub use mesh::{PolyMesh, TriangulationReport};

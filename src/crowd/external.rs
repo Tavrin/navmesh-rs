@@ -24,6 +24,8 @@ pub struct OffMeshReached {
     pub user_id: u32,
     /// Stable runtime id when this is a runtime connection.
     pub link_id: Option<LinkId>,
+    /// Explicit traversal kind for supported bake-extracted connections.
+    pub kind: Option<crate::detour::OffMeshKind>,
     /// Snapped departure point in the direction of travel.
     pub start: [f32; 3],
     /// Snapped arrival point in the direction of travel.
@@ -68,6 +70,7 @@ impl CrowdAgent {
                 poly,
                 user_id: con.user_id,
                 link_id: nav.runtime_link_id(poly),
+                kind: con.kind(),
                 start,
                 end,
                 departure,

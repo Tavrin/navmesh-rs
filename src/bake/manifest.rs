@@ -804,6 +804,7 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
         strict_triangulation,
         fixes,
         links,
+        extended_links,
         spare_links_per_tile,
     } = *cfg;
     let Config {
@@ -876,6 +877,7 @@ fn settings_hash(cfg: &BakeConfig) -> u64 {
             }
         }
     }
+    extended_links.encode(|bytes| h.bytes(bytes));
     h.finish()
 }
 
