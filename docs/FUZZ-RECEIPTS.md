@@ -641,3 +641,15 @@ tile state ran on the release candidate.
 | `tile_state` | coverage flat | 1,343.5 | 7,062,318 | 1,558 |
 
 No crashes.
+
+## 0.2.6 release run, 2026-11-21
+
+Same toolchain and rule as the 0.2.3 run. The two targets that cover link extraction and baking ran on
+the release candidate; `link_extract` includes the ladder, step and level-gap options.
+
+| Target | Stop reason | CPU seconds | Executions | Coverage |
+|---|---|---:|---:|---:|
+| `link_extract` | coverage flat | 706.1 | 36,858 | 5,254 |
+| `incremental_bake` | coverage flat | 3,270.9 | 27,715 | 9,309 |
+
+No crashes.

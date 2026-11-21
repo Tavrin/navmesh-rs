@@ -6,6 +6,8 @@ All notable changes to this project are documented in this file. The format foll
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-11-21
+
 ### Added
 
 - Opt-in bake extraction for authored ladder volumes, short stair steps across disconnected
@@ -548,7 +550,8 @@ All notable changes to this project are documented in this file. The format foll
 - Per-call memory and work limits with typed errors.
 - `no_std` with `alloc` and `wasm32` support.
 
-[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/Tavrin/navmesh-rs/compare/v0.2.2...v0.2.3
